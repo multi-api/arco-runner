@@ -12,7 +12,7 @@ import { runJob, type JobDeps, type JobPhase } from '../src/job/run-job.js';
 import { claim, reportIdle } from '../src/job/runner-api.js';
 import type { Paths } from '../src/system.js';
 import { wipe } from '../src/wipe.js';
-import { startFakeCloud, type FakeCloud, type FakeCloudOptions } from './fixtures/fake-cloud.js';
+import { startFakeCloud, type FakeCloud, type FakeCloudOptions } from '../src/loopback-cloud.js';
 
 const gnuTar = /GNU tar/.test(spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout ?? '');
 const zstd = spawnSync('zstd', ['--version']).status === 0;

@@ -1,9 +1,11 @@
 // Packages the runner image build context as a zip (Dockerfile at the root) for CreateMicrovmImage.
 import { execFileSync } from 'node:child_process';
-import { createWriteStream, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { createWriteStream, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import yazl from 'yazl';
 import { renderDockerfile } from './lib/dockerfile.ts';
+import { bundleFixture } from './lib/fixture-bundle.ts';
 import { checkFile, parseArgs, phpEntry, readVersions, repoRoot } from './lib/versions.ts';
 
 const MTIME = new Date('2026-01-01T00:00:00Z'); // fixed, so the same inputs give the same zip
@@ -52,11 +54,15 @@ async function main(): Promise<void> {
   add(join(inputs, 'composer.phar'), 'inputs/composer.phar', 0o755);
 
   add(resolve(args.agent!), 'agent/arco-runner.mjs', 0o644);
+  // Optional: the standalone /validate runner used by image smoke tests.
+  if (args['validate-cli']) add(resolve(args['validate-cli']), 'agent/validate-cli.mjs', 0o644);
 
-  const fixture = resolve(args.fixture!);
-  for (const f of walk(fixture)) add(f, `fixture/${relative(fixture, f)}`, statSync(f).mode & 0o111 ? 0o755 : 0o644);
-  // An empty fixture still needs a directory for the Dockerfile's COPY to find.
-  zip.addEmptyDirectory('fixture', { mtime: MTIME });
+  // The fixture is plain files in this repo; /validate clones it from a git bundle, so only the bundle ships.
+  const bundleDir = mkdtempSync(join(tmpdir(), 'arco-bundle-'));
+  const bundle = join(bundleDir, 'app.bundle');
+  bundleFixture(resolve(args.fixture!), bundle);
+  addBuffer(readFileSync(bundle), 'fixture/app.bundle', 0o644);
+  rmSync(bundleDir, { recursive: true, force: true });
 
   const out = resolve(args.out!);
   mkdirSync(dirname(out), { recursive: true });

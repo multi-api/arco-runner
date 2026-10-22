@@ -1,0 +1,7 @@
+{
+  "name": "fixture-app",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "tiny-lib": "file:../packages/tiny-lib-1.0.0.tgz" }
+}

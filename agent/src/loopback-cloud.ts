@@ -1,5 +1,5 @@
 // An in-process stand-in for Arco Cloud's runner endpoints and an S3 bucket reached through presigned URLs.
-// Self-contained (node built-ins only, no test framework) so it can also run as a loopback server.
+// Self-contained (node built-ins only): tests use it, and `/validate` runs it on 127.0.0.1 for its canned job.
 //
 //   POST /api/v1/runner/claim                 {ticket} -> 200 job | 409 ticket_invalid | 503 claim_unavailable
 //   POST /api/v1/deployments/{id}/start       {nonce}  -> 200 credentials

@@ -27,7 +27,7 @@ RUN chmod 0755 /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/frankenphp /home
  && install -d -o build -g build -m 0755 /home/build/work
 
 # Owned by root so the build user cannot modify the agent or the fixture.
-COPY agent/arco-runner.mjs /opt/arco-runner/arco-runner.mjs
+COPY agent/ /opt/arco-runner/
 COPY fixture/ /opt/arco-runner/fixture/
 RUN chown -R root:root /opt/arco-runner \
  && chmod -R u=rwX,go=rX /opt/arco-runner

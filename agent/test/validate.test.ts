@@ -1,0 +1,67 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ValidationError, runValidation } from '../src/validate.js';
+import type { Paths } from '../src/system.js';
+
+// The agent's build PATH (/usr/local/bin:/usr/bin:/bin) is the image's; a dev machine has php/composer elsewhere.
+vi.mock('../src/system.js', async (orig) => {
+  const mod = await orig<typeof import('../src/system.js')>();
+  return { ...mod, buildEnv: (p: Paths, e: Record<string, string>) => ({ ...mod.buildEnv(p, e), PATH: process.env.PATH }) };
+});
+
+const have = (cmd: string, arg = '--version') => spawnSync(cmd, [arg], { stdio: 'ignore' }).status === 0;
+const tools = have('php', '-v') && have('composer') && have('node') && have('npm') && have('git');
+if (!tools) console.warn('validate tests need php, composer, node, npm and git on PATH: skipped here');
+const itTools = it.skipIf(!tools);
+
+const FIXTURE = resolve(__dirname, '../../fixture');
+const roots: string[] = [];
+afterEach(async () => { for (const r of roots.splice(0)) await rm(r, { recursive: true, force: true }); });
+
+const git = (cwd: string, ...args: string[]) =>
+  execFileSync('git', ['-c', 'user.email=a@b.c', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8' }).trim();
+
+/** The fixture as the image ships it: a bundle of the fixture dir (app/ and packages/). */
+async function world(o: { breakArco?: boolean } = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'arco-validate-'));
+  roots.push(root);
+  const src = join(root, 'src');
+  await cp(FIXTURE, src, { recursive: true });
+  if (o.breakArco) await writeFile(join(src, 'packages/fake-arco/bin/arco'), '#!/usr/bin/env php\n<?php\nfwrite(STDERR, "boom\\n");\nexit(1);\n');
+  git(src, 'init', '-q');
+  git(src, 'add', '.');
+  git(src, 'commit', '-q', '-m', 'fixture');
+  const fixtureDir = join(root, 'fixture');
+  await mkdir(fixtureDir);
+  git(src, 'bundle', 'create', join(fixtureDir, 'app.bundle'), '--all');
+  const paths: Paths = {
+    home: join(root, 'home'), repo: join(root, 'home/work/repo'), tmpDirs: [join(root, 'tmp')],
+    agentDir: join(root, 'agent'), varDir: join(root, 'var'),
+  };
+  await mkdir(paths.tmpDirs[0]!);
+  await mkdir(paths.agentDir);
+  return { paths, fixtureDir };
+}
+
+describe('runValidation', () => {
+  itTools('builds the real fixture through the real pipeline, offline', async () => {
+    const w = await world();
+    await expect(runValidation({ ...w, identity: null })).resolves.toBeUndefined();
+  }, 240_000);
+
+  itTools('fails with a ValidationError when arco deploy exits 1', async () => {
+    const w = await world({ breakArco: true });
+    const err = await runValidation({ ...w, identity: null }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as Error).message).toMatch(/did not receive a finish with result succeeded/);
+  }, 240_000);
+
+  it('fails with a ValidationError when the bundle is missing', async () => {
+    const w = await world();
+    await rm(join(w.fixtureDir, 'app.bundle'));
+    await expect(runValidation({ ...w, identity: null })).rejects.toBeInstanceOf(ValidationError);
+  });
+});

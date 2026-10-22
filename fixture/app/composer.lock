@@ -1,0 +1,40 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "0b6d06f23692bb0096b79d1103ad25b0",
+    "packages": [],
+    "packages-dev": [
+        {
+            "name": "multiapi/arco",
+            "version": "0.10.0",
+            "dist": {
+                "type": "path",
+                "url": "../packages/fake-arco",
+                "reference": "0603f2ac4ba4e13d7f1902bbe3859d208cd47aa0"
+            },
+            "bin": [
+                "bin/arco"
+            ],
+            "type": "library",
+            "license": [
+                "MIT"
+            ],
+            "description": "Offline stand-in for the Arco CLI, used only by the runner image's /validate fixture",
+            "transport-options": {
+                "symlink": false,
+                "relative": true
+            }
+        }
+    ],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {},
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
+}

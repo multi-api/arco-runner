@@ -1,0 +1,7 @@
+{
+    "name": "multiapi/arco",
+    "description": "Offline stand-in for the Arco CLI, used only by the runner image's /validate fixture",
+    "version": "0.10.0",
+    "license": "MIT",
+    "bin": ["bin/arco"]
+}
