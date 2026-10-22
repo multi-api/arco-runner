@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Batcher } from '@multi-api/arco-cloud-client';
+import type { Batcher } from '@multiapi/arco-cloud-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { isJsCommand, runBuildCommands } from '../src/job/commands.js';
 import { Steps } from '../src/job/steps.js';

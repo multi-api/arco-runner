@@ -1,4 +1,4 @@
-import type { Redactor } from '@multi-api/arco-cloud-client';
+import type { Redactor } from '@multiapi/arco-cloud-client';
 import type { JobDocument } from './job/document.js';
 
 const MIN_MASK_LENGTH = 4;

@@ -1,4 +1,4 @@
-import type { Batcher } from '@multi-api/arco-cloud-client';
+import type { Batcher } from '@multiapi/arco-cloud-client';
 
 type Params = Record<string, unknown>;
 

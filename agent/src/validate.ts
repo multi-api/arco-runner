@@ -3,7 +3,7 @@ import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
-import { runCommand } from '@multi-api/arco-cloud-client';
+import { runCommand } from '@multiapi/arco-cloud-client';
 import { removeTree } from './fsutil.js';
 import { startFakeCloud, type FakeCloud } from './loopback-cloud.js';
 import type { CacheManifest } from './job/cache.js';

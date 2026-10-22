@@ -5,7 +5,7 @@ import { chown, lstat, mkdir, open, readdir, readlink, rm, stat, unlink, writeFi
 import { join, posix } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { runCommand } from '@multi-api/arco-cloud-client';
+import { runCommand } from '@multiapi/arco-cloud-client';
 import type { Identity, Paths } from '../system.js';
 
 export type Locks = { composer: string | null; npm: string | null; yarn: string | null; pnpm: string | null };

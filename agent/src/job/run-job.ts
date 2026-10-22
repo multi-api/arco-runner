@@ -3,7 +3,7 @@ import { access, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, redactValue, startRun, type RunSession,
-} from '@multi-api/arco-cloud-client';
+} from '@multiapi/arco-cloud-client';
 import { registerJobSecrets, shortMaskValues } from '../mask.js';
 import { buildEnv, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
 import { killUserProcesses } from '../wipe.js';

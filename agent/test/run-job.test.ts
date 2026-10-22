@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { secretVariants, toFinishPayload, type ArcoResult } from '@multi-api/arco-cloud-client';
+import { secretVariants, toFinishPayload, type ArcoResult } from '@multiapi/arco-cloud-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { CacheManifest } from '../src/job/cache.js';
 import type { TicketPayload } from '../src/job/document.js';
