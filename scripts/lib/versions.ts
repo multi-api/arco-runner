@@ -16,6 +16,7 @@ export interface PhpEntry {
 export interface Versions {
   php: Record<string, PhpEntry>;
   composer: { version: string; sha256: string };
+  tini: { version: string; sha256: string; size: number };
   corepack: { version: string };
   base_image_digest: string;
 }

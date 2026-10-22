@@ -15,6 +15,11 @@
     "sha256": "7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6"
   },
   "base_image_digest": "sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108",
+  "tini": {
+    "version": "0.19.0",
+    "sha256": "eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9",
+    "size": 546456
+  },
   "corepack": {
     "version": "0.36.0"
   }

@@ -18,8 +18,9 @@ RUN useradd -u 1000 -U -m -s /bin/bash build
 
 COPY inputs/php /usr/local/bin/php
 COPY inputs/composer.phar /usr/local/bin/composer
+COPY inputs/tini /usr/local/bin/tini
 COPY rootfs/ /
-RUN chmod 0755 /usr/local/bin/php /usr/local/bin/composer
+RUN chmod 0755 /usr/local/bin/php /usr/local/bin/composer /usr/local/bin/tini
 
 # Arco re-checks size and sha256 before using a cached runtime binary.
 COPY --chown=build:build inputs/frankenphp inputs/php /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/
@@ -35,4 +36,6 @@ RUN chown -R root:root /opt/arco-runner \
 ENV ARCO_RUNNER_IMAGE=php85 ARCO_RUNNER_IMAGE_REVISION=$REVISION
 
 EXPOSE 8080 9000
+# tini is PID 1: it reaps the orphans build commands leave behind and forwards SIGTERM to node.
+ENTRYPOINT ["/usr/local/bin/tini", "--"]
 CMD ["/usr/bin/node", "/opt/arco-runner/arco-runner.mjs"]

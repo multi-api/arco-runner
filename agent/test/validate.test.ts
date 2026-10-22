@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -50,6 +51,10 @@ describe('runValidation', () => {
   itTools('builds the real fixture through the real pipeline, offline', async () => {
     const w = await world();
     await expect(runValidation({ ...w, identity: null })).resolves.toBeUndefined();
+    // Nothing the canned jobs built may be left behind.
+    for (const p of ['work/repo/app/vendor', 'work/repo/app/node_modules', 'work/repo', '.npm', '.cache']) {
+      expect(existsSync(join(w.paths.home, p)), p).toBe(false);
+    }
   }, 240_000);
 
   itTools('fails with a ValidationError when arco deploy exits 1', async () => {

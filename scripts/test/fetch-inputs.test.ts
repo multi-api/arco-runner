@@ -14,6 +14,7 @@ const files: Record<string, Buffer> = {
   '/frankenphp-1.13.1-r1/php-linux-aarch64': Buffer.from('fake php cli'),
   '/frankenphp-1.13.1-r1/frankenphp-linux-aarch64': Buffer.from('fake frankenphp'),
   '/composer/2.10.3/composer.phar': Buffer.from('fake composer'),
+  '/tini/v0.19.0/tini-static-arm64': Buffer.from('fake tini'),
 };
 
 let server: Server;
@@ -22,7 +23,7 @@ let work: string;
 let fakeBin: string;
 let ghLog: string;
 
-function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string } = {}): string {
+function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string } = {}): string {
   const path = join(work, `versions-${Math.random().toString(36).slice(2)}.json`);
   const php = files['/frankenphp-1.13.1-r1/php-linux-aarch64']!;
   const fp = files['/frankenphp-1.13.1-r1/frankenphp-linux-aarch64']!;
@@ -41,6 +42,7 @@ function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: 
         },
       },
       composer: { version: '2.10.3', sha256: sha(files['/composer/2.10.3/composer.phar']!) },
+      tini: { version: '0.19.0', sha256: overrides.tiniSha ?? sha(files['/tini/v0.19.0/tini-static-arm64']!), size: files['/tini/v0.19.0/tini-static-arm64']!.length },
       base_image_digest: 'sha256:0',
     }),
   );
@@ -56,6 +58,7 @@ function run(versions: string, out: string, extraEnv: Record<string, string> = {
       ARCO_VERSIONS_FILE: versions,
       ARCO_RUNTIME_RELEASE_BASE: base,
       COMPOSER_DOWNLOAD_BASE: `${base}/composer`,
+      TINI_DOWNLOAD_BASE: `${base}/tini`,
       FAKE_GH_LOG: ghLog,
       ...extraEnv,
     },
@@ -113,6 +116,15 @@ describe('fetch-inputs', () => {
     expect(readdirSync(out)).toEqual([]); // no unverified bytes left behind
   });
 
+  it('exits 1 and names tini when its sha256 does not match', async () => {
+    const out = join(work, 'out-tini');
+    const r = await run(versionsFile({ tiniSha: 'e'.repeat(64) }), out);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('tini-static-arm64');
+    expect(r.stderr).toContain('sha256');
+    expect(existsSync(join(out, 'tini'))).toBe(false);
+  });
+
   it('exits 1 when a download returns 404', async () => {
     const out = join(work, 'out-404');
     const r = await run(versionsFile({ release: 'frankenphp-0.0.0' }), out);
@@ -130,6 +142,7 @@ describe('fetch-inputs', () => {
     expect(readFileSync(join(out, 'php'), 'utf8')).toBe('fake php cli');
     expect(readFileSync(join(out, 'frankenphp'), 'utf8')).toBe('fake frankenphp');
     expect(readFileSync(join(out, 'composer.phar'), 'utf8')).toBe('fake composer');
+    expect(readFileSync(join(out, 'tini'), 'utf8')).toBe('fake tini');
     expect(existsSync(ghLog)).toBe(true);
     const calls = readFileSync(ghLog, 'utf8').trim().split('\n').filter((l) => l.startsWith('attestation verify'));
     expect(calls).toHaveLength(2);

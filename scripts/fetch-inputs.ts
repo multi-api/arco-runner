@@ -1,4 +1,4 @@
-// Downloads the PHP CLI, FrankenPHP and Composer for one PHP minor and verifies them against
+// Downloads the PHP CLI, FrankenPHP, Composer and tini for one PHP minor and verifies them against
 // image/versions.json: size, sha256 and the arco-runtime build attestation. Any mismatch exits 1.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -7,6 +7,7 @@ import { checkFile, defaultVersionsPath, parseArgs, phpEntry, readVersions } fro
 
 const RELEASE_BASE = process.env.ARCO_RUNTIME_RELEASE_BASE ?? 'https://github.com/multi-api/arco-runtime/releases/download';
 const COMPOSER_BASE = process.env.COMPOSER_DOWNLOAD_BASE ?? 'https://getcomposer.org/download';
+const TINI_BASE = process.env.TINI_DOWNLOAD_BASE ?? 'https://github.com/krallin/tini/releases/download';
 const ATTEST_REPO = 'multi-api/arco-runtime';
 const ATTEST_SIGNER = 'multi-api/arco-runtime/.github/workflows/publish.yml';
 
@@ -68,6 +69,15 @@ async function main(): Promise<void> {
       url: `${COMPOSER_BASE}/${versions.composer.version}/composer.phar`,
       dest: join(out, 'composer.phar'),
       sha256: versions.composer.sha256,
+      attest: false,
+    },
+    {
+      // tini publishes no attestation: the pinned size and sha256 in versions.json are the only check.
+      asset: 'tini-static-arm64',
+      url: `${TINI_BASE}/v${versions.tini.version}/tini-static-arm64`,
+      dest: join(out, 'tini'),
+      sha256: versions.tini.sha256,
+      size: versions.tini.size,
       attest: false,
     },
   ];

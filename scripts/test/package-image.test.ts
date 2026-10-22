@@ -5,14 +5,15 @@ import { join, resolve } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { renderDockerfile } from '../lib/dockerfile.ts';
 import { readVersions } from '../lib/versions.ts';
+import { createHash } from 'node:crypto';
 
 const script = resolve(import.meta.dirname, '..', 'package-image.ts');
 let work: string;
 
-function run(inputs: string, out: string): Promise<{ status: number | null; stderr: string }> {
+function run(inputs: string, out: string, env: Record<string, string> = {}): Promise<{ status: number | null; stderr: string }> {
   return new Promise((done) => {
     const c = spawn(process.execPath, ['--import', 'tsx', script, '--minor', '8.5', '--inputs', inputs, '--out', out,
-      '--agent', join(work, 'agent.mjs'), '--fixture', join(work, 'fixture'), '--revision', 'abc'], { stdio: ['ignore', 'ignore', 'pipe'] });
+      '--agent', join(work, 'agent.mjs'), '--fixture', join(work, 'fixture'), '--revision', 'abc'], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, ...env } });
     let stderr = '';
     c.stderr.on('data', (d) => (stderr += d));
     c.on('close', (status) => done({ status, stderr }));
@@ -32,6 +33,24 @@ describe('package-image', () => {
     const r = await run(join(work, 'inputs'), join(work, 'out.zip'));
     expect(r.status).toBe(1);
     expect(r.stderr).toContain('php:');
+  });
+});
+
+describe('package-image tini', () => {
+  it('re-checks tini against versions.json too', async () => {
+    const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+    const inputs = join(work, 'inputs-tini');
+    mkdirSync(inputs);
+    for (const [f, c] of [['php', 'p'], ['frankenphp', 'f'], ['composer.phar', 'c'], ['tini', 'tampered']] as const) writeFileSync(join(inputs, f), c);
+    const v = readVersions();
+    v.php['8.5'] = { ...v.php['8.5']!, php_cli_sha256: sha('p'), php_cli_size: 1, frankenphp_sha256: sha('f'), frankenphp_size: 1 };
+    v.composer.sha256 = sha('c');
+    v.tini = { version: '0.19.0', sha256: sha('tini'), size: 4 };
+    const file = join(work, 'versions-tini.json');
+    writeFileSync(file, JSON.stringify(v));
+    const r = await run(inputs, join(work, 'out-tini.zip'), { ARCO_VERSIONS_FILE: file });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('tini:');
   });
 });
 

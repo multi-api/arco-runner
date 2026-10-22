@@ -6,7 +6,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import yazl from 'yazl';
 import { renderDockerfile } from './lib/dockerfile.ts';
 import { bundleFixture } from './lib/fixture-bundle.ts';
-import { checkFile, parseArgs, phpEntry, readVersions, repoRoot } from './lib/versions.ts';
+import { checkFile, defaultVersionsPath, parseArgs, phpEntry, readVersions, repoRoot } from './lib/versions.ts';
 
 const MTIME = new Date('2026-01-01T00:00:00Z'); // fixed, so the same inputs give the same zip
 
@@ -21,7 +21,7 @@ function* walk(dir: string): Generator<string> {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2), ['minor', 'inputs', 'out', 'agent', 'fixture']);
   const minor = args.minor!;
-  const versions = readVersions();
+  const versions = readVersions(process.env.ARCO_VERSIONS_FILE ?? defaultVersionsPath);
   const php = phpEntry(versions, minor);
   const revision = args.revision ?? execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
 
@@ -30,6 +30,7 @@ async function main(): Promise<void> {
   await checkFile(join(inputs, 'php'), 'php', php.php_cli_sha256, php.php_cli_size);
   await checkFile(join(inputs, 'frankenphp'), 'frankenphp', php.frankenphp_sha256, php.frankenphp_size);
   await checkFile(join(inputs, 'composer.phar'), 'composer.phar', versions.composer.sha256);
+  await checkFile(join(inputs, 'tini'), 'tini', versions.tini.sha256, versions.tini.size);
 
   const zip = new yazl.ZipFile();
   const add = (file: string, name: string, mode: number) =>
@@ -52,6 +53,7 @@ async function main(): Promise<void> {
   add(join(inputs, 'php'), 'inputs/php', 0o755);
   add(join(inputs, 'frankenphp'), 'inputs/frankenphp', 0o755);
   add(join(inputs, 'composer.phar'), 'inputs/composer.phar', 0o755);
+  add(join(inputs, 'tini'), 'inputs/tini', 0o755);
 
   add(resolve(args.agent!), 'agent/arco-runner.mjs', 0o644);
   // Optional: the standalone /validate runner used by image smoke tests.

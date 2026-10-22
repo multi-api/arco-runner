@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 import { runCommand } from '@multi-api/arco-cloud-client';
+import { removeTree } from './fsutil.js';
 import { startFakeCloud, type FakeCloud } from './loopback-cloud.js';
 import type { CacheManifest } from './job/cache.js';
 import type { TicketPayload } from './job/document.js';
@@ -93,24 +94,37 @@ async function cannedJob(o: { paths: Paths; identity: Identity | null; bundle: s
       log: (m) => { logs.push(m); console.log(`[validate] ${m}`); },
     });
     await rm(source.dir, { recursive: true, force: true });
+    await removeBuildState(paths);
     return { result, cloud, logs, killFailure };
   } catch (e) {
     await cloud.close();
     await rm(source.dir, { recursive: true, force: true });
+    await removeBuildState(paths).catch(() => {});
     throw e;
   }
 }
 
-/** Everything the job sent as `logs` lines, for the failure message. */
-const cloudLines = (cloud: FakeCloud): string[] =>
-  cloud.calls('/logs').flatMap((r) => {
-    try { return (JSON.parse(r.body.toString('utf8')).lines ?? []) as string[]; } catch { return []; }
-  });
+/** What the job sent to Cloud's `logs` endpoint: the lines (for failure messages) and the step events. */
+function sentLogs(cloud: FakeCloud): { lines: string[]; events: { key: string; status: string }[] } {
+  const out = { lines: [] as string[], events: [] as { key: string; status: string }[] };
+  for (const r of cloud.calls('/logs')) {
+    try {
+      const body = JSON.parse(r.body.toString('utf8')) as { lines?: string[]; events?: { key: string; status: string }[] };
+      out.lines.push(...(body.lines ?? []));
+      out.events.push(...(body.events ?? []));
+    } catch { /* not a batch */ }
+  }
+  return out;
+}
+const cloudLines = (cloud: FakeCloud): string[] => sentLogs(cloud).lines;
 
-const logEvents = (cloud: FakeCloud): { key: string; status: string }[] =>
-  cloud.calls('/logs').flatMap((r) => {
-    try { return (JSON.parse(r.body.toString('utf8')).events ?? []) as { key: string; status: string }[]; } catch { return []; }
-  });
+/**
+ * Nothing the canned jobs built may outlive them (as root, links unlinked and never followed): the checkout and
+ * the dependency caches. Only `.arco/cache/runtime` (the image's own) stays.
+ */
+async function removeBuildState(paths: Paths): Promise<void> {
+  for (const p of [paths.repo, join(paths.home, '.npm'), join(paths.home, '.cache')]) await removeTree(p);
+}
 
 async function processesOf(uid: number): Promise<string[]> {
   const found: string[] = [];
@@ -118,10 +132,10 @@ async function processesOf(uid: number): Promise<string[]> {
     if (!/^\d+$/.test(name)) continue;
     try {
       const status = await readFile(join('/proc', name, 'status'), 'utf8');
-      const ids = /^Uid:\s+(\d+)\s+(\d+)/m.exec(status);
+      const ids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
       // A zombie (an orphan nobody reaped: PID 1 here is the agent) holds nothing and cannot be killed again.
       if (/^State:\s+[ZX]/m.test(status)) continue;
-      if (ids && (Number(ids[1]) === uid || Number(ids[2]) === uid)) found.push(/^Name:\s+(.*)$/m.exec(status)?.[1] ?? name);
+      if (ids && ids.slice(1, 5).some((v) => Number(v) === uid)) found.push(/^Name:\s+(.*)$/m.exec(status)?.[1] ?? name);
     } catch { /* exited meanwhile */ }
   }
   return found;
@@ -131,9 +145,10 @@ async function processesOf(uid: number): Promise<string[]> {
 async function checkAgentDirReadOnly(paths: Paths, identity: Identity): Promise<void> {
   const probe = join(paths.agentDir, `.write-probe-${randomBytes(4).toString('hex')}`);
   let exitCode: number;
+  const output: string[] = [];
   try {
     ({ exitCode } = await runCommand('/bin/bash', ['-c', ': > "$1"', '_', probe], {
-      cwd: '/', env: { PATH: '/usr/bin:/bin' }, onStdoutLine: () => {}, onStderrLine: () => {}, signal: AbortSignal.timeout(30_000),
+      cwd: '/', env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, onStdoutLine: (l) => output.push(l), onStderrLine: (l) => output.push(l), signal: AbortSignal.timeout(30_000),
       uid: identity.uid, gid: identity.gid,
     }));
   } catch (e) {
@@ -142,6 +157,8 @@ async function checkAgentDirReadOnly(paths: Paths, identity: Identity): Promise<
   const written = await access(probe).then(() => true, () => false);
   if (written) await rm(probe, { force: true });
   if (written || exitCode === 0) throw new ValidationError(`${paths.agentDir} is writable by the build user`);
+  // Not writable for the right reason: a bash that failed to start or an uid that cannot enter the directory is not proof.
+  if (!output.some((l) => /Permission denied/.test(l))) throw new ValidationError(`write probe in ${paths.agentDir} failed without "Permission denied": ${output.join(' ').slice(0, 300)}`);
 }
 
 const archiveToolsPresent = (): boolean =>
@@ -200,8 +217,12 @@ export async function runValidation(o: { paths: Paths; identity: Identity | null
       }
       clouds.push(second.cloud);
       check(second, 'second job');
-      const restored = logEvents(second.cloud).some((ev) => ev.key === 'build.cache_restore' && ev.status === 'done');
+      const restored = sentLogs(second.cloud).events.some((ev) => ev.key === 'build.cache_restore' && ev.status === 'done');
       if (!restored) throw new ValidationError(`second job: the cache was not restored\n${tail([...cloudLines(second.cloud), ...second.logs])}`);
+      // The first job removed everything it built, so composer finding vendor complete proves the archive supplied it.
+      if (!cloudLines(second.cloud).some((l) => /Nothing to install, update or remove/.test(l))) {
+        throw new ValidationError(`second job: composer did not find vendor restored from the cache\n${tail([...cloudLines(second.cloud), ...second.logs])}`);
+      }
       if (identity && (await processesOf(identity.uid)).length > 0) throw new ValidationError('capabilities: build user processes survived the wipe');
     }
   } finally {
