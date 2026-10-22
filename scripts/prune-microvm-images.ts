@@ -5,15 +5,19 @@ import { parseArgs } from 'node:util';
 import { DeleteMicrovmImageVersionCommand, LambdaMicrovmsClient, ListMicrovmImageVersionsCommand } from '@aws-sdk/client-lambda-microvms';
 import { imageName } from './publish-microvm-image.ts';
 
-export interface VersionInfo { imageVersion: string; createdAt?: Date | string }
+export interface VersionInfo { imageVersion: string; createdAt?: Date | string; state?: string }
 
 export function planPrune(versions: VersionInfo[], inUse: string): string[] {
   const sorted = [...versions].sort((a, b) => +new Date(a.createdAt ?? 0) - +new Date(b.createdAt ?? 0));
-  const idx = sorted.findIndex((v) => v.imageVersion === inUse);
-  if (idx < 0) throw new Error(`in-use version ${inUse} not found among ${sorted.length} versions`);
-  const keepFrom = Math.max(idx - 1, 0);
-  const doomed = sorted.slice(0, keepFrom).map((v) => v.imageVersion);
-  if (sorted.length - doomed.length < 2) throw new Error(`refusing: pruning would leave ${sorted.length - doomed.length} version(s), need at least 2`);
+  const good = sorted.filter((v) => v.state === 'SUCCESSFUL');
+  const idx = good.findIndex((v) => v.imageVersion === inUse);
+  if (idx < 0) throw new Error(`in-use version ${inUse} is not a SUCCESSFUL version (${good.length} successful of ${sorted.length})`);
+  // Keep the in-use version, the SUCCESSFUL one before it, and everything newer; delete what is older.
+  const cutoff = good[Math.max(idx - 1, 0)]!;
+  const cutoffAt = sorted.indexOf(sorted.find((v) => v.imageVersion === cutoff.imageVersion)!);
+  const doomed = sorted.slice(0, cutoffAt).filter((v) => v.imageVersion !== inUse).map((v) => v.imageVersion);
+  const remainingGood = good.filter((v) => !doomed.includes(v.imageVersion)).length;
+  if (remainingGood < 2) throw new Error(`refusing: pruning would leave ${remainingGood} successful version(s), need at least 2`);
   return doomed;
 }
 
@@ -26,7 +30,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   let nextToken: string | undefined;
   do {
     const page = await client.send(new ListMicrovmImageVersionsCommand({ imageIdentifier: name, nextToken }));
-    all.push(...(page.items as VersionInfo[]));
+    all.push(...((page.items ?? []) as VersionInfo[]));
     nextToken = page.nextToken;
   } while (nextToken);
   try {

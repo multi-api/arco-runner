@@ -16,6 +16,10 @@ permissions:
   id-token: write
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: publish-${{ inputs.stage }}
   cancel-in-progress: false

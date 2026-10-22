@@ -20,6 +20,10 @@ permissions:
   id-token: write
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   STAGE: ${{ inputs.stage || 'staging' }}
 

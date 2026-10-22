@@ -4,7 +4,6 @@ import {
   GetMicrovmImageCommand,
   GetMicrovmImageVersionCommand,
   ListManagedMicrovmImagesCommand,
-  ListMicrovmImageVersionsCommand,
   UpdateMicrovmImageCommand,
 } from '@aws-sdk/client-lambda-microvms';
 import { main, type PublishDeps } from '../publish-microvm-image.ts';
@@ -19,7 +18,6 @@ function fake(world: World) {
   const calls: { name: string; input: any }[] = [];
   const logs: string[] = [];
   const uploads: string[][] = [];
-  let created = false;
   let polls = 0;
   const deps: PublishDeps = {
     client: {
@@ -38,13 +36,7 @@ function fake(world: World) {
           return { imageArn: 'arn:img' };
         }
         if (command instanceof CreateMicrovmImageCommand || command instanceof UpdateMicrovmImageCommand) {
-          created = true;
-          return { imageArn: 'arn:img' };
-        }
-        if (command instanceof ListMicrovmImageVersionsCommand) {
-          const items = world.exists ? [{ imageVersion: '1', createdAt: new Date(1) }] : [];
-          if (created) items.push({ imageVersion: world.exists ? '2' : '1', createdAt: new Date(5) });
-          return { items };
+          return { imageArn: 'arn:img', imageVersion: world.exists ? '2' : '1' };
         }
         if (command instanceof GetMicrovmImageVersionCommand) {
           const state = world.versionStates[Math.min(polls++, world.versionStates.length - 1)];

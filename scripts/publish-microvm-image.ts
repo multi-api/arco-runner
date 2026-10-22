@@ -11,7 +11,6 @@ import {
   GetMicrovmImageVersionCommand,
   LambdaMicrovmsClient,
   ListManagedMicrovmImagesCommand,
-  ListMicrovmImageVersionsCommand,
   UpdateMicrovmImageCommand,
 } from '@aws-sdk/client-lambda-microvms';
 import { S3Client } from '@aws-sdk/client-s3';
@@ -21,7 +20,6 @@ import { createReadStream } from 'node:fs';
 export const POLL_INTERVAL_MS = 15_000;
 export const POLL_TIMEOUT_MS = 60 * 60_000;
 const ON = 'ENABLED' as const;
-const VERSION_APPEAR_TIMEOUT_MS = 10 * 60_000;
 
 export interface PublishDeps {
   client: { send(command: unknown): Promise<any> };
@@ -85,17 +83,6 @@ async function newestAl2023Base(client: PublishDeps['client']): Promise<string> 
   return found[0]!.imageArn;
 }
 
-async function listVersions(client: PublishDeps['client'], name: string) {
-  const items: { imageVersion: string; createdAt?: Date }[] = [];
-  let nextToken: string | undefined;
-  do {
-    const page = await client.send(new ListMicrovmImageVersionsCommand({ imageIdentifier: name, nextToken }));
-    items.push(...(page.items ?? []));
-    nextToken = page.nextToken;
-  } while (nextToken);
-  return items;
-}
-
 export async function publish(opts: PublishOptions, deps: PublishDeps): Promise<{ imageArn: string; imageVersion: string }> {
   const { client, log } = deps;
   const name = imageName(opts.minor);
@@ -114,28 +101,17 @@ export async function publish(opts: PublishOptions, deps: PublishDeps): Promise<
     if (!isNotFound(e)) throw e;
     exists = false;
   }
-  const before = new Set((exists ? await listVersions(client, name) : []).map((v) => v.imageVersion));
-
   let imageArn: string;
+  let version: string;
   if (exists) {
-    log(`updating image ${name}`);
-    imageArn = (await client.send(new UpdateMicrovmImageCommand({ imageIdentifier: name, ...params }))).imageArn;
+    log(`updating image ${name} (${opts.stage})`);
+    ({ imageArn, imageVersion: version } = await client.send(new UpdateMicrovmImageCommand({ imageIdentifier: name, ...params })));
   } else {
-    log(`creating image ${name}`);
-    imageArn = (await client.send(new CreateMicrovmImageCommand({ name, ...params }))).imageArn;
+    log(`creating image ${name} (${opts.stage})`);
+    ({ imageArn, imageVersion: version } = await client.send(new CreateMicrovmImageCommand({ name, ...params })));
   }
 
-  // Create/Update do not return the version they start; it is the one that was not there before.
   const started = deps.now();
-  let version: string | undefined;
-  while (!version) {
-    const fresh = (await listVersions(client, name)).filter((v) => !before.has(v.imageVersion));
-    fresh.sort((a, b) => +new Date(b.createdAt ?? 0) - +new Date(a.createdAt ?? 0));
-    version = fresh[0]?.imageVersion;
-    if (version) break;
-    if (deps.now() - started > VERSION_APPEAR_TIMEOUT_MS) throw new PublishFailed('no new image version appeared after the update');
-    await deps.sleep(POLL_INTERVAL_MS);
-  }
   log(`image version ${version} building`);
 
   const deadline = started + POLL_TIMEOUT_MS;

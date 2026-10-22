@@ -73,9 +73,11 @@ CLOUD_RUNNERS_TASK_DEFINITION_85=...
 
 One-time setup: create the repository, the `staging` and `prod` environments and their variables, and the runners accounts with the publisher permissions the Cloud plan lists (`ecs:RegisterTaskDefinition`, `iam:PassRole` on the execution role, `GetMicrovmImage`, `ListMicrovmImageVersions`, `DeleteMicrovmImageVersion`, `ListManagedMicrovmImages`, ECR push, `s3:PutObject` on `images/*`).
 
+Restrict the `prod` environment to deployments from the `main` branch, and limit the publisher role's trust policy to the subjects `repo:multi-api/arco-runner:environment:<stage>` (one per stage account), so only that environment can assume it.
+
 ### Pruning
 
-`prune.yml` (`workflow_dispatch`, inputs `stage` and `in_use_version`) deletes `arco-runner-php85` versions older than the version just before `in_use_version`. It refuses if fewer than 2 versions would remain or the version is unknown. Pass the value currently set in `CLOUD_RUNNERS_IMAGE_VERSION_85`. ECR keeps its own last 10 images through a lifecycle rule.
+`prune.yml` (`workflow_dispatch`, inputs `stage` and `in_use_version`) deletes `arco-runner-php85` versions older than the version just before `in_use_version`. Only `SUCCESSFUL` versions count when choosing the previous version and when checking that at least 2 remain; it never deletes the in-use version, and refuses if the version is not a successful one. Pass the value currently set in `CLOUD_RUNNERS_IMAGE_VERSION_85`. ECR keeps its own last 10 images through a lifecycle rule.
 
 ## If `/validate` fails with `capabilities:`
 
