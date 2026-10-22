@@ -54,6 +54,78 @@ describe('Agent', () => {
     expect(a.canSuspend()).toBe(true);
   });
 
+  // C1 / R22: Cloud's /idle suspends the VM before it answers, so the agent must be suspendable while idle is pending.
+  describe('idle phase (R22)', () => {
+    /** A job that reaches the idle phase, then waits for a hand-driven idle report. */
+    function idleJob() {
+      let reportIdle!: () => void;
+      const reported = new Promise<void>((r) => { reportIdle = r; });
+      const seen: { deps?: JobDeps } = {};
+      hoisted.impl = async (_p, deps) => {
+        seen.deps = deps as JobDeps;
+        seen.deps.onPhase('running');
+        seen.deps.onPhase('wiping');
+        seen.deps.onPhase('idle');
+        await reported;
+        return {};
+      };
+      return { seen, reportIdle };
+    }
+
+    it('can suspend while the idle report is still pending', async () => {
+      const job = idleJob();
+      const a = new Agent(baseDeps);
+      a.accept(P);
+      await tick();
+      expect(a.state).toBe('idle');
+      expect(a.canSuspend()).toBe(true);
+      await a.whenIdle(); // the job slot is detached: nothing to wait for
+      job.reportIdle();
+    });
+
+    it('accepts a new job while the previous idle report is pending, and the old job ending does not clobber it', async () => {
+      const first = idleJob();
+      const a = new Agent(baseDeps);
+      a.accept(P);
+      await tick();
+      const second = stubJob();
+      expect(a.accept({ ...P, deployment_id: 'dep-2' })).toBe('accepted');
+      await tick();
+      expect(a.state).toBe('running');
+      first.reportIdle(); // the old job's runJob resolves now
+      await tick();
+      expect(a.state).toBe('running');
+      expect(a.canSuspend()).toBe(false);
+      expect(a.accept(P)).toBe('busy');
+      expect(a.cancel('dep-1')).toBe('idle'); // the old job no longer owns the slot
+      expect(a.cancel('dep-2')).toBe('cancelling');
+      expect(second.seen.deps!.signal.aborted).toBe(true);
+      second.finish();
+      await a.whenIdle();
+      expect(a.state).toBe('idle');
+    });
+
+    it('a rejection after the idle phase is only logged, never dirties a newer job', async () => {
+      let fail!: (e: Error) => void;
+      hoisted.impl = async (_p, deps) => {
+        (deps as JobDeps).onPhase('idle');
+        await new Promise((_r, rej) => { fail = rej; });
+        return {};
+      };
+      const logs: string[] = [];
+      const a = new Agent({ ...baseDeps, log: (m) => logs.push(m) });
+      a.accept(P);
+      await tick();
+      stubJob();
+      a.accept({ ...P, deployment_id: 'dep-2' });
+      await tick();
+      fail(new Error('late boom'));
+      await tick();
+      expect(a.state).toBe('running');
+      expect(logs.join('\n')).toContain('late boom');
+    });
+  });
+
   it('a wipe that throws leaves the agent dirty for good', async () => {
     hoisted.impl = async (_p, deps) => { await (deps as JobDeps).wipe('.'); return {}; };
     const logs: string[] = [];

@@ -2,12 +2,12 @@ import { constants } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, startRun, type RunSession,
+  CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, redactValue, startRun, type RunSession,
 } from '@multi-api/arco-cloud-client';
 import { registerJobSecrets, shortMaskValues } from '../mask.js';
 import { buildEnv, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
 import { killUserProcesses } from '../wipe.js';
-import { type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
+import { CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
 import { runBuildCommands } from './commands.js';
 import type { JobDocument, TicketPayload } from './document.js';
 import { BuildFailure } from './errors.js';
@@ -15,7 +15,8 @@ import { claim, reportIdle } from './runner-api.js';
 import { checkout, revokeGithubToken, type CheckoutContext } from './source.js';
 import { Steps } from './steps.js';
 
-export type JobPhase = 'running' | 'saving' | 'wiping';
+/** `idle`: the VM is clean again (after the wipe, before the idle report); MicroVM mode only. */
+export type JobPhase = 'running' | 'saving' | 'wiping' | 'idle';
 
 export interface JobDeps {
   paths: Paths;
@@ -40,7 +41,8 @@ export interface JobDeps {
    */
   wipe: (rootDir: string) => Promise<void>;
   /**
-   * Ruling R13: kills every build-user process before the cache save; a rejection skips the save.
+   * Kills every build-user process: before arco deploy (M3; a rejection fails the run with runner.internal_error)
+   * and before the cache save (R13; a rejection skips the save).
    * Defaults to killUserProcesses(identity.uid) when an identity is set, else nothing.
    */
   killBuildProcesses?: () => Promise<void>;
@@ -137,14 +139,14 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
     const s = session;
     const runSignal = AbortSignal.any([deps.signal, s.signal]);
     const steps = new Steps(s.batcher);
-    let restoreFailed = false;
+    let restoreTransientFailure = false;
     // Set once deployAndFinish returned (finish sent): the save time box starts there.
     let saveBy: number | null = null;
     // finishWithRetry warns exactly when Cloud did not accept the finish (run lost, or no answer after retries).
     let finishRejected = false;
     const finishWarn = (m: string) => { finishRejected = true; log(m); };
     try {
-      restoreFailed = await build(doc, deps, s, steps, runSignal, deadlineMs);
+      restoreTransientFailure = await build(doc, deps, s, steps, runSignal, deadlineMs);
       const exitCode = await deploy(doc, deps, { ...s, warn: finishWarn }, runSignal, now);
       saveBy = now() + SAVE_TIME_BOX_MS;
       result.finished = !finishRejected;
@@ -164,23 +166,27 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
         }
         // Closed (not just flushed) first, so no keep-alive batch can follow the finish.
         await s.batcher.close();
-        await finishWithRetry(api, JSON.parse(s.redact(JSON.stringify(failure))), undefined, finishWarn);
+        // `result` is our own enum: kept even if a mask value equals "failed".
+        await finishWithRetry(api, { ...redactValue(failure, s.redact), result: failure.result }, undefined, finishWarn);
         result.finished = !finishRejected;
       }
     } finally {
       await s.batcher.close();
     }
 
-    // 8. Cache save: after finish, only after a deploy ran, never after a failed restore
+    // 8. Cache save: after finish, only after a deploy ran, never after a transient restore failure (R23: the
+    // object may be fine, so it is not overwritten; after a content failure a fresh cache replaces it)
     deps.onPhase('saving');
-    if (saveBy !== null && !restoreFailed) await save(doc, deps, now, log, saveBy);
+    if (saveBy !== null && !restoreTransientFailure) await save(doc, deps, now, log, saveBy);
 
     // 9. Wipe (the checkout ran: customer code may have run)
     deps.onPhase('wiping');
     if (deps.mode === 'microvm') await deps.wipe(doc.source.root_dir);
   }
 
-  // 9. Idle
+  // 9. Idle. R22 (MicroVM): Cloud's /idle suspends this VM before it answers, so the agent must already be idle
+  // (suspendable, free for the next job) when the request goes out. Fargate reports idle, then exits.
+  if (deps.mode === 'microvm') deps.onPhase('idle');
   try {
     await reportIdle(p.api_base, doc.runner_token, doc.deployment_id, deps.fetchImpl, sleep);
     result.idleReported = true;
@@ -190,7 +196,7 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
   return result;
 }
 
-/** Steps 4-6: source, cache restore, build commands. Returns whether a restore failed (other than 404). */
+/** Steps 4-6: source, cache restore, build commands. Returns whether the restore failed transiently (R23). */
 async function build(
   doc: JobDocument, deps: JobDeps, s: RunSession, steps: Steps, signal: AbortSignal, deadlineMs: number,
 ): Promise<boolean> {
@@ -219,7 +225,7 @@ async function build(
   cancelled();
 
   // 5. Cache restore: only when this VM has not built with a cache yet
-  let restoreFailed = false;
+  let restoreTransientFailure = false;
   if (deps.knownCache.get() === null) {
     steps.start('build.cache_restore');
     try {
@@ -233,7 +239,8 @@ async function build(
       }
     } catch (e) {
       cancelled();
-      restoreFailed = true;
+      // Only CacheError carries a kind; anything else is a local failure, not a reason to keep a bad object.
+      restoreTransientFailure = e instanceof CacheError && e.kind === 'transient';
       steps.warning('build.cache_restore', `Cache restore failed, building without it: ${messageOf(e)}`);
     }
   }
@@ -243,7 +250,18 @@ async function build(
   await runBuildCommands(doc.commands, {
     projectDir, env, identity, batcher: s.batcher, steps, deadlineMs, signal, timeoutSeconds: doc.timeout_seconds,
   });
-  return restoreFailed;
+  return restoreTransientFailure;
+}
+
+/** Kills every build-user process (R13); null when there is no build user to kill (tests without identity). */
+function buildProcessKiller(deps: JobDeps): (() => Promise<void>) | null {
+  const identity = deps.identity;
+  return deps.killBuildProcesses ?? (identity ? () => killUserProcesses(identity.uid) : null);
+}
+
+/** The customer's env for arco: Cloud's start answer is the only source of ARCO_PERMISSIONS_BOUNDARY. */
+function arcoJobEnv(env: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).filter(([k]) => k.toUpperCase() !== 'ARCO_PERMISSIONS_BOUNDARY'));
 }
 
 /**
@@ -258,10 +276,20 @@ async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: Ab
     throw new BuildFailure('runner_credentials_expiring', 'The deploy credentials expire in less than 20 minutes; arco deploy was not started');
   }
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
+  // M3: no background build process may live next to arco (it could read /proc/<arco>/environ). A failure is an
+  // internal error (finish failed runner.internal_error, then the usual wipe).
+  const kill = buildProcessKiller(deps);
+  if (kill) {
+    try {
+      await kill();
+    } catch (e) {
+      throw new Error(`build processes survived before arco deploy: ${messageOf(e)}`);
+    }
+  }
   // A cancel stops arco like a run Cloud ended; the RunAbortedError it causes is reported as build.cancelled.
   const view: RunSession = { ...s, signal, abortMessage: () => s.abortMessage() ?? (deps.signal.aborted ? 'Cancelled' : null) };
   return await deployAndFinish(view, {
-    mode: doc.mode, environment: doc.environment, cwd: projectDir, env: buildEnv(deps.paths, doc.env),
+    mode: doc.mode, environment: doc.environment, cwd: projectDir, env: buildEnv(deps.paths, arcoJobEnv(doc.env)),
     ...(deps.identity ? { uid: deps.identity.uid, gid: deps.identity.gid } : {}),
   });
 }
@@ -270,8 +298,7 @@ async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: Ab
 async function save(doc: JobDocument, deps: JobDeps, now: () => number, log: (m: string) => void, savedBy: number): Promise<void> {
   try {
     // Ruling R13: no build process may be alive while the cache roots are walked and archived.
-    const identity = deps.identity;
-    const kill = deps.killBuildProcesses ?? (identity ? () => killUserProcesses(identity.uid) : null);
+    const kill = buildProcessKiller(deps);
     if (kill) {
       try {
         await kill();

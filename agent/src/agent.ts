@@ -30,33 +30,54 @@ export class Agent {
     if (this.current !== 'idle') return 'busy';
     this.current = 'running';
     this.jobEverAccepted = true;
-    const abort = new AbortController();
     const receivedAt = Date.now();
-    const done = new Promise<void>((resolve) => {
-      setImmediate(() => { void this.execute(p, abort, receivedAt).finally(resolve); });
-    });
-    this.job = { deploymentId: p.deployment_id, abort, done };
+    let resolveDone!: () => void;
+    const job = { deploymentId: p.deployment_id, abort: new AbortController(), done: new Promise<void>((r) => { resolveDone = r; }) };
+    this.job = job;
+    setImmediate(() => { void this.execute(p, job, receivedAt).finally(resolveDone); });
     return 'accepted';
   }
 
-  private async execute(p: TicketPayload, abort: AbortController, receivedAt: number): Promise<void> {
+  /** The job still owns the slot (it has not reached its idle phase, which detaches it). */
+  private owns(job: NonNullable<Agent['job']>): boolean { return this.job === job; }
+
+  /**
+   * R22: Cloud's `/idle` suspends this VM before it answers, so once the wipe is done (phase `idle`) the agent is
+   * idle and the slot is free at once; the idle report then runs detached and its outcome is only logged.
+   */
+  private detach(job: NonNullable<Agent['job']>): void {
+    if (!this.owns(job) || this.current === 'dirty') return;
+    this.current = 'idle';
+    this.job = null;
+  }
+
+  private async execute(p: TicketPayload, job: NonNullable<Agent['job']>, receivedAt: number): Promise<void> {
     const log = this.deps.log ?? ((m: string) => console.log(`[arco-runner] ${m}`));
     try {
       await runJob(p, {
         ...this.deps,
-        signal: abort.signal,
+        signal: job.abort.signal,
         receivedAt,
         knownCache: { get: () => this.cache, set: (m) => { this.cache = m; } },
-        onPhase: (ph: JobPhase) => { if (this.current !== 'dirty') this.current = ph; },
+        onPhase: (ph: JobPhase) => {
+          if (!this.owns(job) || this.current === 'dirty') return;
+          if (ph === 'idle') this.detach(job);
+          else this.current = ph;
+        },
       });
-      this.current = 'idle';
+      if (this.owns(job)) this.current = 'idle';
     } catch (e) {
-      // runJob only rejects when the wipe failed (or something unforeseen after customer code ran): the VM
-      // cannot be trusted any more, so it never takes another job and /suspend answers 503 until Cloud ends it.
-      this.current = 'dirty';
-      log(`deployment ${p.deployment_id} left the VM dirty: ${messageOf(e)}`);
+      if (this.owns(job)) {
+        // runJob only rejects when the wipe failed (or something unforeseen after customer code ran): the VM
+        // cannot be trusted any more, so it never takes another job and /suspend answers 503 until Cloud ends it.
+        this.current = 'dirty';
+        log(`deployment ${p.deployment_id} left the VM dirty: ${messageOf(e)}`);
+      } else {
+        // After the idle phase the VM was already clean; a newer job may own the slot now.
+        log(`deployment ${p.deployment_id} failed after it was idle: ${messageOf(e)}`);
+      }
     } finally {
-      this.job = null;
+      if (this.owns(job)) this.job = null;
     }
   }
 

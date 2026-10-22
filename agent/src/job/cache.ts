@@ -36,8 +36,14 @@ const LIMITS: Limits = {
 };
 const limitsOf = (ctx: CacheCtx): Limits => ({ ...LIMITS, ...ctx.limits });
 
+/**
+ * `transient`: the object could not be fetched right now (network error or timeout, HTTP 5xx, HTTP 403 from an
+ * expired presigned URL); trying again later may work. `content`: the object itself (or extracting it) is bad.
+ */
+export type CacheErrorKind = 'transient' | 'content';
+
 export class CacheError extends Error {
-  constructor(message: string) {
+  constructor(message: string, readonly kind: CacheErrorKind = 'content') {
     super(message);
     this.name = 'CacheError';
   }
@@ -327,10 +333,14 @@ async function download(url: string, dest: string, ctx: CacheCtx): Promise<'ok' 
   try {
     res = await doFetch(url, { ...(ctx.signal ? { signal: ctx.signal } : {}) });
   } catch (e) {
-    throw new CacheError(netMessage('cache download failed', e));
+    throw new CacheError(netMessage('cache download failed', e), 'transient');
   }
   if (res.status === 404) { await res.body?.cancel(); return 'missing'; }
-  if (!res.ok || !res.body) throw new CacheError(`cache download failed (HTTP ${res.status})`);
+  if (!res.ok || !res.body) {
+    await res.body?.cancel();
+    const transient = res.status >= 500 || res.status === 403;
+    throw new CacheError(`cache download failed (HTTP ${res.status})`, transient ? 'transient' : 'content');
+  }
   let size = 0;
   const cap = new Transform({
     transform(chunk: Buffer, _enc, cb) {
@@ -342,7 +352,8 @@ async function download(url: string, dest: string, ctx: CacheCtx): Promise<'ok' 
     // 'wx': never writes through an existing file or link. 0644: the build user reads it to list and extract.
     await pipeline(Readable.fromWeb(res.body as never), cap, createWriteStream(dest, { flags: 'wx', mode: 0o644 }));
   } catch (e) {
-    throw e instanceof CacheError ? e : new CacheError('cache download failed (stream error)');
+    // The connection broke mid-body: a network failure, not a verdict on the object.
+    throw e instanceof CacheError ? e : new CacheError('cache download failed (stream error)', 'transient');
   }
   return 'ok';
 }

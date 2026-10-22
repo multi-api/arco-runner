@@ -133,7 +133,7 @@ async function processesOf(uid: number): Promise<string[]> {
     try {
       const status = await readFile(join('/proc', name, 'status'), 'utf8');
       const ids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
-      // A zombie (an orphan nobody reaped: PID 1 here is the agent) holds nothing and cannot be killed again.
+      // A zombie (exited, not yet reaped by its parent or by tini, PID 1) holds nothing and cannot be killed again.
       if (/^State:\s+[ZX]/m.test(status)) continue;
       if (ids && ids.slice(1, 5).some((v) => Number(v) === uid)) found.push(/^Name:\s+(.*)$/m.exec(status)?.[1] ?? name);
     } catch { /* exited meanwhile */ }

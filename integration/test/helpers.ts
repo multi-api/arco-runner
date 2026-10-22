@@ -23,6 +23,8 @@ export interface Recorded {
   at: number; size: number; body: string;
 }
 export interface GitRecorded { method: string; path: string; authorized: boolean; at: number }
+/** A /suspend hook call the fake Cloud made while answering /idle (status 0: hook unreachable). */
+export interface SuspendRecorded { deployment_id: string; status: number; at: number }
 
 // ---------------------------------------------------------------- docker compose
 
@@ -90,8 +92,8 @@ export async function seedCache(manifest: unknown, files: Record<string, string>
   if (r.status !== 200) throw new Error(`seed failed: ${JSON.stringify(r.json)}`);
 }
 
-export async function requests(): Promise<{ cloud: Recorded[]; git: GitRecorded[] }> {
-  return (await http('GET', `${FAKE}/admin/requests`)).json as { cloud: Recorded[]; git: GitRecorded[] };
+export async function requests(): Promise<{ cloud: Recorded[]; git: GitRecorded[]; suspends: SuspendRecorded[] }> {
+  return (await http('GET', `${FAKE}/admin/requests`)).json as { cloud: Recorded[]; git: GitRecorded[]; suspends: SuspendRecorded[] };
 }
 
 // ---------------------------------------------------------------- jobs
@@ -124,6 +126,10 @@ export interface JobOptions {
   ticket?: string;
   /** Every start call gets this answer instead of the credentials. */
   startAnswer?: { status: number; body?: unknown };
+  /** The cache object key (default CACHE_KEY, the seeded one). */
+  cacheKey?: string;
+  /** Whether the fake Cloud calls the runner's /suspend hook before answering /idle (default true; false for Fargate). */
+  suspendOnIdle?: boolean;
 }
 
 /** Registers a fresh job (fresh ticket, tokens, secrets) with the fake Cloud and returns it. */
@@ -133,7 +139,8 @@ export async function newJob(name: string, o: JobOptions): Promise<Job> {
   const buildSecret = `build-secret-${hex(10)}`;
   const multiLine = `first-line-${hex(6)}\nsecond-line-${hex(6)}`;
   const deploymentId = `dep-${name}-${hex(4)}`;
-  const signed = (sig: string) => `${API_BASE}/s3/${CACHE_KEY}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`;
+  const cacheKey = o.cacheKey ?? CACHE_KEY;
+  const signed = (sig: string) => `${API_BASE}/s3/${cacheKey}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=${sig}`;
   const credentials: Credentials = {
     accessKeyId: `AKIA${hex(8).toUpperCase()}`,
     secretAccessKey: `fake/Secret+${hex(12)}/Key`,
@@ -155,7 +162,7 @@ export async function newJob(name: string, o: JobOptions): Promise<Job> {
     commands: o.commands ?? DEFAULT_COMMANDS,
     env: { COMPOSER_DISABLE_NETWORK: '1', APP_SECRET: buildSecret, MULTI_LINE_SECRET: multiLine, APP_NAME: 'fixture' },
     mask: [buildSecret, multiLine],
-    cache: { restore_url: signed(`restore${hex(16)}`), save_url: signed(`save${hex(16)}`), key: CACHE_KEY },
+    cache: { restore_url: signed(`restore${hex(16)}`), save_url: signed(`save${hex(16)}`), key: cacheKey },
     timeout_seconds: o.timeoutSeconds ?? 600,
   };
   const before = await requests();
@@ -163,6 +170,7 @@ export async function newJob(name: string, o: JobOptions): Promise<Job> {
     job: doc, ticket, credentials, claimAnswers: o.claimAnswers ?? [],
     permissionsBoundary: o.permissionsBoundary ?? null,
     ...(o.startAnswer ? { startAnswer: o.startAnswer } : {}),
+    suspendOnIdle: o.suspendOnIdle ?? true,
   });
   if (r.status !== 204) throw new Error(`could not set the job: ${JSON.stringify(r.json)}`);
   return {
@@ -172,10 +180,13 @@ export async function newJob(name: string, o: JobOptions): Promise<Job> {
   };
 }
 
-/** What the fake Cloud recorded for this job (requests made after it was registered). */
-export async function recorded(job: Job): Promise<{ cloud: Recorded[]; git: GitRecorded[] }> {
+/** What the fake Cloud recorded for this job (requests made after it was registered, and its /suspend calls). */
+export async function recorded(job: Job): Promise<{ cloud: Recorded[]; git: GitRecorded[]; suspends: SuspendRecorded[] }> {
   const all = await requests();
-  return { cloud: all.cloud.slice(job.from.cloud), git: all.git.slice(job.from.git) };
+  return {
+    cloud: all.cloud.slice(job.from.cloud), git: all.git.slice(job.from.git),
+    suspends: all.suspends.filter((s) => s.deployment_id === job.doc.deployment_id),
+  };
 }
 
 export const isIdleCall = (r: Recorded) => r.pathname === '/api/v1/runner/idle';

@@ -42,13 +42,14 @@ jobs:
       ECR_REPO: ${{ vars.ECR_REPO }}
       AWS_REGION: ${{ vars.AWS_REGION }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - uses: aws-actions/configure-aws-credentials@v4
+      # No install scripts needed: esbuild and tsx work without esbuild's optional postinstall (verified on linux/arm64).
+      - run: npm ci --ignore-scripts
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ vars.PUBLISHER_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -71,20 +72,25 @@ jobs:
           echo "image_version=$(sed -n 's/^image_version=//p' build/publish.log)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push the Fargate image
+        id: fargate
         run: |
+          # ECR tags are immutable: the run id and attempt keep a scheduled rebuild of an unchanged main (or a re-run) unique.
+          image="$ECR_REPO:php85-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           registry="${ECR_REPO%%/*}"
           aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
           mkdir build/context && unzip -q build/image.zip -d build/context
-          docker build --platform linux/arm64 -t "$ECR_REPO:php85-$GITHUB_SHA" build/context
-          docker push "$ECR_REPO:php85-$GITHUB_SHA"
+          docker build --platform linux/arm64 -t "$image" build/context
+          docker push "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - name: Register the Fargate task definition
         id: taskdef
         env:
           EXECUTION_ROLE_ARN: ${{ vars.FARGATE_EXECUTION_ROLE_ARN }}
+          IMAGE: ${{ steps.fargate.outputs.image }}
         run: |
           jq -n \
-            --arg image "$ECR_REPO:php85-$GITHUB_SHA" \
+            --arg image "$IMAGE" \
             --arg role "$EXECUTION_ROLE_ARN" \
             --arg region "$AWS_REGION" '{
               family: "arco-runner-php85",
@@ -114,6 +120,7 @@ jobs:
           IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
           IMAGE_VERSION: ${{ steps.microvm.outputs.image_version }}
           TASK_DEFINITION_ARN: ${{ steps.taskdef.outputs.task_definition_arn }}
+          FARGATE_IMAGE: ${{ steps.fargate.outputs.image }}
         run: |
           {
             echo "### Arco runner image published to $STAGE"
@@ -125,4 +132,6 @@ jobs:
             echo "CLOUD_RUNNERS_IMAGE_VERSION_85=$IMAGE_VERSION"
             echo "CLOUD_RUNNERS_TASK_DEFINITION_85=$TASK_DEFINITION_ARN"
             echo '```'
+            echo
+            echo "Fargate image: \`$FARGATE_IMAGE\`"
           } >> "$GITHUB_STEP_SUMMARY"

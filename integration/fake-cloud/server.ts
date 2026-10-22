@@ -2,7 +2,9 @@
 //   - forwards the runner protocol and the S3-like cache calls to a loopback-cloud.ts instance (one per job),
 //   - serves git smart HTTP (`git http-backend`) under /git/, refusing any request without the current job's
 //     `Authorization` header,
-//   - lets the test driver set the job, commit to the repos, seed a cache object and read what was recorded (/admin/*).
+//   - lets the test driver set the job, commit to the repos, seed a cache object and read what was recorded (/admin/*),
+//   - like Cloud's RunnerController::idle, calls the runner's Lambda /suspend hook BEFORE it answers /idle (unless the
+//     job was registered with `suspendOnIdle: false`, e.g. a Fargate run) and records the hook's status.
 // Runs with Node 24's type stripping: `node integration/fake-cloud/server.ts`.
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
@@ -15,13 +17,18 @@ const PORT = Number(process.env.FAKE_CLOUD_PORT ?? 8081);
 const GIT_ROOT = process.env.FAKE_CLOUD_GIT_ROOT ?? '/srv/git';
 const WORK_ROOT = process.env.FAKE_CLOUD_WORK_ROOT ?? '/srv/work';
 const TEMPLATE = process.env.FAKE_CLOUD_TEMPLATE ?? '/srv/template';
+const RUNNER_HOOKS = process.env.FAKE_CLOUD_RUNNER_HOOKS ?? 'http://runner:9000/aws/lambda-microvms/runtime/v1';
 
 interface GitRequest { method: string; path: string; authorized: boolean; at: number }
+/** One /suspend hook call made while answering /idle; status 0 when the hook could not be reached. */
+interface SuspendCall { deployment_id: string; status: number; at: number }
 
 let cloud: FakeCloud | null = null;
 /** Every protocol request of every job, in arrival order (each loopback instance only knows its own). */
 const finishedJobs: FakeCloud[] = [];
 const gitRequests: GitRequest[] = [];
+const suspendCalls: SuspendCall[] = [];
+let suspendOnIdle = true;
 /** Cache objects seeded before the first job; afterwards each job's instance inherits the previous one's. */
 const pendingObjects = new Map<string, Buffer>();
 
@@ -151,6 +158,20 @@ async function serveGit(req: IncomingMessage, res: ServerResponse, url: URL, bod
 /** The runner protocol and the cache: forwarded to the current job's loopback instance. */
 async function forward(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
   if (!cloud) return json(res, 409, { error: 'ticket_invalid' });
+  if (req.method === 'POST' && req.url?.split('?')[0] === '/api/v1/runner/idle' && suspendOnIdle) {
+    // Cloud's idle handler suspends the VM (RunnerFleet::park -> SuspendMicrovm) before it answers 204.
+    let deploymentId = '';
+    try { deploymentId = String((JSON.parse(body.toString('utf8')) as { deployment_id?: unknown }).deployment_id ?? ''); } catch { /* not JSON */ }
+    let status = 0;
+    try {
+      const r = await fetch(`${RUNNER_HOOKS}/suspend`, { method: 'POST', signal: AbortSignal.timeout(10_000) });
+      await r.body?.cancel();
+      status = r.status;
+    } catch (e) {
+      console.error(`fake-cloud: /suspend hook failed: ${(e as Error).message}`);
+    }
+    suspendCalls.push({ deployment_id: deploymentId, status, at: Date.now() });
+  }
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (v === undefined || ['host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive'].includes(k)) continue;
@@ -180,8 +201,10 @@ async function admin(req: IncomingMessage, res: ServerResponse, url: URL, body: 
   const input = body.length ? JSON.parse(body.toString('utf8')) : {};
   switch (`${req.method} ${url.pathname}`) {
     case 'POST /admin/job': {
+      const { suspendOnIdle: suspend, ...options } = input as FakeCloudOptions & { suspendOnIdle?: boolean };
+      suspendOnIdle = suspend !== false;
       const previous = cloud;
-      const next = await startFakeCloud(input as FakeCloudOptions);
+      const next = await startFakeCloud(options);
       for (const [k, v] of previous?.objects ?? pendingObjects) next.objects.set(k, v);
       if (previous) {
         finishedJobs.push(previous);
@@ -195,7 +218,7 @@ async function admin(req: IncomingMessage, res: ServerResponse, url: URL, body: 
     case 'POST /admin/cache':
       return json(res, 200, { size: await seedCache(input.key, input.manifest, input.files ?? {}) });
     case 'GET /admin/requests':
-      return json(res, 200, { cloud: allRequests().map(serialize), git: gitRequests });
+      return json(res, 200, { cloud: allRequests().map(serialize), git: gitRequests, suspends: suspendCalls });
     case 'GET /admin/objects':
       return json(res, 200, Object.fromEntries([...(cloud?.objects ?? pendingObjects)].map(([k, v]) => [k, v.length])));
     case 'GET /admin/health':

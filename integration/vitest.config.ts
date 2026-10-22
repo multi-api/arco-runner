@@ -10,5 +10,7 @@ export default defineConfig({
     testTimeout: 240_000,
     hookTimeout: 1_000_000,
     reporters: ['verbose'],
+    // The scenarios share one runner and build on each other's state: stop at the first failure.
+    bail: 1,
   },
 });

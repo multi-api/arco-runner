@@ -47,7 +47,7 @@ npm ci --prefix integration
 npm run test:integration                 # extra arguments go to vitest, e.g. -- -t 'warm'
 ```
 
-Set `ARCO_RUNNER_IMAGE=<image>` to test an image you already built instead (CI does). The scenarios share one runner container and run in order; the published ports are `127.0.0.1:38080` (control), `39000` (hooks) and `38081` (fake Cloud), overridable with `RUNNER_CONTROL_PORT`, `RUNNER_HOOKS_PORT` and `FAKE_CLOUD_PORT`.
+Set `ARCO_RUNNER_IMAGE=<image>` to test an image you already built instead (CI does). The scenarios share one runner container and must run in order (each builds on the state the previous ones left; a filter such as `-t 'warm'` alone only works for scenarios that need no earlier one), so vitest stops at the first failure (`bail: 1`). Like Cloud, the fake Cloud calls the runner's `/suspend` hook before it answers `/idle`, and the MicroVM scenarios check that hook answered 200. The published ports are `127.0.0.1:38080` (control), `39000` (hooks) and `38081` (fake Cloud), overridable with `RUNNER_CONTROL_PORT`, `RUNNER_HOOKS_PORT` and `FAKE_CLOUD_PORT`.
 
 ### Smoke against Herd
 
@@ -72,8 +72,10 @@ It runs the image with `ARCO_RUNNER_ALLOW_HTTP=1` and `--add-host arco-cloud.tes
 1. assumes the publisher role through GitHub OIDC (`vars.PUBLISHER_ROLE_ARN`, `vars.AWS_REGION`);
 2. downloads and verifies the PHP CLI, FrankenPHP and Composer, bundles the agent and packages `build/image.zip`;
 3. runs `scripts/publish-microvm-image.ts`: uploads the zip to `s3://$ARTIFACT_BUCKET/images/arco-runner-php85/<sha>.zip`, creates or updates the MicroVM image `arco-runner-php85` on the newest managed `al2023` base, and waits (up to 60 minutes) for the new version to reach `SUCCESSFUL`, which includes the `/validate` fixture build. A `FAILED` version fails the job and prints its `stateReason`;
-4. builds and pushes `$ECR_REPO:php85-<sha>` and registers a new revision of the Fargate task definition `arco-runner-php85` (2 vCPU / 4 GB, ARM64, 30 GiB ephemeral storage, no task role);
+4. builds and pushes `$ECR_REPO:php85-<sha>-<run id>-<run attempt>` (ECR tags are immutable, so every run, including the monthly rebuild of an unchanged `main` and re-runs, gets its own tag) and registers a new revision of the Fargate task definition `arco-runner-php85` (2 vCPU / 4 GB, ARM64, 30 GiB ephemeral storage, no task role);
 5. writes the three values below to the job summary.
+
+**First staging publish:** `publish-microvm-image.ts` picks the managed base whose ARN contains `al2023` (the newest match). Before trusting it, confirm in the publish log (or `ListManagedMicrovmImages`) that the chosen base is the same `al2023-minimal` flavour the Dockerfile builds on (`public.ecr.aws/lambda/microvms:al2023-minimal`); if a non-minimal al2023 base is picked, tighten the match in the script before the image is used.
 
 Environment variables for each of `staging` and `prod`: `PUBLISHER_ROLE_ARN`, `AWS_REGION`, `ARTIFACT_BUCKET`, `BUILD_ROLE_ARN`, `ECR_REPO`, `FARGATE_EXECUTION_ROLE_ARN`.
 

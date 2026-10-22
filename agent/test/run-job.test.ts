@@ -91,10 +91,13 @@ async function run(w: World, o: RunOptions = {}) {
   const sleeps: number[] = [];
   const wipes: string[] = [];
   const phases: JobPhase[] = [];
+  // How many idle requests Cloud had seen when the job entered its idle phase (R22: must be 0).
+  let idleCallsAtIdlePhase: number | null = null;
   const logs: string[] = [];
   const deps: JobDeps = {
     paths: w.paths, identity: null, mode: 'microvm', signal: o.signal ?? new AbortController().signal,
-    knownCache: w.knownCache, onPhase: (p) => phases.push(p), receivedAt: Date.now(),
+    knownCache: w.knownCache, receivedAt: Date.now(),
+    onPhase: (p) => { phases.push(p); if (p === 'idle') idleCallsAtIdlePhase = cloud.calls('/idle').length; },
     sleep: async (ms) => { sleeps.push(ms); },
     wipe: async (rootDir) => {
       wipes.push(rootDir);
@@ -113,7 +116,9 @@ async function run(w: World, o: RunOptions = {}) {
   const result = await runJob(ticket, deps);
   const api = cloud.requests.filter((r) => !r.pathname.startsWith('/s3/'));
   const finishes = cloud.calls('/finish').map((r) => JSON.parse(r.body.toString('utf8')));
-  return { cloud, result, sleeps, wipes, phases, logs, api, finishes, order: api.map((r) => r.pathname.split('/').pop()) };
+  return {
+    cloud, result, sleeps, wipes, phases, logs, api, finishes, idleCallsAtIdlePhase, order: api.map((r) => r.pathname.split('/').pop()),
+  };
 }
 
 const fakeResult = {
@@ -139,7 +144,9 @@ describe('runJob: happy path', () => {
     expect(r.finishes).toEqual([toFinishPayload(fakeResult, 0, '0.10.0', fakeInventory)]);
     expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: true, idleReported: true });
     expect(r.wipes).toEqual(['']);
-    expect(r.phases).toEqual(['running', 'saving', 'wiping']);
+    // R22: idle (clean, suspendable) before the idle report, which Cloud answers only after suspending the VM.
+    expect(r.phases).toEqual(['running', 'saving', 'wiping', 'idle']);
+    expect(r.idleCallsAtIdlePhase).toBe(0);
     for (const req of r.api) {
       if (!req.pathname.endsWith('/claim')) expect(req.headers.authorization).toBe(`Bearer ${TOKEN}`);
       expect(req.headers['x-arco-cloud-api']).toBe('1');
@@ -226,7 +233,8 @@ describe('runJob: errors and refusals', () => {
     const r = await run(w, { cloud: { startAnswer: { status: 500, body: { error: 'boom' } } } });
     expect(r.order).toEqual(['claim', 'start', 'idle']);
     expect(r.wipes).toEqual([]);
-    expect(r.phases).toEqual(['running']);
+    expect(r.phases).toEqual(['running', 'idle']);
+    expect(r.idleCallsAtIdlePhase).toBe(0);
     expect(r.result).toEqual({ deploymentId: 'dep_1', finished: false, buildOk: false, idleReported: true });
     expect(existsSync(join(w.paths.repo, 'composer.json'))).toBe(false);
   });
@@ -380,8 +388,9 @@ describe('runJob: R13 kill before cache save', () => {
   it('skips the save when the kill fails, and still wipes and reports idle', async () => {
     const w = await world();
     let kills = 0;
-    const r = await run(w, { deps: { killBuildProcesses: async () => { kills++; throw new Error('1 process(es) of uid 1000 survived SIGKILL'); } } });
-    expect(kills).toBe(1);
+    // The kill before arco deploy (M3) succeeds; the one before the save fails.
+    const r = await run(w, { deps: { killBuildProcesses: async () => { if (++kills === 2) throw new Error('1 process(es) of uid 1000 survived SIGKILL'); } } });
+    expect(kills).toBe(2);
     expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
     expect(w.knownCache.get()).toBeNull();
     expect(r.logs.some((l) => l.startsWith('cache save skipped'))).toBe(true);
@@ -397,6 +406,8 @@ describe('runJob: fargate', () => {
     expect(r.wipes).toEqual([]);
     expect(r.result).toMatchObject({ finished: true, idleReported: true });
     expect(r.order.at(-1)).toBe('idle');
+    expect(r.phases).not.toContain('idle'); // fargate reports idle, then exits
+
   }, 30_000);
 });
 
@@ -457,4 +468,104 @@ describe('claim and reportIdle', () => {
     expect(gaps).toEqual([1000, 1000]);
     expect(bodies[0]).toEqual({ deployment_id: 'dep_1' });
   });
+});
+
+describe('runJob: I2 restore failures', () => {
+  /** Answers the cache GET itself; everything else goes to the fake Cloud. */
+  const cacheGet = (answer: () => Response): typeof fetch => async (input, init) => {
+    const url = String(input);
+    if (url.includes('/s3/cache') && (init?.method ?? 'GET') === 'GET') return answer();
+    return fetch(input, init);
+  };
+
+  itTar('saves a fresh cache after a content failure (corrupt archive)', async () => {
+    const w = await world();
+    const r = await run(w, { deps: { fetchImpl: cacheGet(() => new Response(Buffer.from('this is not a zstd archive'))) } });
+    expect(r.result.buildOk).toBe(true);
+    expect(r.logs.join('\n')).not.toContain('cache not saved');
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(1);
+    expect(w.knownCache.get()).toMatchObject({ key: 'env-1' });
+  }, 30_000);
+
+  it('saves nothing after a transient failure (HTTP 500)', async () => {
+    const w = await world();
+    const r = await run(w, { deps: { fetchImpl: cacheGet(() => new Response('boom', { status: 500 })) } });
+    expect(r.result.buildOk).toBe(true);
+    const events = r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).events as { key: string; status: string; message?: string }[]);
+    expect(events).toContainEqual(expect.objectContaining({ key: 'build.cache_restore', status: 'warning' }));
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+    expect(w.knownCache.get()).toBeNull();
+  }, 30_000);
+
+  it.each([403, 503])('treats HTTP %i as transient', async (status) => {
+    const w = await world();
+    const r = await run(w, { deps: { fetchImpl: cacheGet(() => new Response('x', { status })) } });
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+  }, 30_000);
+});
+
+describe('runJob: M2 permissions boundary', () => {
+  it('never passes a customer-set ARCO_PERMISSIONS_BOUNDARY to arco', async () => {
+    const w = await world();
+    const dump = join(w.out, 'arco-env.json');
+    const r = await run(w, { env: { FAKE_ARCO_ENVDUMP: dump, ARCO_PERMISSIONS_BOUNDARY: 'arn:aws:iam::1:policy/customer', arco_permissions_boundary: 'x-lower' } });
+    expect(r.result.buildOk).toBe(true);
+    for (const cmd of ['deploy', 'info', '--version']) {
+      const env = JSON.parse(await readFile(`${dump}.${cmd}`, 'utf8')) as Record<string, string>;
+      expect(env).not.toHaveProperty('ARCO_PERMISSIONS_BOUNDARY');
+      expect(env).not.toHaveProperty('arco_permissions_boundary');
+    }
+  }, 30_000);
+
+  it("passes Cloud's boundary to arco deploy only", async () => {
+    const w = await world();
+    const dump = join(w.out, 'arco-env.json');
+    const boundary = 'arn:aws:iam::123:policy/cloud-boundary';
+    await run(w, { env: { FAKE_ARCO_ENVDUMP: dump, ARCO_PERMISSIONS_BOUNDARY: 'arn:customer' }, cloud: { permissionsBoundary: boundary } });
+    expect(JSON.parse(await readFile(`${dump}.deploy`, 'utf8')).ARCO_PERMISSIONS_BOUNDARY).toBe(boundary);
+    expect(JSON.parse(await readFile(`${dump}.info`, 'utf8'))).not.toHaveProperty('ARCO_PERMISSIONS_BOUNDARY');
+  }, 30_000);
+});
+
+describe('runJob: M3 kill before arco deploy', () => {
+  it('kills the build processes after the build commands and before arco deploy', async () => {
+    const w = await world();
+    const built = join(w.out, 'built');
+    const calls = join(w.out, 'arco-calls.txt');
+    const seen: { built: boolean; arco: boolean }[] = [];
+    const r = await run(w, {
+      commands: [`touch "${built}"`], env: { FAKE_ARCO_CALLS: calls },
+      deps: { killBuildProcesses: async () => { seen.push({ built: existsSync(built), arco: existsSync(calls) }); } },
+    });
+    expect(r.result.buildOk).toBe(true);
+    expect(seen[0]).toEqual({ built: true, arco: false });
+  }, 30_000);
+
+  it('a kill failure before deploy finishes failed runner.internal_error, then wipes and reports idle', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls },
+      deps: { killBuildProcesses: async () => { throw new Error('1 process(es) of uid 1000 survived SIGKILL'); } },
+    });
+    expect(existsSync(calls)).toBe(false);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'runner.internal_error' });
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+});
+
+describe('runJob: failure finish redaction', () => {
+  it('a mask value equal to a JSON literal does not break the failure finish', async () => {
+    const w = await world();
+    const r = await run(w, { commands: ['exit 3'], mask: ['null', 'failed', MASKED] });
+    // Strings are still masked (error_code included); the result enum, null and booleans are untouched.
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'build.command_***',
+      error_message: '`exit 3` exited with code 3', arco_version: null,
+    }]);
+    expect(r.result).toMatchObject({ finished: true, idleReported: true });
+  }, 30_000);
 });
