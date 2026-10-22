@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Agent } from '../src/agent.js';
+import { Agent as RealAgent } from '../src/agent.js';
 import { startServers } from '../src/servers.js';
+
+vi.mock('../src/job/run-job.js', () => ({
+  runJob: async (_p: unknown, deps: { wipe: (r: string) => Promise<void> }) => { await deps.wipe('.'); return {}; },
+}));
 
 const HOOK = '/aws/lambda-microvms/runtime/v1';
 const GOOD = { ticket: 'tkt_0123456789abcdef', api_base: 'https://cloud.example', deployment_id: 'dep-1' };
@@ -24,7 +29,7 @@ async function boot(agent: Agent, o: Partial<Parameters<typeof startServers>[1]>
   const logs: string[] = [];
   const onTerminate = vi.fn();
   const s = await startServers(agent, {
-    hooksPort: 0, controlPort: 0, ready: async () => true, validate: async () => 'passed', allowHttp: false,
+    hooksPort: 0, controlPort: 0, ready: async () => true, validate: async () => {}, allowHttp: false,
     onTerminate, log: (m) => logs.push(m), ...o,
   });
   closers.push(s.close);
@@ -79,14 +84,56 @@ describe('hooks server', () => {
     expect((await hooks('ready')).status).toBe(200);
   });
 
-  it('/validate maps running, passed, failed to 503, 200, 500', async () => {
-    let r: 'running' | 'passed' | 'failed' = 'running';
-    const { hooks } = await boot(fakeAgent(), { validate: async () => r });
+  it('/validate: 503 while running, 200 once passed (through the real Agent)', async () => {
+    let release!: () => void;
+    const agent = new RealAgent({ paths: {} as never, identity: null, mode: 'microvm', wipe: async () => {}, log: () => {} });
+    const { hooks, ctl } = await boot(agent, { validate: () => new Promise<void>((r) => { release = r; }) });
     expect((await hooks('validate')).status).toBe(503);
-    r = 'passed';
-    expect((await hooks('validate')).status).toBe(200);
-    r = 'failed';
-    expect((await hooks('validate')).status).toBe(500);
+    expect(agent.canSuspend()).toBe(false);
+    expect((await hooks('suspend')).status).toBe(503);
+    expect((await ctl('POST', '/job', GOOD)).status).toBe(409);
+    release();
+    await vi.waitFor(async () => expect((await hooks('validate')).status).toBe(200));
+    expect((await hooks('suspend')).status).toBe(200);
+  });
+
+  it('/validate is 500 when the validation fails, and the agent is dirty', async () => {
+    const agent = new RealAgent({ paths: {} as never, identity: null, mode: 'microvm', wipe: async () => {}, log: () => {} });
+    const { hooks, ctl } = await boot(agent, { validate: async () => { throw new Error('nope'); } });
+    await hooks('validate');
+    await vi.waitFor(async () => expect((await hooks('validate')).status).toBe(500));
+    expect((await hooks('suspend')).status).toBe(503);
+    expect((await ctl('POST', '/job', GOOD)).status).toBe(409);
+  });
+
+  it('/validate after a job was accepted is 409 refused and runs nothing', async () => {
+    const validate = vi.fn(async () => {});
+    const agent = fakeAgent({ validate: vi.fn(() => 'refused') });
+    const { hooks } = await boot(agent, { validate });
+    const res = await hooks('validate');
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'refused' });
+    expect(validate).not.toHaveBeenCalled();
+  });
+
+  it('a dirty real Agent answers /suspend 503 and /job 409', async () => {
+    const agent = new RealAgent({ paths: {} as never, identity: null, mode: 'microvm', wipe: async () => { throw new Error('wipe'); }, log: () => {} });
+    const { hooks, ctl } = await boot(agent);
+    expect((await ctl('POST', '/job', GOOD)).status).toBe(202);
+    await agent.whenIdle();
+    expect(agent.state).toBe('dirty');
+    expect((await hooks('suspend')).status).toBe(503);
+    expect((await ctl('POST', '/job', GOOD)).status).toBe(409);
+    expect((await hooks('validate')).status).toBe(409);
+  });
+
+  it('an oversized body is 400 on /job and ignored (200) on /run', async () => {
+    const agent = fakeAgent();
+    const { hooks, ctl } = await boot(agent);
+    const big = JSON.stringify({ ...GOOD, pad: 'x'.repeat(100_000) });
+    expect((await ctl('POST', '/job', big)).status).toBe(400);
+    expect((await hooks('run', JSON.parse(big))).status).toBe(200);
+    expect(agent.accept).not.toHaveBeenCalled();
   });
 
   it('/resume calls agent.resume; /suspend follows canSuspend', async () => {

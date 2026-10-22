@@ -9,7 +9,8 @@ export interface ServerOptions {
   hooksPort: number;
   controlPort: number;
   ready: () => Promise<boolean>;
-  validate: () => Promise<'running' | 'passed' | 'failed'>;
+  /** The image validation; run through agent.validate (R18). */
+  validate: () => Promise<void>;
   allowHttp: boolean;
   onTerminate: () => void;
   log?: (message: string) => void;
@@ -77,8 +78,11 @@ export async function startServers(agent: Agent, o: ServerOptions): Promise<Runn
       switch (hook) {
         case 'ready': return send(res, (await o.ready()) ? 200 : 503);
         case 'validate': {
-          const r = await o.validate();
-          return send(res, r === 'passed' ? 200 : r === 'running' ? 503 : 500);
+          const started = agent.validate(o.validate);
+          if (started === 'refused') return send(res, 409, { error: 'refused' });
+          if (started === 'busy') return send(res, 503);
+          const r = agent.validation;
+          return send(res, r === 'passed' ? 200 : r === 'failed' ? 500 : 503);
         }
         case 'run': {
           let body: unknown;
@@ -141,6 +145,7 @@ export async function startServers(agent: Agent, o: ServerOptions): Promise<Runn
     }
   });
 
+  for (const s of [hooks, control]) { s.requestTimeout = 10_000; s.headersTimeout = 10_000; }
   const hooksPort = await listen(hooks, o.hooksPort);
   const controlPort = await listen(control, o.controlPort).catch((e) => { hooks.close(); throw e; });
   const close = async () => {

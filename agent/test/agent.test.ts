@@ -128,36 +128,74 @@ describe('Agent', () => {
     expect(ended).toBe(true);
   });
 
+  describe('validate (R18)', () => {
+    it('runs as state running, passes, then is idle and cached', async () => {
+      const a = new Agent(baseDeps);
+      let release!: () => void;
+      const fn = vi.fn(() => new Promise<void>((r) => { release = r; }));
+      expect(a.validate(fn)).toBe('started');
+      expect(a.state).toBe('running');
+      expect(a.validation).toBe('running');
+      expect(a.accept(P)).toBe('busy');
+      expect(a.canSuspend()).toBe(false);
+      expect(a.validate(fn)).toBe('started');
+      expect(fn).toHaveBeenCalledTimes(1);
+      release();
+      await a.whenIdle();
+      expect(a.validation).toBe('passed');
+      expect(a.state).toBe('idle');
+      expect(a.validate(fn)).toBe('started');
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failure makes the agent dirty', async () => {
+      const a = new Agent({ ...baseDeps, log: () => {} });
+      a.validate(async () => { throw new Error('x'); });
+      await a.whenIdle();
+      expect(a.validation).toBe('failed');
+      expect(a.state).toBe('dirty');
+    });
+
+    it('is refused once a job was accepted, and runs nothing', async () => {
+      const a = new Agent(baseDeps);
+      a.accept(P);
+      await a.whenIdle();
+      const fn = vi.fn(async () => {});
+      expect(a.validate(fn)).toBe('refused');
+      expect(fn).not.toHaveBeenCalled();
+    });
+  });
+
   // Review Focus 3: a VM resumed hours later holds idle keep-alive sockets the peer has since reset.
   describe('after resume', () => {
     let server: Server;
     afterEach(() => new Promise((r) => server.close(() => r(null))));
 
-    it('claims successfully against a server that destroyed the idle sockets', async () => {
-      const sockets = new Set<import('node:net').Socket>();
-      let claims = 0;
-      server = createServer((req, res) => {
-        if (req.url === '/api/v1/runner/claim') claims++;
-        res.writeHead(claims > 0 && req.url?.endsWith('claim') ? 409 : 200, { 'Content-Type': 'application/json', 'Keep-Alive': 'timeout=600' });
+    it('opens a new connection for a global fetch after resume and succeeds', async () => {
+      let connections = 0;
+      server = createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Keep-Alive': 'timeout=600' });
         res.end('{}');
       });
       server.keepAliveTimeout = 600_000;
-      server.on('connection', (s) => sockets.add(s));
+      const sockets = new Set<import('node:net').Socket>();
+      server.on('connection', (s) => { connections++; sockets.add(s); });
       await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
       const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
       await (await fetch(`${base}/warm`)).text(); // pools a keep-alive socket in the global dispatcher
-      const g = globalThis as Record<symbol, unknown>;
-      const before = g[Symbol.for('undici.globalDispatcher.1')];
-      for (const s of sockets) s.destroy(); // the peer resets everything while the VM was suspended
+      expect(connections).toBe(1);
+      for (const s of sockets) s.destroy(); // the peer reset everything while the VM was suspended
 
-      const a = new Agent(baseDeps);
-      a.resume();
-      expect(g[Symbol.for('undici.globalDispatcher.1')]).not.toBe(before);
+      new Agent(baseDeps).resume();
 
+      const res = await fetch(`${base}/after`);
+      expect(res.status).toBe(200);
+      expect(connections).toBe(2);
+      // claim (fresh connection per request) also succeeds
       const doc = await claim({ ...P, api_base: base }, { now: Date.now, sleep: async () => {}, receivedAt: Date.now() });
-      expect(claims).toBe(1); // reached the server on the first try (refused 409 -> null, but delivered)
-      expect(doc).toBeNull();
+      expect(doc).toBeNull(); // body '{}' is not a job document, but the request was delivered
+      expect(connections).toBe(3);
     });
   });
 });

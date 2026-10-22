@@ -19,6 +19,8 @@ export class Agent {
   private current: AgentState = 'idle';
   private job: { deploymentId: string; abort: AbortController; done: Promise<void> } | null = null;
   private cache: CacheManifest | null = null;
+  private jobEverAccepted = false;
+  private validationResult: 'running' | 'passed' | 'failed' | null = null;
 
   constructor(private readonly deps: AgentDeps) {}
 
@@ -27,6 +29,7 @@ export class Agent {
   accept(p: TicketPayload): 'accepted' | 'busy' {
     if (this.current !== 'idle') return 'busy';
     this.current = 'running';
+    this.jobEverAccepted = true;
     const abort = new AbortController();
     const receivedAt = Date.now();
     const done = new Promise<void>((resolve) => {
@@ -57,8 +60,33 @@ export class Agent {
     }
   }
 
+  /** The cached result of the image validation, null before it was asked for. */
+  get validation(): 'running' | 'passed' | 'failed' | null { return this.validationResult; }
+
+  /**
+   * R18: the image validation (spec 9.3) runs inside the state machine: `running` meanwhile (so /job is busy and
+   * /suspend 503), `dirty` if it fails. Only on a VM that never accepted a job; repeated calls return the cached result.
+   */
+  validate(fn: () => Promise<void>): 'started' | 'busy' | 'refused' {
+    if (this.jobEverAccepted) return 'refused';
+    if (this.validationResult !== null) return 'started';
+    if (this.current !== 'idle') return 'busy';
+    this.validationResult = 'running';
+    this.current = 'running';
+    const log = this.deps.log ?? ((m: string) => console.log(`[arco-runner] ${m}`));
+    let started: Promise<void>;
+    try { started = fn(); } catch (e) { started = Promise.reject(e); }
+    const done = started.then(
+      () => { this.validationResult = 'passed'; this.current = 'idle'; },
+      (e) => { this.validationResult = 'failed'; this.current = 'dirty'; log(`validation failed: ${messageOf(e)}`); },
+    );
+    this.job = { deploymentId: '', abort: new AbortController(), done };
+    void done.finally(() => { this.job = null; });
+    return 'started';
+  }
+
   cancel(deploymentId: string): 'cancelling' | 'idle' {
-    if (this.job && this.job.deploymentId === deploymentId && this.current !== 'dirty') {
+    if (this.job && this.job.deploymentId !== '' && this.job.deploymentId === deploymentId && this.current !== 'dirty') {
       this.job.abort.abort();
       return 'cancelling';
     }

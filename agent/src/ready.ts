@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { buildEnv, type Identity, type Paths } from './system.js';
 
@@ -22,10 +22,16 @@ export function writableBy(st: { uid: number; gid: number; mode: number }, id: I
  */
 export async function selfCheck(paths: Paths, identity: Identity | null): Promise<string | null> {
   try {
+    if (identity) {
+      const passwd = await readFile('/etc/passwd', 'utf8').catch(() => '');
+      if (!passwd.split('\n').some((l) => l.split(':')[0] === 'build' && l.split(':')[2] === String(identity.uid))) {
+        return `user build (uid ${identity.uid}) does not exist`;
+      }
+    }
     const env = buildEnv(paths, {});
     for (const [cmd, args] of TOOLS) {
       try {
-        await execFileP(cmd, args, { env, timeout: 30_000, ...(identity ? { uid: identity.uid, gid: identity.gid } : {}) });
+        await execFileP(cmd, args, { env, timeout: 10_000, ...(identity ? { uid: identity.uid, gid: identity.gid } : {}) });
       } catch (e) {
         return `${cmd} ${args[0]} failed${(e as { code?: unknown }).code !== undefined ? ` (${String((e as { code?: unknown }).code)})` : ''}`;
       }

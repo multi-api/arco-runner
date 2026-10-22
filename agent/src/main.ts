@@ -75,20 +75,8 @@ async function runMicroVm(): Promise<void> {
     return problem === null;
   }));
 
-  let validation: 'running' | 'passed' | 'failed' | null = null;
-  const validate = async () => {
-    if (validation === null) {
-      validation = 'running';
-      runValidation({ paths, identity, fixtureDir: FIXTURE_DIR }).then(
-        () => { validation = 'passed'; },
-        (e) => { validation = 'failed'; log(`validation failed: ${(e as Error).message}`); },
-      );
-    }
-    return validation;
-  };
-
   const servers = await startServers(agent, {
-    hooksPort: HOOKS_PORT, controlPort: CONTROL_PORT, ready, validate, allowHttp, log,
+    hooksPort: HOOKS_PORT, controlPort: CONTROL_PORT, ready, allowHttp, validate: () => runValidation({ paths, identity, fixtureDir: FIXTURE_DIR }), log,
     onTerminate: () => { void agent.terminate().finally(() => process.exit(0)); },
   });
   log(`listening: hooks ${servers.hooksPort}, control ${servers.controlPort}`);
