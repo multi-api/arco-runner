@@ -16,8 +16,8 @@ export type CacheCtx = {
   rootDir: string;
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
-  /** Listing limits; tests lower them. */
-  limits?: { maxMembers: number; maxLineBytes: number };
+  /** Resource caps; tests lower them. */
+  limits?: Partial<Limits>;
 };
 export type ArchiveEntry = { path: string; type: 'file' | 'dir' | 'symlink' | 'other'; target?: string };
 
@@ -25,6 +25,16 @@ export const MAX_ARCHIVE_BYTES = 2_147_483_648;
 export const MANIFEST_NAME = '.arco-cache.json';
 const ARCHIVE_NAME = 'cache.tar.zst';
 const TAR_ENV: NodeJS.ProcessEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', LC_ALL: 'C' };
+
+export type Limits = {
+  maxMembers: number; maxLineBytes: number; maxListingBytes: number; maxSymlinkBytes: number;
+  maxSegments: number; maxWalked: number; maxExcludes: number;
+};
+const LIMITS: Limits = {
+  maxMembers: 2_000_000, maxLineBytes: 64 * 1024, maxListingBytes: 512 * 1024 * 1024, maxSymlinkBytes: 64 * 1024 * 1024,
+  maxSegments: 4096, maxWalked: 5_000_000, maxExcludes: 100_000,
+};
+const limitsOf = (ctx: CacheCtx): Limits => ({ ...LIMITS, ...ctx.limits });
 
 export class CacheError extends Error {
   constructor(message: string) {
@@ -101,16 +111,25 @@ export function checkArchiveEntries(entries: ArchiveEntry[], roots: string[]): v
 }
 
 /** The stateful form of `checkArchiveEntries`: feed members in archive order, it throws on the first unsafe one. */
-export function createEntryChecker(roots: string[]): (e: ArchiveEntry) => void {
+export function createEntryChecker(
+  roots: string[],
+  caps: { maxSegments: number; maxSymlinkBytes: number } = LIMITS,
+): (e: ArchiveEntry) => void {
   const symlinks = new Set<string>();
+  let symlinkBytes = 0;
   return (e) => {
     if (e.path === '' || e.path.startsWith('/')) throw new UnsafeArchive(`absolute or empty member path: ${e.path}`);
     const segs = e.path.split('/').filter((s) => s !== '' && s !== '.');
     if (segs.includes('..')) throw new UnsafeArchive(`member path contains "..": ${e.path}`);
     const path = segs.join('/');
     if (e.type === 'other') throw new UnsafeArchive(`unsupported member type: ${path}`);
-    for (let i = 1; i < segs.length; i++) {
-      if (symlinks.has(segs.slice(0, i).join('/'))) throw new UnsafeArchive(`member below a symlink: ${path}`);
+    if (segs.length > caps.maxSegments) throw new UnsafeArchive('member path has too many segments');
+    if (symlinks.size > 0) {
+      let prefix = '';
+      for (let i = 0; i < segs.length - 1; i++) {
+        prefix = i === 0 ? segs[0]! : `${prefix}/${segs[i]}`;
+        if (symlinks.has(prefix)) throw new UnsafeArchive(`member below a symlink: ${path}`);
+      }
     }
     if (path === MANIFEST_NAME) {
       if (e.type !== 'file') throw new UnsafeArchive(`${MANIFEST_NAME} must be a regular file`);
@@ -130,6 +149,8 @@ export function createEntryChecker(roots: string[]): (e: ArchiveEntry) => void {
     if (resolved !== root && !resolved.startsWith(`${root}/`)) {
       throw new UnsafeArchive(`symlink leaves its cache root: ${path}`);
     }
+    symlinkBytes += Buffer.byteLength(path);
+    if (symlinkBytes > caps.maxSymlinkBytes) throw new UnsafeArchive('too many symlinks in the archive');
     symlinks.add(path);
   };
 }
@@ -238,14 +259,13 @@ async function removeManifest(path: string): Promise<void> {
   }
 }
 
-const LIMITS = { maxMembers: 2_000_000, maxLineBytes: 64 * 1024 };
 
 /**
  * Streams `tar --list` as the build user and hands each parsed member to `onEntry`, keeping no copy of the output.
  * The first parse/check error, or exceeding the member or line cap, kills tar's process group and throws.
  */
 function listArchive(archive: string, ctx: CacheCtx, onEntry: (e: ArchiveEntry) => void): Promise<void> {
-  const { maxMembers, maxLineBytes } = ctx.limits ?? LIMITS;
+  const { maxMembers, maxLineBytes, maxListingBytes } = limitsOf(ctx);
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
@@ -255,6 +275,7 @@ function listArchive(archive: string, ctx: CacheCtx, onEntry: (e: ArchiveEntry) 
     } catch { reject(new CacheError('cannot start tar')); return; }
     let failure: Error | null = null;
     let members = 0;
+    let total = 0;
     let pending: Buffer = Buffer.alloc(0);
     const kill = () => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
     const fail = (e: Error) => { if (!failure) { failure = e; kill(); } };
@@ -263,12 +284,15 @@ function listArchive(archive: string, ctx: CacheCtx, onEntry: (e: ArchiveEntry) 
       if (++members > maxMembers) { fail(new CacheError(`cache archive has more than ${maxMembers} members`)); return; }
       try { onEntry(parseListLine(buf.toString('utf8'))); } catch (e) { fail(e as Error); }
     };
+    const onAbort = () => fail(new CacheError('cache restore cancelled'));
     if (ctx.signal) {
-      if (ctx.signal.aborted) fail(new CacheError('cache restore cancelled'));
-      else ctx.signal.addEventListener('abort', () => fail(new CacheError('cache restore cancelled')), { once: true });
+      if (ctx.signal.aborted) onAbort();
+      else ctx.signal.addEventListener('abort', onAbort, { once: true });
     }
     child.stdout!.on('data', (chunk: Buffer) => {
       if (failure) return;
+      total += chunk.length;
+      if (total > maxListingBytes) { fail(new CacheError('archive listing is too large')); return; }
       pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
       let nl: number;
       while (!failure && (nl = pending.indexOf(0x0a)) >= 0) {
@@ -278,8 +302,9 @@ function listArchive(archive: string, ctx: CacheCtx, onEntry: (e: ArchiveEntry) 
       }
       if (pending.length > maxLineBytes) fail(new CacheError('archive listing line too long'));
     });
-    child.once('error', () => reject(new CacheError('cannot run tar')));
+    child.once('error', () => { ctx.signal?.removeEventListener('abort', onAbort); reject(new CacheError('cannot run tar')); });
     child.once('close', (code) => {
+      ctx.signal?.removeEventListener('abort', onAbort);
       if (!failure && pending.length) line(pending);
       if (failure) reject(failure);
       else if (code !== 0) reject(new CacheError(`cache archive listing failed (tar exit ${code})`));
@@ -314,6 +339,10 @@ async function download(url: string, dest: string, ctx: CacheCtx): Promise<'ok' 
   return 'ok';
 }
 
+/**
+ * Precondition (ruling R13): no build process is alive. The job runner restores before any build command starts.
+ * Every filesystem operation by the agent over build-owned paths uses lstat/unlink and never follows links.
+ */
 export async function restoreCache(
   url: string,
   ctx: CacheCtx,
@@ -326,7 +355,7 @@ export async function restoreCache(
   try {
     if ((await download(url, archive, ctx)) === 'missing') return { status: 'missing', manifest: null };
 
-    const check = createEntryChecker(cacheRoots(ctx.rootDir));
+    const check = createEntryChecker(cacheRoots(ctx.rootDir), limitsOf(ctx));
     await listArchive(archive, ctx, check);
 
     await ensureHome(paths.home, identity);
@@ -351,10 +380,15 @@ export async function restoreCache(
  * Walks the roots with lstat only (never following a link) and returns every member that `restoreCache` would
  * refuse: symlinks `checkArchiveEntries` rejects, and anything that is not a regular file, directory or symlink.
  */
-async function unrestorableMembers(home: string, present: string[], rootDir: string): Promise<string[]> {
-  const check = createEntryChecker(cacheRoots(rootDir));
+async function unrestorableMembers(
+  home: string, present: string[], rootDir: string, signal: AbortSignal, limits: Limits,
+): Promise<string[]> {
+  const check = createEntryChecker(cacheRoots(rootDir), limits);
   const out: string[] = [];
+  let walked = 0;
   const visit = async (rel: string): Promise<void> => {
+    if (++walked > limits.maxWalked) throw new CacheError('cache roots hold too many entries');
+    if (walked % 1000 === 0 && signal.aborted) throw new CacheError('cache save aborted');
     let st;
     try { st = await lstat(join(home, rel)); } catch { return; }
     const entry: ArchiveEntry = st.isDirectory() ? { path: rel, type: 'dir' }
@@ -364,6 +398,8 @@ async function unrestorableMembers(home: string, present: string[], rootDir: str
       try { entry.target = await readlink(join(home, rel)); } catch { out.push(rel); return; }
     }
     try { check(entry); } catch { out.push(rel); return; }
+    if (out.length > limits.maxExcludes) throw new CacheError('too many members to exclude from the cache');
+    // lstat said real directory: only then do we descend; a link or anything else is never entered.
     if (entry.type !== 'dir') return;
     let names: string[];
     try { names = await readdir(join(home, rel)); } catch { return; }
@@ -388,6 +424,10 @@ function tarToFd(args: string[], cwd: string, identity: Identity | null, fd: num
   });
 }
 
+/**
+ * Precondition (ruling R13): no build process is alive (the runner kills every build-user process before saving),
+ * so the walk over the roots cannot race a build swapping entries.
+ */
 export async function saveCache(
   url: string,
   manifest: CacheManifest,
@@ -418,11 +458,23 @@ export async function saveCache(
     }
     // Members restore would refuse (escaping symlinks, FIFOs, sockets, devices) are left out: the package managers
     // recreate such links on install, and one of them must not make every restore refuse the whole archive.
-    const excludes = await unrestorableMembers(paths.home, present, ctx.rootDir);
+    let excludes: string[];
+    try {
+      excludes = await unrestorableMembers(paths.home, present, ctx.rootDir, signal, limitsOf(ctx));
+    } catch (e) {
+      if (timedOut()) return 'timeout';
+      throw e;
+    }
+    if (signal.aborted) {
+      if (timedOut()) return 'timeout';
+      throw new CacheError('cache save cancelled');
+    }
     const excludeFile = join(paths.varDir, 'exclude.list');
     // tar reads --exclude-from one name per line (--null does not apply to it), so a name holding a newline
     // cannot be excluded literally: the save fails cleanly rather than archive something restore would refuse.
     if (excludes.some((x) => x.includes('\n'))) throw new CacheError('a cache file name contains a newline');
+    // ...and --exclude-from strips trailing whitespace from each line, so such a name cannot be matched literally.
+    if (excludes.some((x) => /[ \t\r\v\f]$/.test(x))) throw new CacheError('a cache file name ends in whitespace');
     await writeFile(excludeFile, excludes.map((x) => `${x}\n`).join(''), { flag: 'w', mode: 0o644 });
     const fh = await open(archive, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     let code: number;

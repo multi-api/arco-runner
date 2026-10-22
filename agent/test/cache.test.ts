@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  type CacheCtx, type CacheManifest, CacheError, UnsafeArchive, cacheRoots, checkArchiveEntries, lockHashes,
+  type CacheCtx, type CacheManifest, CacheError, UnsafeArchive, cacheRoots, createEntryChecker, checkArchiveEntries, lockHashes,
   parseListLine, restoreCache, saveCache, shouldSave,
 } from '../src/job/cache.js';
 import type { Paths } from '../src/system.js';
@@ -258,6 +258,54 @@ describe('archive round trip (GNU tar + zstd)', () => {
     execFileSync('mkfifo', [join(a.home, 'work/repo/vendor/new\nline')]);
     const { url, state } = await s3();
     await expect(saveCache(url, manifest, ctx(a), Date.now() + 60_000)).rejects.toBeInstanceOf(CacheError);
+    expect(state.puts).toBe(0);
+    expect(await readdir(a.varDir)).toEqual([]);
+  });
+
+  it('refuses a member with too many segments quickly and caps retained symlink bytes', () => {
+    const check = createEntryChecker(cacheRoots(''), { maxSegments: 4096, maxSymlinkBytes: 64 });
+    const t = Date.now();
+    expect(() => check({ path: `work/repo/vendor/${'a/'.repeat(30000)}a`, type: 'file' })).toThrow(UnsafeArchive);
+    const deep = `work/repo/vendor/${'a/'.repeat(3000)}f`;
+    check({ path: deep, type: 'file' });
+    expect(Date.now() - t).toBeLessThan(1000);
+    const c2 = createEntryChecker(cacheRoots(''), { maxSegments: 4096, maxSymlinkBytes: 40 });
+    c2({ path: 'work/repo/vendor/l1', type: 'symlink', target: 'x' });
+    expect(() => c2({ path: 'work/repo/vendor/l2xxxxxxxxxxx', type: 'symlink', target: 'x' })).toThrow(/too many symlinks/);
+  });
+
+  itTar('caps total listing bytes on restore', async () => {
+    const { a, b, ctx } = await env();
+    await populate(a.home);
+    const { url } = await s3();
+    await saveCache(url, manifest, ctx(a), Date.now() + 60_000);
+    await expect(restoreCache(url, ctx(b, { limits: { maxListingBytes: 100 } }))).rejects.toThrow(/too large/);
+    expect(existsSync(join(b.home, 'work/repo/vendor'))).toBe(false);
+  });
+
+  itTar('bounds the save walk: entry cap, exclude cap, abort and deadline', async () => {
+    const { a, ctx } = await env();
+    await populate(a.home);
+    const { url, state } = await s3();
+    await expect(saveCache(url, manifest, ctx(a, { limits: { maxWalked: 3 } }), Date.now() + 60_000))
+      .rejects.toThrow(/too many entries/);
+    execFileSync('mkfifo', [join(a.home, 'work/repo/vendor/p1')]);
+    execFileSync('mkfifo', [join(a.home, 'work/repo/vendor/p2')]);
+    await expect(saveCache(url, manifest, ctx(a, { limits: { maxExcludes: 1 } }), Date.now() + 60_000))
+      .rejects.toThrow(/too many members to exclude/);
+    const ac = new AbortController();
+    ac.abort();
+    await expect(saveCache(url, manifest, ctx(a, { signal: ac.signal }), Date.now() + 60_000)).rejects.toBeInstanceOf(CacheError);
+    expect(state.puts).toBe(0);
+    expect(await readdir(a.varDir)).toEqual([]);
+  });
+
+  itTar('fails the save cleanly when an excluded name ends in whitespace', async () => {
+    const { a, ctx } = await env();
+    await populate(a.home);
+    execFileSync('mkfifo', [join(a.home, 'work/repo/vendor/trail ')]);
+    const { url, state } = await s3();
+    await expect(saveCache(url, manifest, ctx(a), Date.now() + 60_000)).rejects.toThrow(/whitespace/);
     expect(state.puts).toBe(0);
     expect(await readdir(a.varDir)).toEqual([]);
   });
