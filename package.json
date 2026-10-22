@@ -2,6 +2,7 @@
   "name": "arco-runner",
   "private": true,
   "type": "module",
-  "workspaces": ["scripts"],
+  "workspaces": ["scripts", "agent"],
+  "scripts": { "test": "npm test --workspaces --if-present", "test:linux": "sh scripts/test-linux.sh" },
   "engines": { "node": ">=24" }
 }
