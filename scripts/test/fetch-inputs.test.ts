@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -22,7 +22,7 @@ let work: string;
 let fakeBin: string;
 let ghLog: string;
 
-function versionsFile(overrides: { phpSha?: string } = {}): string {
+function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string } = {}): string {
   const path = join(work, `versions-${Math.random().toString(36).slice(2)}.json`);
   const php = files['/frankenphp-1.13.1-r1/php-linux-aarch64']!;
   const fp = files['/frankenphp-1.13.1-r1/frankenphp-linux-aarch64']!;
@@ -31,11 +31,11 @@ function versionsFile(overrides: { phpSha?: string } = {}): string {
     JSON.stringify({
       php: {
         '8.5': {
-          release: 'frankenphp-1.13.1-r1',
+          release: overrides.release ?? 'frankenphp-1.13.1-r1',
           runtime_build: '1.13.1-r1',
           arco_build_id: 'php8.5.12-fp1.13.1-r1',
           php_cli_sha256: overrides.phpSha ?? sha(php),
-          php_cli_size: php.length,
+          php_cli_size: overrides.phpSize ?? php.length,
           frankenphp_sha256: sha(fp),
           frankenphp_size: fp.length,
         },
@@ -48,7 +48,7 @@ function versionsFile(overrides: { phpSha?: string } = {}): string {
 }
 
 // Async spawn: the test's own HTTP server must keep serving while the script runs.
-function run(versions: string, out: string): Promise<{ status: number | null; stdout: string; stderr: string }> {
+function run(versions: string, out: string, extraEnv: Record<string, string> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, ['--import', 'tsx', script, '--minor', '8.5', '--out', out], {
     env: {
       ...process.env,
@@ -57,6 +57,7 @@ function run(versions: string, out: string): Promise<{ status: number | null; st
       ARCO_RUNTIME_RELEASE_BASE: base,
       COMPOSER_DOWNLOAD_BASE: `${base}/composer`,
       FAKE_GH_LOG: ghLog,
+      ...extraEnv,
     },
   });
   let stdout = '';
@@ -71,7 +72,7 @@ beforeAll(async () => {
   fakeBin = join(work, 'bin');
   mkdirSync(fakeBin);
   ghLog = join(work, 'gh.log');
-  writeFileSync(join(fakeBin, 'gh'), '#!/bin/sh\necho "$@" >> "$FAKE_GH_LOG"\nexit 0\n');
+  writeFileSync(join(fakeBin, 'gh'), '#!/bin/sh\necho "$@" >> "$FAKE_GH_LOG"\n[ -n "$FAKE_GH_FAIL" ] && { echo "no matching attestation" >&2; exit 1; }\nexit 0\n');
   chmodSync(join(fakeBin, 'gh'), 0o755);
   server = createServer((req, res) => {
     const body = files[req.url ?? ''];
@@ -91,10 +92,38 @@ describe('fetch-inputs', () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain('php-linux-aarch64');
     expect(r.stderr).toContain('sha256');
+    expect(readdirSync(out)).toEqual([]);
+  });
+
+  it('exits 1 and names the file when the size does not match', async () => {
+    const out = join(work, 'out-size');
+    const r = await run(versionsFile({ phpSize: 1 }), out);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('php-linux-aarch64');
+    expect(r.stderr).toContain('size');
+    expect(readdirSync(out)).toEqual([]);
+  });
+
+  it('exits 1 and names the file when attestation verification fails', async () => {
+    const out = join(work, 'out-attest');
+    const r = await run(versionsFile(), out, { FAKE_GH_FAIL: '1' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('php-linux-aarch64');
+    expect(r.stderr).toContain('attestation');
+    expect(readdirSync(out)).toEqual([]); // no unverified bytes left behind
+  });
+
+  it('exits 1 when a download returns 404', async () => {
+    const out = join(work, 'out-404');
+    const r = await run(versionsFile({ release: 'frankenphp-0.0.0' }), out);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('HTTP 404');
+    expect(readdirSync(out)).toEqual([]);
   });
 
   it('downloads, verifies and attests every input when values are correct', async () => {
     const out = join(work, 'out-ok');
+    rmSync(ghLog, { force: true }); // earlier cases also call gh
     const r = await run(versionsFile(), out);
     expect(r.stderr).toBe('');
     expect(r.status).toBe(0);

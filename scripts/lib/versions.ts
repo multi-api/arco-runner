@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, readFileSync, writeFileSync } from 'node:fs';
+import { createReadStream, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,6 +16,7 @@ export interface PhpEntry {
 export interface Versions {
   php: Record<string, PhpEntry>;
   composer: { version: string; sha256: string };
+  corepack: { version: string };
   base_image_digest: string;
 }
 
@@ -57,4 +58,14 @@ export function parseArgs(argv: string[], required: string[]): Record<string, st
   }
   for (const name of required) if (!args[name]) throw new Error(`missing --${name}`);
   return args;
+}
+
+/** Throws, naming `name`, unless the file at `path` has the expected size (when given) and sha256. */
+export async function checkFile(path: string, name: string, sha256: string, size?: number): Promise<void> {
+  if (size !== undefined) {
+    const actual = statSync(path).size;
+    if (actual !== size) throw new Error(`${name}: size ${actual} does not match versions.json (${size})`);
+  }
+  const actual = await sha256File(path);
+  if (actual !== sha256) throw new Error(`${name}: sha256 ${actual} does not match versions.json (${sha256})`);
 }

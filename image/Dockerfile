@@ -5,11 +5,14 @@ FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51c
 ARG PHP_MINOR=8.5
 # Arco's build id for the pre-seeded runtime cache (the manifest key, e.g. php8.5.12-fp1.13.1-r1).
 ARG RUNTIME_BUILD=php8.5.12-fp1.13.1-r1
+ARG COREPACK_VERSION=0.36.0
 ARG REVISION=dev
 
-# corepack is not shipped by the dnf Node 24, so there are no yarn/pnpm shims (spec 9.1 designer's call dropped).
+# The dnf Node 24 does not ship corepack, so install a pinned one (yarn/pnpm shims for customers).
 RUN dnf install -y nodejs24 nodejs24-npm git-core zstd tar unzip shadow-utils util-linux-core findutils procps-ng ca-certificates \
- && dnf clean all
+ && dnf clean all \
+ && npm install -g corepack@${COREPACK_VERSION} \
+ && corepack enable
 
 RUN useradd -u 1000 -U -m -s /bin/bash build
 

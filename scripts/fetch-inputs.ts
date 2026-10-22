@@ -1,9 +1,9 @@
 // Downloads the PHP CLI, FrankenPHP and Composer for one PHP minor and verifies them against
 // image/versions.json: size, sha256 and the arco-runtime build attestation. Any mismatch exits 1.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { defaultVersionsPath, parseArgs, phpEntry, readVersions, sha256File } from './lib/versions.ts';
+import { checkFile, defaultVersionsPath, parseArgs, phpEntry, readVersions } from './lib/versions.ts';
 
 const RELEASE_BASE = process.env.ARCO_RUNTIME_RELEASE_BASE ?? 'https://github.com/multi-api/arco-runtime/releases/download';
 const COMPOSER_BASE = process.env.COMPOSER_DOWNLOAD_BASE ?? 'https://getcomposer.org/download';
@@ -25,18 +25,11 @@ async function download(url: string, dest: string): Promise<void> {
   writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
 }
 
-async function verify(input: Input): Promise<void> {
-  if (input.size !== undefined) {
-    const size = statSync(input.dest).size;
-    if (size !== input.size) throw new Error(`${input.asset}: size ${size} does not match versions.json (${input.size})`);
-  }
-  const actual = await sha256File(input.dest);
-  if (actual !== input.sha256) {
-    throw new Error(`${input.asset}: sha256 ${actual} does not match versions.json (${input.sha256})`);
-  }
+async function verify(input: Input, path: string): Promise<void> {
+  await checkFile(path, input.asset, input.sha256, input.size);
   if (input.attest) {
     try {
-      execFileSync('gh', ['attestation', 'verify', input.dest, '--repo', ATTEST_REPO, '--signer-workflow', ATTEST_SIGNER], {
+      execFileSync('gh', ['attestation', 'verify', path, '--repo', ATTEST_REPO, '--signer-workflow', ATTEST_SIGNER], {
         stdio: ['ignore', 'ignore', 'pipe'],
       });
     } catch (e) {
@@ -80,8 +73,15 @@ async function main(): Promise<void> {
   ];
 
   for (const input of inputs) {
-    await download(input.url, input.dest);
-    await verify(input);
+    // Unverified bytes only ever exist under a temp name, and are removed on any failure.
+    const temp = `${input.dest}.part`;
+    try {
+      await download(input.url, temp);
+      await verify(input, temp);
+      renameSync(temp, input.dest);
+    } finally {
+      rmSync(temp, { force: true });
+    }
     console.log(`ok ${input.asset}`);
   }
 }
