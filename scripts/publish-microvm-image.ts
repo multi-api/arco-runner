@@ -37,6 +37,7 @@ export interface PublishOptions {
   sha: string;
   bucket: string;
   buildRoleArn: string;
+  region: string;
 }
 
 export class PublishFailed extends Error {}
@@ -45,6 +46,18 @@ const isNotFound = (e: unknown): boolean => (e as { name?: string })?.name === '
 
 export function imageName(minor: string): string {
   return `arco-runner-php${minor.replace('.', '')}`;
+}
+
+/** The account id of an IAM role ARN (`arn:aws:iam::<account>:role/...`). */
+export function accountOfRoleArn(roleArn: string): string {
+  const account = /^arn:aws[\w-]*:iam::(\d{12}):role\//.exec(roleArn)?.[1];
+  if (!account) throw new Error(`not an IAM role ARN: ${roleArn}`);
+  return account;
+}
+
+/** The MicroVM APIs that take `imageIdentifier` want the image ARN, not its name. */
+export function imageArnFor(region: string, account: string, minor: string): string {
+  return `arn:aws:lambda:${region}:${account}:microvm-image:${imageName(minor)}`;
 }
 
 export function imageParams(opts: PublishOptions, baseImageArn: string) {
@@ -93,10 +106,11 @@ export async function publish(opts: PublishOptions, deps: PublishDeps): Promise<
   const base = await newestAl2023Base(client);
   log(`base image: ${base}`);
   const params = imageParams(opts, base);
+  const identifier = imageArnFor(opts.region, accountOfRoleArn(opts.buildRoleArn), opts.minor);
 
   let exists = true;
   try {
-    await client.send(new GetMicrovmImageCommand({ imageIdentifier: name }));
+    await client.send(new GetMicrovmImageCommand({ imageIdentifier: identifier }));
   } catch (e) {
     if (!isNotFound(e)) throw e;
     exists = false;
@@ -105,7 +119,7 @@ export async function publish(opts: PublishOptions, deps: PublishDeps): Promise<
   let version: string;
   if (exists) {
     log(`updating image ${name} (${opts.stage})`);
-    ({ imageArn, imageVersion: version } = await client.send(new UpdateMicrovmImageCommand({ imageIdentifier: name, ...params })));
+    ({ imageArn, imageVersion: version } = await client.send(new UpdateMicrovmImageCommand({ imageIdentifier: identifier, ...params })));
   } else {
     log(`creating image ${name} (${opts.stage})`);
     ({ imageArn, imageVersion: version } = await client.send(new CreateMicrovmImageCommand({ name, ...params })));
@@ -116,7 +130,7 @@ export async function publish(opts: PublishOptions, deps: PublishDeps): Promise<
 
   const deadline = started + POLL_TIMEOUT_MS;
   for (;;) {
-    const v = await client.send(new GetMicrovmImageVersionCommand({ imageIdentifier: name, imageVersion: version }));
+    const v = await client.send(new GetMicrovmImageVersionCommand({ imageIdentifier: imageArn, imageVersion: version }));
     if (v.state === 'SUCCESSFUL') break;
     if (v.state === 'FAILED' || v.state === 'DELETING' || v.state === 'DELETED' || v.state === 'DELETE_FAILED') {
       throw new PublishFailed(`image version ${version} ${v.state}: ${v.stateReason ?? '(no stateReason)'}`);
@@ -152,6 +166,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, deps: Publish
       sha: need(env.GITHUB_SHA ?? gitSha(), 'GITHUB_SHA'),
       bucket: need(env.ARTIFACT_BUCKET, 'ARTIFACT_BUCKET'),
       buildRoleArn: need(env.BUILD_ROLE_ARN, 'BUILD_ROLE_ARN'),
+      region: need(env.AWS_REGION, 'AWS_REGION'),
     };
     await publish(opts, deps);
     return 0;
