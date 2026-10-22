@@ -2,7 +2,20 @@
   "name": "@arco-runner/scripts",
   "private": true,
   "type": "module",
-  "scripts": { "test": "vitest run" },
-  "dependencies": { "yazl": "^3.3.1" },
-  "devDependencies": { "@types/node": "^24.0.0", "@types/yazl": "^3.3.0", "tsx": "^4.20.0", "typescript": "^5.9.0", "vitest": "^3.2.0" }
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda-microvms": "3.1155.0",
+    "@aws-sdk/client-s3": "3.1155.0",
+    "@aws-sdk/lib-storage": "3.1155.0",
+    "yazl": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/yazl": "^3.3.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
 }

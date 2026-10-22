@@ -1,0 +1,128 @@
+name: publish
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Runners account to publish to
+        type: choice
+        options: [staging, prod]
+        default: staging
+      os_capabilities_all:
+        description: Publish with additionalOsCapabilities ALL (only if /validate failed with "capabilities:")
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  STAGE: ${{ inputs.stage || 'staging' }}
+
+concurrency:
+  group: publish-${{ inputs.stage || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    environment: ${{ inputs.stage || 'staging' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      BUILD_ROLE_ARN: ${{ vars.BUILD_ROLE_ARN }}
+      ECR_REPO: ${{ vars.ECR_REPO }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Fetch inputs
+        run: npx tsx scripts/fetch-inputs.ts --minor 8.5 --out build/inputs
+      - run: node agent/build.mjs
+      - name: Package
+        run: >
+          npx tsx scripts/package-image.ts --minor 8.5 --inputs build/inputs --out build/image.zip
+          --agent agent/dist/arco-runner.mjs --fixture fixture
+      - name: Publish MicroVM image
+        id: microvm
+        env:
+          OS_CAPABILITIES_ALL: ${{ inputs.os_capabilities_all && '--os-capabilities-all' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          npx tsx scripts/publish-microvm-image.ts --stage "$STAGE" --zip build/image.zip --minor 8.5 $OS_CAPABILITIES_ALL | tee build/publish.log
+          echo "image_arn=$(sed -n 's/^image_arn=//p' build/publish.log)" >> "$GITHUB_OUTPUT"
+          echo "image_version=$(sed -n 's/^image_version=//p' build/publish.log)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the Fargate image
+        run: |
+          registry="${ECR_REPO%%/*}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
+          mkdir build/context && unzip -q build/image.zip -d build/context
+          docker build --platform linux/arm64 -t "$ECR_REPO:php85-$GITHUB_SHA" build/context
+          docker push "$ECR_REPO:php85-$GITHUB_SHA"
+
+      - name: Register the Fargate task definition
+        id: taskdef
+        env:
+          EXECUTION_ROLE_ARN: ${{ vars.FARGATE_EXECUTION_ROLE_ARN }}
+        run: |
+          jq -n \
+            --arg image "$ECR_REPO:php85-$GITHUB_SHA" \
+            --arg role "$EXECUTION_ROLE_ARN" \
+            --arg region "$AWS_REGION" '{
+              family: "arco-runner-php85",
+              requiresCompatibilities: ["FARGATE"],
+              networkMode: "awsvpc",
+              cpu: "2048",
+              memory: "4096",
+              runtimePlatform: {cpuArchitecture: "ARM64", operatingSystemFamily: "LINUX"},
+              ephemeralStorage: {sizeInGiB: 30},
+              executionRoleArn: $role,
+              containerDefinitions: [{
+                name: "runner",
+                image: $image,
+                essential: true,
+                stopTimeout: 30,
+                logConfiguration: {
+                  logDriver: "awslogs",
+                  options: {"awslogs-group": "/ecs/arco-runner", "awslogs-region": $region, "awslogs-stream-prefix": "php85"}
+                }
+              }]
+            }' > build/taskdef.json
+          arn=$(aws ecs register-task-definition --cli-input-json file://build/taskdef.json --query taskDefinition.taskDefinitionArn --output text)
+          echo "task_definition_arn=$arn" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          IMAGE_ARN: ${{ steps.microvm.outputs.image_arn }}
+          IMAGE_VERSION: ${{ steps.microvm.outputs.image_version }}
+          TASK_DEFINITION_ARN: ${{ steps.taskdef.outputs.task_definition_arn }}
+        run: |
+          {
+            echo "### Arco runner image published to $STAGE"
+            echo
+            echo "Set these in Arco Cloud and redeploy:"
+            echo
+            echo '```'
+            echo "CLOUD_RUNNERS_IMAGE_ARN_85=$IMAGE_ARN"
+            echo "CLOUD_RUNNERS_IMAGE_VERSION_85=$IMAGE_VERSION"
+            echo "CLOUD_RUNNERS_TASK_DEFINITION_85=$TASK_DEFINITION_ARN"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
