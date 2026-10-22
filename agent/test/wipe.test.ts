@@ -1,11 +1,11 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, lstatSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Paths } from '../src/system.js';
-import { WipeError, findOwnedArgs, keptPaths, killUserProcesses, wipe } from '../src/wipe.js';
+import { WipeError, findOwnedArgs, keptPaths, killUserProcesses, runFind, wipe } from '../src/wipe.js';
 
 const isRoot = process.getuid?.() === 0;
 // Running as root (test:linux) every fixture file is root-owned, which step 6 refuses; chown the tree to the build user.
@@ -33,7 +33,10 @@ async function fixture(rootDir = '') {
   const outside = join(root, 'outside'); // stands for a root-owned location a link could point at
   await put(join(outside, 'precious'), 'keep me');
   await mkdir(join(outside, 'dir'));
-  const opts = { uid: UID, findRoot: fs, procDir: emptyProc };
+  const opts = {
+    uid: UID, findRoot: fs, procDir: emptyProc, extraRoots: [] as string[], sysvDir: join(root, 'no-sysvipc'),
+    killAllAs: async () => undefined,
+  };
   return { root, fs, paths, outside, opts, rootDir };
 }
 
@@ -231,17 +234,46 @@ describe('wipe', () => {
     expect(await readdir(f.paths.tmpDirs[0]!)).toEqual([]);
   });
 
+  it('R12: removes SysV IPC objects owned by the build uid and sweeps the extra roots', async () => {
+    const f = await fixture();
+    const ipc = join(f.root, 'sysvipc');
+    await mkdir(ipc);
+    await writeFile(join(ipc, 'shm'), `       key      shmid perms  size cpid lpid nattch   uid   gid  cuid  cgid\n 0 11 666 4096 1 1 0 ${UID} ${UID} ${UID} ${UID}\n 0 12 666 4096 1 1 0 0 0 0 0\n`);
+    await writeFile(join(ipc, 'sem'), `key semid perms nsems uid gid cuid cgid\n 0 21 666 1 ${UID} ${UID} ${UID} ${UID}\n`);
+    await writeFile(join(ipc, 'msg'), `key msqid perms cbytes qnum lspid lrpid uid gid cuid cgid\n 0 31 666 0 0 0 0 ${UID} ${UID} ${UID} ${UID}\n`);
+    const mq = join(f.root, 'mq');
+    await put(join(mq, 'queue'));
+    await mkdir(join(f.root, 'not-a-dir-root'));
+    await writeFile(join(f.root, 'lockfile'), 'x');
+    chownTree(f.root);
+    const calls: string[] = [];
+    await wipe(f.paths, '', {
+      ...f.opts, findRoot: f.fs, sysvDir: ipc, ipcrm: async (fl, id) => { calls.push(`${fl} ${id}`); },
+      extraRoots: [mq, join(f.root, 'lockfile'), join(f.root, 'absent')],
+    });
+    expect(calls).toEqual(['-m 11', '-s 21', '-q 31']);
+    expect(existsSync(join(mq, 'queue'))).toBe(false);
+    expect(existsSync(join(f.root, 'lockfile'))).toBe(true);
+  });
+
   it('surfaces a surviving build process as WipeError', async () => {
     const f = await fixture();
     await mkdir(join(f.root, 'proc/4242'));
     await writeFile(join(f.root, 'proc/4242/status'), 'Name:\tx\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n');
-    await expect(wipe(f.paths, '', { ...f.opts, uid: 1000, kill: () => undefined })).rejects.toThrow(WipeError);
-  }, 15_000);
+    await expect(wipe(f.paths, '', { ...f.opts, uid: 1000, kill: () => undefined, killTimeoutMs: 150 })).rejects.toThrow(WipeError);
+  });
 });
 
 function lstatExists(p: string): boolean {
   try { lstatSync(p); return true; } catch { return false; }
 }
+
+describe('runFind', () => {
+  it('tolerates only "No such file or directory" on stderr', async () => {
+    await expect(runFind(['-P', '/nonexistent-arco-path'])).resolves.toBe('');
+    await expect(runFind(['-P', '.', '-nosuchpredicate'])).rejects.toBeInstanceOf(WipeError);
+  });
+});
 
 describe('killUserProcesses', () => {
   async function fakeProc(entries: Record<string, string>) {
@@ -255,6 +287,7 @@ describe('killUserProcesses', () => {
     await writeFile(join(dir, 'cpuinfo'), 'x');
     return dir;
   }
+  const noAll = { killAllAs: async () => undefined };
   const status = (uid: number, state = 'S (sleeping)') => `Name:\tp\nState:\t${state}\nUid:\t${uid}\t0\t0\t0\nGid:\t${uid}\t${uid}\t${uid}\t${uid}\n`;
 
   it('signals only pids whose real uid matches, with SIGKILL', async () => {
@@ -262,8 +295,8 @@ describe('killUserProcesses', () => {
     const calls: [number, string][] = [];
     await killUserProcesses(1000, 2000, dir, (pid, sig) => {
       calls.push([pid, sig]);
-      void rm(join(dir, String(pid)), { recursive: true });
-    });
+      rmSync(join(dir, String(pid)), { recursive: true });
+    }, noAll);
     expect(calls.sort()).toEqual([[10, 'SIGKILL'], [13, 'SIGKILL']]);
   });
 
@@ -272,21 +305,62 @@ describe('killUserProcesses', () => {
     const calls: number[] = [];
     await killUserProcesses(1000, 2000, dir, (pid) => {
       calls.push(pid);
-      if (pid === 20) void mkdir(join(dir, '21')).then(() => writeFile(join(dir, '21/status'), status(1000)));
-      void rm(join(dir, String(pid)), { recursive: true });
-    });
+      if (pid === 20) { mkdirSync(join(dir, '21')); writeFileSync(join(dir, '21/status'), status(1000)); }
+      rmSync(join(dir, String(pid)), { recursive: true });
+    }, noAll);
     expect(calls).toEqual([20, 21]);
   });
 
   it('throws WipeError when a process survives the timeout, and ignores a kill that fails', async () => {
     const dir = await fakeProc({ 30: status(1000) });
     let n = 0;
-    await expect(killUserProcesses(1000, 150, dir, () => { n++; throw new Error('EPERM'); })).rejects.toBeInstanceOf(WipeError);
+    await expect(killUserProcesses(1000, 150, dir, () => { n++; throw new Error('EPERM'); }, noAll)).rejects.toBeInstanceOf(WipeError);
     expect(n).toBeGreaterThan(1);
+  });
+
+  it('matches on any of the four uid fields', async () => {
+    const dir = await fakeProc({
+      40: 'State:\tS\nUid:\t0\t1000\t0\t0\n', 41: 'State:\tS\nUid:\t0\t0\t1000\t0\n', 42: 'State:\tS\nUid:\t0\t0\t0\t1000\n',
+    });
+    const seen: number[] = [];
+    await killUserProcesses(1000, 2000, dir, (pid) => { seen.push(pid); rmSync(join(dir, String(pid)), { recursive: true }); }, noAll);
+    expect(seen.sort()).toEqual([40, 41, 42]);
+  });
+
+  it('needs two consecutive empty scans and calls the atomic killer while processes exist', async () => {
+    const dir = await fakeProc({ 50: status(1000) });
+    const t0 = Date.now();
+    let atomic = 0;
+    await killUserProcesses(1000, 2000, dir, (pid) => rmSync(join(dir, String(pid)), { recursive: true }), {
+      killAllAs: async () => { atomic++; },
+    });
+    expect(atomic).toBe(1);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(50);
+  });
+
+  it('fails closed when /proc cannot be read, and on a status read error other than a vanished pid', async () => {
+    await expect(killUserProcesses(1000, 100, '/nonexistent-proc', () => undefined, noAll)).rejects.toBeInstanceOf(WipeError);
+    const dir = await fakeProc({});
+    await mkdir(join(dir, '60'));
+    await mkdir(join(dir, '60/status')); // reading a directory: EISDIR
+    await expect(killUserProcesses(1000, 100, dir, () => undefined, noAll)).rejects.toBeInstanceOf(WipeError);
   });
 
   it('refuses uid 0', async () => {
     await expect(killUserProcesses(0, 100, '/nonexistent', () => undefined)).rejects.toBeInstanceOf(WipeError);
+  });
+
+  it.skipIf(!isRoot)('a uid-1000 fork-and-exit chain is fully gone after step 1 and stays gone (root only)', async () => {
+    const code = `setTimeout(()=>{require('child_process').spawn(process.execPath,['-e',process.argv[1],process.argv[1]],{detached:true,stdio:'ignore'}).unref();process.exit(0)},15)`;
+    const first = spawn(process.execPath, ['-e', code, code], { uid: 1000, gid: 1000, cwd: '/', stdio: 'ignore', detached: true, env: {} });
+    first.unref();
+    await new Promise((r) => setTimeout(r, 300));
+    const count = () => Number(execFileSync('sh', ['-c', "ps -eo uid= | awk '$1==1000' | wc -l"], { encoding: 'utf8' }).trim());
+    expect(count()).toBeGreaterThan(0);
+    await killUserProcesses(1000, 5000);
+    expect(count()).toBe(0);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(count()).toBe(0);
   });
 
   it.skipIf(!isRoot)('kills real processes of uid 1000, forking ones included (root only)', async () => {
