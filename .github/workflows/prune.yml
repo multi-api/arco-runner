@@ -43,4 +43,5 @@ jobs:
       - name: Delete old versions
         env:
           IN_USE_VERSION: ${{ inputs.in_use_version }}
+          PUBLISHER_ROLE_ARN: ${{ vars.PUBLISHER_ROLE_ARN }}
         run: npx tsx scripts/prune-microvm-images.ts --minor 8.5 --in-use-version "$IN_USE_VERSION"
