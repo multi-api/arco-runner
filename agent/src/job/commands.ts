@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { runCommand, type Batcher } from '@multi-api/arco-cloud-client';
+import { runCommand, type Batcher } from '@multiapi/arco-cloud-client';
 import { cutLine, type Identity } from '../system.js';
 import { BuildFailure } from './errors.js';
 import type { Steps } from './steps.js';

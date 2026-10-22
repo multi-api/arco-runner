@@ -1,4 +1,4 @@
-import { Redactor } from '@multi-api/arco-cloud-client';
+import { Redactor } from '@multiapi/arco-cloud-client';
 import { describe, expect, it } from 'vitest';
 import { parseJobDocument } from '../src/job/document.js';
 import { BuildFailure } from '../src/job/errors.js';

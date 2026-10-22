@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { lchown, mkdtemp, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { runCommand } from '@multi-api/arco-cloud-client';
+import { runCommand } from '@multiapi/arco-cloud-client';
 import { ensureRealDir, sanitizeKeep, wipeExcept } from '../fsutil.js';
 import { cloneToken } from '../mask.js';
 import { type Identity, type Paths } from '../system.js';

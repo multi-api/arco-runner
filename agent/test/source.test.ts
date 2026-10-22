@@ -3,14 +3,14 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import * as client from '@multi-api/arco-cloud-client';
+import * as client from '@multiapi/arco-cloud-client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseJobDocument } from '../src/job/document.js';
 import { checkout } from '../src/job/source.js';
 import type { Paths } from '../src/system.js';
 
-vi.mock('@multi-api/arco-cloud-client', async (orig) => {
-  const mod = await orig<typeof import('@multi-api/arco-cloud-client')>();
+vi.mock('@multiapi/arco-cloud-client', async (orig) => {
+  const mod = await orig<typeof import('@multiapi/arco-cloud-client')>();
   return { ...mod, runCommand: vi.fn(mod.runCommand) };
 });
 
