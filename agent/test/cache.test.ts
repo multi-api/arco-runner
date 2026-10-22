@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   type CacheCtx, type CacheManifest, CacheError, UnsafeArchive, cacheRoots, checkArchiveEntries, lockHashes,
-  restoreCache, saveCache, shouldSave,
+  parseListLine, restoreCache, saveCache, shouldSave,
 } from '../src/job/cache.js';
 import type { Paths } from '../src/system.js';
 
@@ -129,6 +129,28 @@ describe('checkArchiveEntries', () => {
   });
 });
 
+const rm0 = async (p: string) => (await import('node:fs/promises')).rm(p, { recursive: true, force: true });
+
+describe('parseListLine', () => {
+  const L = (kind: string, rest: string) => `${kind}rwxr-xr-x 0/0 5 2024-01-01 00:00 ${rest}`;
+  it('decodes an escaped newline, backslash and an octal escape followed by a digit', () => {
+    expect(parseListLine(L('-', 'a\\nb')).path).toBe('a\nb');
+    expect(parseListLine(L('-', 'a\\\\b')).path).toBe('a\\b');
+    expect(parseListLine(L('-', 'x\\0017')).path).toBe('x\u00017');
+  });
+  it('keeps the full name of a regular file containing an arrow', () => {
+    expect(parseListLine(L('-', 'a -> b'))).toEqual({ path: 'a -> b', type: 'file' });
+  });
+  it('splits a symlink with exactly one arrow and refuses two', () => {
+    expect(parseListLine(L('l', 'a -> ../b'))).toEqual({ path: 'a', type: 'symlink', target: '../b' });
+    expect(() => parseListLine(L('l', 'a -> b -> /etc'))).toThrow(UnsafeArchive);
+  });
+  it('refuses a line without a date and treats hardlinks as other', () => {
+    expect(() => parseListLine('-rw-r--r-- 0/0 5 name')).toThrow(UnsafeArchive);
+    expect(parseListLine(L('h', 'a link to b')).type).toBe('other');
+  });
+});
+
 describe('archive round trip (GNU tar + zstd)', () => {
   async function populate(home: string) {
     await mkdir(join(home, 'work/repo/vendor/pkg'), { recursive: true });
@@ -179,14 +201,88 @@ describe('archive round trip (GNU tar + zstd)', () => {
     await populate(a.home);
     await writeFile(join(root, 'victim'), 'precious');
     await symlink(join(root, 'victim'), join(a.home, '.arco-cache.json'));
-    await writeFile(join(root, 'outside'), 'outside-data');
-    await symlink(root, join(a.home, '.cache-link'));
+    await mkdir(join(root, 'outside'));
+    await writeFile(join(root, 'outside/secret.txt'), 'outside-data');
+    const { rm } = await import('node:fs/promises');
+    await rm(join(a.home, '.npm'), { recursive: true });
+    await symlink(join(root, 'outside'), join(a.home, '.npm'));
     const { url, state } = await s3();
     expect(await saveCache(url, manifest, ctx(a), Date.now() + 60_000)).toBe('saved');
     expect(await readFile(join(root, 'victim'), 'utf8')).toBe('precious');
     const listing = execFileSync('tar', ['--zstd', '-tf', '-'], { input: state.body!, encoding: 'utf8' });
     expect(listing).toContain('.arco-cache.json');
-    expect(listing).not.toContain('outside');
+    expect(listing).not.toContain('secret.txt');
+    expect(listing).not.toContain('.npm');
+  });
+
+  itTar('leaves a directory planted at the manifest path untouched and fails cleanly', async () => {
+    const { a, b, root, ctx } = await env();
+    await populate(a.home);
+    await mkdir(join(a.home, '.arco-cache.json/sub'), { recursive: true });
+    await writeFile(join(a.home, '.arco-cache.json/sub/keep'), 'k');
+    const { url } = await s3();
+    await expect(saveCache(url, manifest, ctx(a), Date.now() + 60_000)).rejects.toBeInstanceOf(CacheError);
+    expect(await readFile(join(a.home, '.arco-cache.json/sub/keep'), 'utf8')).toBe('k');
+    expect(await readdir(a.varDir)).toEqual([]);
+
+    // restore: same planted directory in a home that receives a valid archive
+    await rm0(join(a.home, '.arco-cache.json'));
+    expect(await saveCache(url, manifest, ctx(a), Date.now() + 60_000)).toBe('saved');
+    await mkdir(join(b.home, '.arco-cache.json/sub'), { recursive: true });
+    await writeFile(join(b.home, '.arco-cache.json/sub/keep'), 'k');
+    await expect(restoreCache(url, ctx(b))).rejects.toBeInstanceOf(CacheError);
+    expect(await readFile(join(b.home, '.arco-cache.json/sub/keep'), 'utf8')).toBe('k');
+    expect(root).toBeTruthy();
+  });
+
+  itTar('excludes symlinks that escape their root and FIFOs at save, so the archive still restores', async () => {
+    const { a, b, ctx } = await env();
+    await populate(a.home);
+    await mkdir(join(a.home, 'work/repo/packages/p'), { recursive: true });
+    await mkdir(join(a.home, 'work/repo/node_modules/@s'), { recursive: true });
+    await symlink('../../../packages/p', join(a.home, 'work/repo/node_modules/@s/p'));
+    await symlink('/opt/arco-runner', join(a.home, 'work/repo/vendor/abs'));
+    execFileSync('mkfifo', [join(a.home, 'work/repo/vendor/pipe')]);
+    const { url } = await s3();
+    expect(await saveCache(url, manifest, ctx(a), Date.now() + 60_000)).toBe('saved');
+    expect((await restoreCache(url, ctx(b))).status).toBe('restored');
+    expect(existsSync(join(b.home, 'work/repo/node_modules/@s/p'))).toBe(false);
+    expect(existsSync(join(b.home, 'work/repo/vendor/abs'))).toBe(false);
+    expect(existsSync(join(b.home, 'work/repo/vendor/pipe'))).toBe(false);
+    expect(await readlink(join(b.home, 'work/repo/node_modules/.bin/vite'))).toBe('../vite/bin/vite.js');
+  });
+
+  itTar('fails the save cleanly when an excluded name holds a newline', async () => {
+    const { a, ctx } = await env();
+    await populate(a.home);
+    execFileSync('mkfifo', [join(a.home, 'work/repo/vendor/new\nline')]);
+    const { url, state } = await s3();
+    await expect(saveCache(url, manifest, ctx(a), Date.now() + 60_000)).rejects.toBeInstanceOf(CacheError);
+    expect(state.puts).toBe(0);
+    expect(await readdir(a.varDir)).toEqual([]);
+  });
+
+  itTar('caps the number of members and the listing line length, killing tar', async () => {
+    const { a, b, ctx } = await env();
+    await populate(a.home);
+    const { url } = await s3();
+    await saveCache(url, manifest, ctx(a), Date.now() + 60_000);
+    await expect(restoreCache(url, ctx(b, { limits: { maxMembers: 2, maxLineBytes: 65536 } })))
+      .rejects.toThrow(/more than 2 members/);
+    await expect(restoreCache(url, ctx(b, { limits: { maxMembers: 100, maxLineBytes: 20 } })))
+      .rejects.toThrow(/too long/);
+    expect(existsSync(join(b.home, 'work/repo/vendor'))).toBe(false);
+    expect(await readdir(b.varDir)).toEqual([]);
+  });
+
+  it('puts the network error code, never the url, in the message', async () => {
+    const { a, ctx } = await env();
+    const fetchImpl = (async () => {
+      throw Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } });
+    }) as typeof fetch;
+    const err = await restoreCache('https://b/obj?X-Amz-Signature=SECRET', ctx(a, { fetchImpl })).catch((e) => e);
+    expect(err.message).toContain('ECONNRESET');
+    expect(err.message).not.toContain('SECRET');
   });
 
   itTar('restore of a 404 is missing', async () => {
