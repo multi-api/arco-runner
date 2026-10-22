@@ -165,4 +165,17 @@ describe('checkout', () => {
     const ssh = { ...doc, source: { ...doc.source, clone_url: '--upload-pack=x' } };
     await expect(checkout(ssh, ctx())).rejects.toMatchObject({ code: 'build.clone_failed' });
   });
+
+  it('accepts an http:// clone URL only when allowHttpUrl is set (ARCO_RUNNER_ALLOW_HTTP, tests only)', async () => {
+    const { doc, ctx } = await fixture();
+    const http = { ...doc, source: { ...doc.source, clone_url: 'http://127.0.0.1:1/repo.git' } };
+    await expect(checkout(http, { ...ctx(), allowFileUrl: false }))
+      .rejects.toMatchObject({ code: 'build.clone_failed', message: 'clone_url must use https' });
+    // Allowed: the scheme check passes and git itself fails to reach the (closed) port.
+    await expect(checkout(http, { ...ctx(), allowFileUrl: false, allowHttpUrl: true }))
+      .rejects.toMatchObject({ code: 'build.clone_failed', message: expect.stringMatching(/^git fetch exited/) });
+    const file = { ...doc };
+    await expect(checkout(file, { ...ctx(), allowFileUrl: false, allowHttpUrl: true }))
+      .rejects.toMatchObject({ message: 'clone_url must use https' });
+  });
 });

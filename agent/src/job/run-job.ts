@@ -44,8 +44,8 @@ export interface JobDeps {
    * Defaults to killUserProcesses(identity.uid) when an identity is set, else nothing.
    */
   killBuildProcesses?: () => Promise<void>;
-  /** Tests and offline validation only (file:// clones). */
-  checkoutOptions?: Pick<CheckoutContext, 'extraGitArgs' | 'allowFileUrl'>;
+  /** Tests and offline validation only (file:// clones), and http:// clones under ARCO_RUNNER_ALLOW_HTTP=1. */
+  checkoutOptions?: Pick<CheckoutContext, 'extraGitArgs' | 'allowFileUrl' | 'allowHttpUrl'>;
   /** Agent diagnostics (stdout). Every message is redacted first. */
   log?: (message: string) => void;
 }

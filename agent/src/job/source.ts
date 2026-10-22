@@ -39,12 +39,16 @@ export interface CheckoutContext {
   extraGitArgs?: string[];
   /** Allows a `file://` clone_url; only tests and offline validation set it. */
   allowFileUrl?: boolean;
+  /** Allows an `http://` clone_url; set by `ARCO_RUNNER_ALLOW_HTTP=1` (integration tests only, like an http api_base). */
+  allowHttpUrl?: boolean;
 }
 
 export async function checkout(doc: JobDocument, ctx: CheckoutContext): Promise<{ hasSubmodules: boolean }> {
   const { paths, identity } = ctx;
   const url = doc.source.clone_url;
-  if (!url.startsWith('https://') && !(ctx.allowFileUrl && url.startsWith('file://'))) {
+  const allowed = url.startsWith('https://') || (ctx.allowFileUrl && url.startsWith('file://'))
+    || (ctx.allowHttpUrl && url.startsWith('http://'));
+  if (!allowed) {
     throw new BuildFailure('build.clone_failed', 'clone_url must use https');
   }
   const keep = sanitizeKeep(ctx.keep);
