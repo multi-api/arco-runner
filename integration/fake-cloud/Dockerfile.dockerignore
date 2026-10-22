@@ -1,0 +1,6 @@
+*
+!agent/src/loopback-cloud.ts
+!integration/fake-cloud/server.ts
+!integration/fake-cloud/fake-arco
+!fixture/app
+!fixture/packages

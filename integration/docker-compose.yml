@@ -1,0 +1,23 @@
+# The Docker integration suite (spec §11.2): the real runner image in MicroVM mode next to a fake Cloud.
+# Started by `npm run test:integration` (integration/run.mjs), which builds the runner image first.
+name: arco-runner-it
+services:
+  fake-cloud:
+    build:
+      context: ..
+      dockerfile: integration/fake-cloud/Dockerfile
+    platform: linux/arm64
+    ports:
+      - "127.0.0.1:${FAKE_CLOUD_PORT:-38081}:8081"
+
+  runner:
+    image: ${ARCO_RUNNER_IMAGE:-arco-runner:php85-dev}
+    platform: linux/arm64
+    environment:
+      ARCO_RUNNER_ALLOW_HTTP: "1"
+    ports:
+      - "127.0.0.1:${RUNNER_CONTROL_PORT:-38080}:8080"
+      - "127.0.0.1:${RUNNER_HOOKS_PORT:-39000}:9000"
+    depends_on:
+      fake-cloud:
+        condition: service_healthy

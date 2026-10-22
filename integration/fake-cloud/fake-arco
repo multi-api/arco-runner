@@ -1,0 +1,40 @@
+#!/usr/bin/env php
+<?php
+// The integration suite's stand-in for vendor/bin/arco (it replaces fixture/packages/fake-arco/bin/arco in the
+// test repo). Like the fixture's, it prints Arco-shaped NDJSON and touches no network; it also dumps its
+// environment, raw and encoded, so the suite can check what the runner hands to `arco` and what it masks.
+$args = array_slice($argv, 1);
+$at = '2026-10-21T12:00:00Z';
+$emit = function (array $event) use ($at): void {
+    echo json_encode(['schema' => 1, 'at' => $at] + $event, JSON_UNESCAPED_SLASHES), "\n";
+};
+$env = getenv();
+ksort($env);
+
+if (($args[0] ?? '') === '--version') {
+    echo "Arco 0.10.0\n";
+} elseif (($args[0] ?? '') === 'deploy') {
+    echo "fake-arco deploy invoked\n";
+    foreach ($env as $k => $v) {
+        echo "fake-arco env $k=$v\n";
+        echo "fake-arco env-b64 $k=", base64_encode($v), "\n";
+        echo "fake-arco env-url $k=", rawurlencode($v), "\n";
+    }
+    $emit(['type' => 'step', 'key' => 'deploy.build', 'status' => 'started', 'params' => new stdClass()]);
+    $emit([
+        'type' => 'result', 'outcome' => 'deployed', 'app' => 'fixture', 'environment' => 'production',
+        'revision' => 'r1', 'url' => 'https://fixture.example', 'domains' => [], 'rolled_back' => false,
+        'cold_start_ms' => 120, 'error' => null,
+    ]);
+} elseif (($args[0] ?? '') === 'info') {
+    fwrite(STDERR, 'fake-arco info ARCO_PERMISSIONS_BOUNDARY=' . ($env['ARCO_PERMISSIONS_BOUNDARY'] ?? '') . "\n");
+    fwrite(STDERR, 'fake-arco info has AWS_SECRET_ACCESS_KEY=' . (isset($env['AWS_SECRET_ACCESS_KEY']) ? 'yes' : 'no') . "\n");
+    echo json_encode([
+        'schema' => 1, 'app' => 'fixture', 'environment' => 'production', 'group' => 'g',
+        'resources' => [['type' => 'queue', 'name' => 'jobs', 'arn' => 'arn:q', 'retained' => false,
+            'relations' => [['type' => 'worker_of', 'target' => 'fn']]]],
+    ], JSON_UNESCAPED_SLASHES), "\n";
+} else {
+    fwrite(STDERR, "unknown command\n");
+    exit(1);
+}

@@ -2,7 +2,17 @@
   "name": "arco-runner",
   "private": true,
   "type": "module",
-  "workspaces": ["scripts", "agent"],
-  "scripts": { "test": "npm test --workspaces --if-present", "test:linux": "sh scripts/test-linux.sh" },
-  "engines": { "node": ">=24" }
+  "workspaces": [
+    "scripts",
+    "agent"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present",
+    "test:linux": "sh scripts/test-linux.sh",
+    "test:integration": "npm --prefix integration run test:integration --",
+    "smoke:herd": "node integration/smoke-herd.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }

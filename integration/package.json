@@ -1,0 +1,15 @@
+{
+  "name": "@arco-runner/integration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:integration": "node run.mjs",
+    "vitest": "vitest run",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

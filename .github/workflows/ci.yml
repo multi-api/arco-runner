@@ -50,6 +50,9 @@ jobs:
           docker build --platform linux/arm64 -t arco-runner:ci build/context
       - name: Integration tests
         if: hashFiles('integration/package.json') != ''
+        env:
+          ARCO_RUNNER_IMAGE: arco-runner:ci
         run: |
           npm ci --prefix integration
+          npm --prefix integration run typecheck
           npm run test:integration

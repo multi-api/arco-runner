@@ -36,18 +36,34 @@ node agent/build.mjs  # bundle the agent
 
 ### Integration tests
 
-They need Docker on arm64 (Apple silicon or an arm runner). They build the real image, start it next to a fake Cloud (claim/start/logs/finish/idle, a cache endpoint and a git HTTP endpoint) and drive the hooks and `POST /job` the way Lambda and Cloud do.
+They need Docker on arm64 (Apple silicon or an arm runner). `npm run test:integration` builds the real image from `build/image.zip`, starts it (MicroVM mode, `ARCO_RUNNER_ALLOW_HTTP=1`) next to a fake Cloud (`integration/fake-cloud`: claim/start/logs/finish/idle, an S3-like cache endpoint and a git smart-HTTP endpoint that requires the job's `Authorization` header; with `ARCO_RUNNER_ALLOW_HTTP=1` the agent accepts an `http://` `api_base` and clone URL), drives the hooks and `POST /job` the way Lambda and Cloud do, and always removes the containers, network and volumes afterwards.
 
 ```sh
 npx tsx scripts/fetch-inputs.ts --minor 8.5 --out build/inputs   # needs the gh CLI to verify attestations
+node agent/build.mjs
 npx tsx scripts/package-image.ts --minor 8.5 --inputs build/inputs --out build/image.zip \
   --agent agent/dist/arco-runner.mjs --fixture fixture
-npm run test:integration
+npm ci --prefix integration
+npm run test:integration                 # extra arguments go to vitest, e.g. -- -t 'warm'
 ```
+
+Set `ARCO_RUNNER_IMAGE=<image>` to test an image you already built instead (CI does). The scenarios share one runner container and run in order; the published ports are `127.0.0.1:38080` (control), `39000` (hooks) and `38081` (fake Cloud), overridable with `RUNNER_CONTROL_PORT`, `RUNNER_HOOKS_PORT` and `FAKE_CLOUD_PORT`.
 
 ### Smoke against Herd
 
-To try the image against a local Arco Cloud served by Herd (`*.test`), run the image with `ARCO_RUNNER_ALLOW_HTTP=1` (otherwise `api_base` must be `https://`), mint a ticket with `php artisan tinker` in Cloud, and `POST` it to `/job` on port 8080. `npm run smoke:herd` wraps this. It is manual and not part of CI.
+To try the image against a local Arco Cloud served by Herd (`*.test`), mint a ticket for a deployment dispatched to the `arco-runner` build provider:
+
+```sh
+php artisan tinker --execute 'echo App\Runners\RunnerTickets::mint(App\Models\Deployment::findOrFail(<id>));'
+```
+
+then run, from this repository:
+
+```sh
+ARCO_SMOKE_TICKET=<ticket> npm run smoke:herd -- --deployment <id>
+```
+
+It runs the image with `ARCO_RUNNER_ALLOW_HTTP=1` and `--add-host arco-cloud.test:host-gateway`, trusts Herd's CA in the agent (`NODE_EXTRA_CA_CERTS`), waits for the control port, posts the ticket to `/job`, follows `/healthz` until the runner is idle again, prints the agent's output and removes the container. If the site is not secured in Herd, pass `--api-base http://arco-cloud.test`. The project's own `vendor/bin/arco` runs for real, so use a deployment whose app and AWS account you are happy to deploy to. It is manual and not part of CI.
 
 ## Publishing
 
