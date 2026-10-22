@@ -1,0 +1,41 @@
+name: prune
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Runners account
+        type: choice
+        options: [staging, prod]
+        required: true
+      in_use_version:
+        description: Image version Cloud currently uses (CLOUD_RUNNERS_IMAGE_VERSION_85)
+        type: string
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.stage }}
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04-arm
+    environment: ${{ inputs.stage }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Delete old versions
+        env:
+          IN_USE_VERSION: ${{ inputs.in_use_version }}
+        run: npx tsx scripts/prune-microvm-images.ts --minor 8.5 --in-use-version "$IN_USE_VERSION"
