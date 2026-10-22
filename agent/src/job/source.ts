@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
-import { lchown, lstat, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
-import { dirname, isAbsolute, join, posix } from 'node:path';
+import { lchown, mkdtemp, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { runCommand } from '@multi-api/arco-cloud-client';
+import { ensureRealDir, sanitizeKeep, wipeExcept } from '../fsutil.js';
 import { cloneToken } from '../mask.js';
 import { type Identity, type Paths } from '../system.js';
 import type { JobDocument } from './document.js';
@@ -38,50 +39,6 @@ export interface CheckoutContext {
   extraGitArgs?: string[];
   /** Allows a `file://` clone_url; only tests and offline validation set it. */
   allowFileUrl?: boolean;
-}
-
-const isRealDir = async (p: string): Promise<boolean> => {
-  try { return (await lstat(p)).isDirectory(); } catch { return false; }
-};
-
-/** Makes `p` a real directory: a planted symlink or file is removed itself (never followed). */
-async function ensureRealDir(p: string): Promise<void> {
-  try {
-    if (!(await lstat(p)).isDirectory()) await rm(p, { force: true });
-  } catch { /* missing */ }
-  await mkdir(p, { recursive: true });
-}
-
-/** Keep paths must be relative, free of `..` and `.git` segments, so the old .git can never survive. */
-function sanitizeKeep(keep: string[]): string[] {
-  const out: string[] = [];
-  for (const k of keep) {
-    const n = posix.normalize(k).replace(/\/+$/, '');
-    if (!n || n === '.' || isAbsolute(n)) continue;
-    const segs = n.split('/');
-    if (segs.includes('..') || segs.includes('.git')) continue;
-    out.push(n);
-  }
-  return out;
-}
-
-/**
- * Deletes everything under `dir` except the `keep` paths (relative to the wipe root) and their parents.
- * Every entry is lstat'ed: only real directories are recursed into or kept; symlinks and files that sit
- * where a kept directory (or its ancestor) should be are removed themselves, never followed.
- */
-async function wipeExcept(dir: string, keep: string[], prefix = ''): Promise<void> {
-  for (const name of await readdir(dir)) {
-    const rel = prefix ? `${prefix}/${name}` : name;
-    const full = join(dir, name);
-    const real = await isRealDir(full);
-    if (real && keep.includes(rel)) continue;
-    if (real && keep.some((k) => k.startsWith(`${rel}/`))) {
-      await wipeExcept(full, keep, rel);
-      continue;
-    }
-    await rm(full, { recursive: true, force: true });
-  }
 }
 
 export async function checkout(doc: JobDocument, ctx: CheckoutContext): Promise<{ hasSubmodules: boolean }> {
