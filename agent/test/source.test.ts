@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as client from '@multi-api/arco-cloud-client';
@@ -39,11 +39,11 @@ async function fixture() {
     php_version: '8.5', commands: [], env: {}, mask: [],
     cache: { restore_url: 'https://s3/r', save_url: 'https://s3/s', key: 'k' }, timeout_seconds: 60,
   });
-  const ctx = (keep: string[] = []) => ({
-    paths, identity: null, env: { PATH: process.env.PATH }, onLine: () => {},
-    signal: new AbortController().signal, keep, extraGitArgs: ['-c', 'protocol.file.allow=always'],
+  const ctx = (keep: string[] = [], env: NodeJS.ProcessEnv = { PATH: process.env.PATH }) => ({
+    paths, identity: null, env, onLine: () => {},
+    signal: new AbortController().signal, keep, extraGitArgs: ['-c', 'protocol.file.allow=always'], allowFileUrl: true,
   });
-  return { paths, doc, ctx };
+  return { paths, doc, ctx, root };
 }
 
 afterEach(() => vi.mocked(client.runCommand).mockClear());
@@ -100,5 +100,69 @@ describe('checkout', () => {
     await expect(checkout(bad, ctx())).rejects.toMatchObject({
       code: 'build.clone_failed', message: expect.stringMatching(/^git fetch exited with code \d+$/),
     });
+  });
+
+  it('removes a symlinked repo dir without touching its target', async () => {
+    const { paths, doc, ctx, root } = await fixture();
+    const target = join(root, 'target');
+    await mkdir(target);
+    await writeFile(join(target, 'precious'), 'p');
+    await rm(paths.repo, { recursive: true });
+    await symlink(target, paths.repo);
+    await checkout(doc, ctx());
+    expect(await readdir(target)).toEqual(['precious']);
+    expect(existsSync(join(paths.repo, 'composer.json'))).toBe(true);
+  });
+
+  it('removes a symlinked work dir without touching its target', async () => {
+    const { paths, doc, ctx, root } = await fixture();
+    const target = join(root, 'target');
+    await mkdir(join(target, 'repo'), { recursive: true });
+    await writeFile(join(target, 'repo/precious'), 'p');
+    await rm(join(paths.home, 'work'), { recursive: true });
+    await symlink(target, join(paths.home, 'work'));
+    await checkout(doc, ctx());
+    expect(await readdir(join(target, 'repo'))).toEqual(['precious']);
+    expect(existsSync(join(paths.repo, 'composer.json'))).toBe(true);
+  });
+
+  it('removes a symlinked ancestor of a nested keep, and symlinked/file keeps', async () => {
+    const { paths, doc, ctx, root } = await fixture();
+    const target = join(root, 'target');
+    await mkdir(join(target, 'vendor'), { recursive: true });
+    await writeFile(join(target, 'vendor/precious'), 'p');
+    await symlink(target, join(paths.repo, 'app'));
+    await symlink(target, join(paths.repo, 'vendor'));
+    await writeFile(join(paths.repo, 'node_modules'), 'file');
+    await checkout(doc, ctx(['app/vendor', 'vendor', 'node_modules']));
+    expect(await readFile(join(target, 'vendor/precious'), 'utf8')).toBe('p');
+    for (const n of ['app', 'vendor', 'node_modules']) expect(existsSync(join(paths.repo, n))).toBe(false);
+  });
+
+  it('never keeps anything inside .git or outside the repo', async () => {
+    const { paths, doc, ctx } = await fixture();
+    await mkdir(join(paths.repo, '.git/vendor'), { recursive: true });
+    await writeFile(join(paths.repo, '.git/vendor/x'), 'x');
+    await writeFile(join(paths.repo, 'sibling'), 's');
+    await checkout(doc, ctx(['.git/vendor', '../x', '/etc', 'a/../sibling']));
+    expect(existsSync(join(paths.repo, '.git/vendor'))).toBe(false);
+    expect(existsSync(join(paths.repo, 'sibling'))).toBe(false);
+  });
+
+  it('keeps customer git env out of git and puts -- before the URL', async () => {
+    const { doc, ctx } = await fixture();
+    await checkout(doc, ctx([], { PATH: process.env.PATH, GIT_CONFIG_PARAMETERS: "'x.y=z'", GIT_SSH_COMMAND: 'evil' }));
+    for (const [, args, opts] of vi.mocked(client.runCommand).mock.calls) {
+      expect(opts.env!.GIT_CONFIG_PARAMETERS).toBeUndefined();
+      expect(opts.env!.GIT_SSH_COMMAND).toBeUndefined();
+      if (args.includes('fetch')) expect(args[args.indexOf('fetch') + 3]).toBe('--');
+    }
+  });
+
+  it('rejects non-https clone URLs unless file URLs are allowed', async () => {
+    const { doc, ctx } = await fixture();
+    await expect(checkout(doc, { ...ctx(), allowFileUrl: false })).rejects.toMatchObject({ code: 'build.clone_failed' });
+    const ssh = { ...doc, source: { ...doc.source, clone_url: '--upload-pack=x' } };
+    await expect(checkout(ssh, ctx())).rejects.toMatchObject({ code: 'build.clone_failed' });
   });
 });

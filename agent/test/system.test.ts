@@ -48,7 +48,7 @@ describe('resolveProjectDir', () => {
   it('refuses .. segments, symlink escapes and missing dirs', async () => {
     const repo = await setup();
     await symlink('/etc', join(repo, 'link'));
-    for (const bad of ['../x', 'app/../../x', 'link', 'nope', '/etc']) {
+    for (const bad of ['../x', 'app/../../x', 'link', 'nope', '/etc', '.git', 'app/.git/x']) {
       await expect(resolveProjectDir(repo, bad)).rejects.toMatchObject({ code: 'build.invalid_root_dir' });
     }
   });

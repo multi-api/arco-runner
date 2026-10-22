@@ -56,6 +56,7 @@ export function cutLine(line: string): string {
 export async function resolveProjectDir(repo: string, rootDir: string): Promise<string> {
   const invalid = (why: string) => new BuildFailure('build.invalid_root_dir', `root_dir ${why}`);
   if (rootDir.split(/[\\/]/).includes('..')) throw invalid('must not contain ".."');
+  if (rootDir.split(/[\\/]/).includes('.git')) throw invalid('must not contain ".git"');
   if (isAbsolute(rootDir)) throw invalid('must be relative to the repository');
   try {
     const realRepo = await realpath(repo);
