@@ -1,0 +1,7 @@
+{
+  "name": "arco-runner",
+  "private": true,
+  "type": "module",
+  "workspaces": ["scripts"],
+  "engines": { "node": ">=24" }
+}
