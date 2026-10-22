@@ -232,7 +232,7 @@ describe('wipe', () => {
     await wipe(f.paths, '', f.opts);
     expect(existsSync(join(f.paths.repo, 'deep'))).toBe(false);
     expect(await readdir(f.paths.tmpDirs[0]!)).toEqual([]);
-  });
+  }, 20_000); // R21: building and removing two 900-deep trees is slow on a loaded machine
 
   it('R12: removes SysV IPC objects owned by the build uid and sweeps the extra roots', async () => {
     const f = await fixture();

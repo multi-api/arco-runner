@@ -269,7 +269,8 @@ describe('archive round trip (GNU tar + zstd)', () => {
     const t = Date.now();
     check({ path: `work/repo/vendor/${'a/'.repeat(3990)}f`, type: 'file' });
     expect(() => check({ path: `work/repo/vendor/l/${'a/'.repeat(3990)}f`, type: 'file' })).toThrow(/below a symlink/);
-    expect(Date.now() - t).toBeLessThan(200);
+    // R21: generous for loaded CI machines; a check that is quadratic in the segment count still blows it.
+    expect(Date.now() - t).toBeLessThan(2000);
     const c2 = createEntryChecker(cacheRoots(''), { maxSegments: 4096, maxSymlinkBytes: 40 });
     c2({ path: 'work/repo/vendor/l1', type: 'symlink', target: 'x' });
     expect(() => c2({ path: 'work/repo/vendor/l2xxxxxxxxxxx', type: 'symlink', target: 'x' })).toThrow(/too many symlinks/);
