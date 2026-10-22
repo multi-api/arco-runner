@@ -22,7 +22,12 @@ export const freshFetch = ((input: string | URL, init: RequestInit = {}): Promis
     const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined), Connection: 'close' };
     if (body !== undefined) headers['Content-Length'] = String(Buffer.byteLength(body));
     const send = url.protocol === 'https:' ? httpsRequest : httpRequest;
-    const req = send(url, { method: init.method ?? 'GET', headers, agent: false }, (res) => {
+    const signal = init.signal ?? undefined;
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const req = send(url, { method: init.method ?? 'GET', headers, agent: false, ...(signal ? { signal } : {}) }, (res) => {
       const chunks: Buffer[] = [];
       let size = 0;
       res.on('data', (c: Buffer) => {
@@ -58,16 +63,28 @@ const endpoint = (apiBase: string, path: string) => `${apiBase.replace(/\/+$/, '
  */
 export async function claim(
   p: TicketPayload,
-  o: { now: () => number; sleep: (ms: number) => Promise<void>; receivedAt: number; fetchImpl?: typeof fetch },
+  o: {
+    now: () => number; sleep: (ms: number) => Promise<void>; receivedAt: number; fetchImpl?: typeof fetch;
+    /** Cancel: stops at once (an in-flight request or backoff sleep is abandoned) and returns null. */
+    signal?: AbortSignal;
+  },
 ): Promise<JobDocument | null> {
   const doFetch = o.fetchImpl ?? freshFetch;
   const giveUpAt = o.receivedAt + CLAIM_WINDOW_MS;
+  const cancelled = new Promise<'cancelled'>((resolve) => {
+    if (o.signal?.aborted) resolve('cancelled');
+    else o.signal?.addEventListener('abort', () => resolve('cancelled'), { once: true });
+  });
   for (let attempt = 0; ; attempt++) {
-    if (o.now() >= giveUpAt) return null;
+    const left = giveUpAt - o.now();
+    if (left <= 0 || o.signal?.aborted) return null;
     let res: Response | null = null;
     try {
+      // Never wait past the claim window, nor past a cancel.
+      const timeout = AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, left));
       res = await doFetch(endpoint(p.api_base, 'claim'), {
         method: 'POST', headers: runnerHeaders(), body: JSON.stringify({ ticket: p.ticket }),
+        signal: o.signal ? AbortSignal.any([timeout, o.signal]) : timeout,
       });
     } catch {
       res = null; // network error or reset: retry
@@ -75,7 +92,7 @@ export async function claim(
     if (res) {
       if (res.status === 200) {
         try {
-          return parseJobDocument(await res.json());
+          return o.signal?.aborted ? null : parseJobDocument(await res.json());
         } catch {
           return null;
         }
@@ -84,7 +101,9 @@ export async function claim(
       const retryable = res.status === 503 || res.status === 429 || res.status >= 500;
       if (!retryable) return null;
     }
-    await o.sleep(BACKOFF_MS[attempt] ?? MAX_BACKOFF_MS);
+    if (o.signal?.aborted) return null;
+    const pause = Math.min(BACKOFF_MS[attempt] ?? MAX_BACKOFF_MS, Math.max(0, giveUpAt - o.now()));
+    if ((await Promise.race([o.sleep(pause), cancelled])) === 'cancelled') return null;
   }
 }
 
@@ -94,10 +113,11 @@ export async function reportIdle(
   token: string,
   deploymentId: string,
   fetchImpl: typeof fetch = freshFetch,
+  sleep: (ms: number) => Promise<void> = realSleep,
 ): Promise<void> {
   let last = 'no answer';
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await realSleep(1000);
+    if (attempt > 0) await sleep(1000);
     try {
       const res = await fetchImpl(endpoint(apiBase, 'idle'), {
         method: 'POST', headers: runnerHeaders(token), body: JSON.stringify({ deployment_id: deploymentId }),

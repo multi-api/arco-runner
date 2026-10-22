@@ -29,19 +29,35 @@ export interface JobDeps {
   /** Date.now() when the ticket arrived. */
   receivedAt: number;
   now?: () => number;
-  /** Claim backoff only. */
+  /** Claim backoff and the gap between idle tries. */
   sleep?: (ms: number) => Promise<void>;
   /** Runner-only calls (claim, idle), the GitHub token revocation and the cache transfers. */
   fetchImpl?: typeof fetch;
-  /** Spec §6.6; a rejection means the VM is dirty and propagates to the caller (no idle is reported). */
+  /**
+   * Spec §6.6; a rejection means the VM is dirty and propagates to the caller (no idle is reported).
+   * Ruling R15: only called when customer code may have run (the checkout started), never after a refused claim,
+   * a failed start or a cancel before start.
+   */
   wipe: (rootDir: string) => Promise<void>;
+  /**
+   * Ruling R13: kills every build-user process before the cache save; a rejection skips the save.
+   * Defaults to killUserProcesses(identity.uid) when an identity is set, else nothing.
+   */
+  killBuildProcesses?: () => Promise<void>;
   /** Tests and offline validation only (file:// clones). */
   checkoutOptions?: Pick<CheckoutContext, 'extraGitArgs' | 'allowFileUrl'>;
   /** Agent diagnostics (stdout). Every message is redacted first. */
   log?: (message: string) => void;
 }
 
-export interface JobResult { deploymentId: string; finished: boolean; buildOk: boolean; idleReported: boolean }
+export interface JobResult {
+  deploymentId: string;
+  /** Cloud accepted a finish for this run (false when none was sent, or Cloud rejected or never answered it). */
+  finished: boolean;
+  /** The build and the deploy phase succeeded (deployAndFinish returned 0). */
+  buildOk: boolean;
+  idleReported: boolean;
+}
 
 const KEEP_ALIVE_MS = 60_000;
 const SAVE_TIME_BOX_MS = 8 * 60_000;
@@ -89,12 +105,12 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
   const result: JobResult = { deploymentId: p.deployment_id, finished: false, buildOk: false, idleReported: false };
   deps.onPhase('running');
 
-  // 1. Claim
-  const doc = await claim(p, { now, sleep: deps.sleep ?? realSleep, receivedAt: deps.receivedAt, fetchImpl: deps.fetchImpl });
+  const sleep = deps.sleep ?? realSleep;
+
+  // 1. Claim. Refused, timed out or cancelled: no Cloud call is possible and no customer code ran (R15: no wipe).
+  const doc = await claim(p, { now, sleep, receivedAt: deps.receivedAt, fetchImpl: deps.fetchImpl, signal: deps.signal });
   if (!doc) {
-    log(`claim for deployment ${p.deployment_id} refused or timed out; no Cloud calls are possible`);
-    deps.onPhase('wiping');
-    if (deps.mode === 'microvm') await deps.wipe('');
+    log(`claim for deployment ${p.deployment_id} refused, timed out or cancelled; no Cloud calls are possible`);
     return result;
   }
   const deadlineMs = now() + doc.timeout_seconds * 1000;
@@ -105,26 +121,34 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
   // 3. Start
   const api = new CloudApi(p.api_base, doc.runner_token, doc.deployment_id);
   let session: RunSession | null = null;
-  try {
-    session = await startRun({
-      api, nonce: doc.nonce, token: doc.runner_token, redactor, warn: log, batcher: { keepAliveMs: KEEP_ALIVE_MS },
-    });
-  } catch (e) {
-    log(`start failed for deployment ${doc.deployment_id}: ${messageOf(e)}`);
+  if (deps.signal.aborted) {
+    log(`deployment ${doc.deployment_id} cancelled before start`);
+  } else {
+    try {
+      session = await startRun({
+        api, nonce: doc.nonce, token: doc.runner_token, redactor, warn: log, batcher: { keepAliveMs: KEEP_ALIVE_MS },
+      });
+    } catch (e) {
+      log(`start failed for deployment ${doc.deployment_id}: ${messageOf(e)}`);
+    }
   }
 
-  let restoreFailed = false;
   if (session) {
     const s = session;
     const runSignal = AbortSignal.any([deps.signal, s.signal]);
     const steps = new Steps(s.batcher);
-    let deployed = false;
+    let restoreFailed = false;
+    // Set once deployAndFinish returned (finish sent): the save time box starts there.
+    let saveBy: number | null = null;
+    // finishWithRetry warns exactly when Cloud did not accept the finish (run lost, or no answer after retries).
+    let finishRejected = false;
+    const finishWarn = (m: string) => { finishRejected = true; log(m); };
     try {
       restoreFailed = await build(doc, deps, s, steps, runSignal, deadlineMs);
-      await deploy(doc, deps, s, runSignal, now);
-      deployed = true;
-      result.finished = true;
-      result.buildOk = true;
+      const exitCode = await deploy(doc, deps, { ...s, warn: finishWarn }, runSignal, now);
+      saveBy = now() + SAVE_TIME_BOX_MS;
+      result.finished = !finishRejected;
+      result.buildOk = exitCode === 0;
     } catch (e) {
       if (s.abortMessage() !== null) {
         // Cloud ended the run (lease lost, finished, not the runner): nothing more is reported.
@@ -138,9 +162,10 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
         if (!(e instanceof BuildFailure) && !deps.signal.aborted) {
           log(`internal error in deployment ${doc.deployment_id}: ${messageOf(e)}`);
         }
-        await s.batcher.flush();
-        await finishWithRetry(api, JSON.parse(s.redact(JSON.stringify(failure))), undefined, log);
-        result.finished = true;
+        // Closed (not just flushed) first, so no keep-alive batch can follow the finish.
+        await s.batcher.close();
+        await finishWithRetry(api, JSON.parse(s.redact(JSON.stringify(failure))), undefined, finishWarn);
+        result.finished = !finishRejected;
       }
     } finally {
       await s.batcher.close();
@@ -148,16 +173,16 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
 
     // 8. Cache save: after finish, only after a deploy ran, never after a failed restore
     deps.onPhase('saving');
-    if (deployed && !restoreFailed) await save(doc, deps, now, log);
-  } else {
-    deps.onPhase('saving');
+    if (saveBy !== null && !restoreFailed) await save(doc, deps, now, log, saveBy);
+
+    // 9. Wipe (the checkout ran: customer code may have run)
+    deps.onPhase('wiping');
+    if (deps.mode === 'microvm') await deps.wipe(doc.source.root_dir);
   }
 
-  // 9. Wipe, then idle
-  deps.onPhase('wiping');
-  if (deps.mode === 'microvm') await deps.wipe(doc.source.root_dir);
+  // 9. Idle
   try {
-    await reportIdle(p.api_base, doc.runner_token, doc.deployment_id, deps.fetchImpl);
+    await reportIdle(p.api_base, doc.runner_token, doc.deployment_id, deps.fetchImpl, sleep);
     result.idleReported = true;
   } catch (e) {
     log(messageOf(e));
@@ -177,12 +202,17 @@ async function build(
   const short = shortMaskValues(doc);
   if (short > 0) steps.warning('build.clone', `${short} secret value(s) shorter than 4 characters are not masked`);
   steps.start('build.clone');
-  const { hasSubmodules } = await checkout(doc, {
-    paths, identity, env, signal, keep: repoKeep(doc.source.root_dir),
-    onLine: (l) => s.batcher.addLine(cutLine(l)),
-    ...deps.checkoutOptions,
-  });
-  await revokeGithubToken(doc.source.clone_url, doc.source.auth_header, deps.fetchImpl);
+  let hasSubmodules: boolean;
+  try {
+    ({ hasSubmodules } = await checkout(doc, {
+      paths, identity, env, signal, keep: repoKeep(doc.source.root_dir),
+      onLine: (l) => s.batcher.addLine(cutLine(l)),
+      ...deps.checkoutOptions,
+    }));
+  } finally {
+    // Also after a failed clone: the token is single-purpose either way.
+    await revokeGithubToken(doc.source.clone_url, doc.source.auth_header, deps.fetchImpl);
+  }
   if (hasSubmodules) steps.note('build.clone', 'Submodules are not checked out');
   const projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
   steps.done('build.clone');
@@ -216,8 +246,11 @@ async function build(
   return restoreFailed;
 }
 
-/** Step 7: arco checks, then the shared deploy phase, which sends finish. Re-resolves root_dir: the build may have swapped it. */
-async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: AbortSignal, now: () => number): Promise<void> {
+/**
+ * Step 7: arco checks, then the shared deploy phase, which sends finish; returns its exit code (0 = success).
+ * Re-resolves root_dir: the build may have swapped it.
+ */
+async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: AbortSignal, now: () => number): Promise<number> {
   const projectDir = await resolveProjectDir(deps.paths.repo, doc.source.root_dir);
   if (!(await arcoInstalled(projectDir, deps.identity))) throw new BuildFailure('arco.not_installed', ARCO_MISSING);
   const expiresAt = Date.parse(s.started.credentials.expiration);
@@ -227,20 +260,21 @@ async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: Ab
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
   // A cancel stops arco like a run Cloud ended; the RunAbortedError it causes is reported as build.cancelled.
   const view: RunSession = { ...s, signal, abortMessage: () => s.abortMessage() ?? (deps.signal.aborted ? 'Cancelled' : null) };
-  await deployAndFinish(view, {
+  return await deployAndFinish(view, {
     mode: doc.mode, environment: doc.environment, cwd: projectDir, env: buildEnv(deps.paths, doc.env),
     ...(deps.identity ? { uid: deps.identity.uid, gid: deps.identity.gid } : {}),
   });
 }
 
 /** Step 8, after finish: nothing reaches Cloud's logs any more, diagnostics go to stdout only. */
-async function save(doc: JobDocument, deps: JobDeps, now: () => number, log: (m: string) => void): Promise<void> {
-  const savedBy = now() + SAVE_TIME_BOX_MS;
+async function save(doc: JobDocument, deps: JobDeps, now: () => number, log: (m: string) => void, savedBy: number): Promise<void> {
   try {
     // Ruling R13: no build process may be alive while the cache roots are walked and archived.
-    if (deps.identity) {
+    const identity = deps.identity;
+    const kill = deps.killBuildProcesses ?? (identity ? () => killUserProcesses(identity.uid) : null);
+    if (kill) {
       try {
-        await killUserProcesses(deps.identity.uid);
+        await kill();
       } catch (e) {
         log(`cache save skipped: build processes survived (${messageOf(e)})`);
         return;

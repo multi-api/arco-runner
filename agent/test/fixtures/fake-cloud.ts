@@ -34,6 +34,8 @@ export interface FakeCloudOptions {
   credentials?: { accessKeyId: string; secretAccessKey: string; sessionToken: string };
   region?: string;
   permissionsBoundary?: string | null;
+  /** When set, every start request gets this answer instead of the credentials. */
+  startAnswer?: CannedAnswer;
   /** When set, every logs request gets this answer instead of 204. */
   logsAnswer?: CannedAnswer;
 }
@@ -127,6 +129,7 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
     if (!authorized || decodeURIComponent(m[1]!) !== id) return json(res, 403, { error: 'not_runner' });
     const action = m[2];
     if (action === 'start') {
+      if (options.startAnswer) return json(res, options.startAnswer.status, options.startAnswer.body);
       const c = options.credentials ?? {
         accessKeyId: 'AKIAFAKECLOUD0000001',
         secretAccessKey: 'fake/Secret+Access+Key/0123456789abcdefABCD',

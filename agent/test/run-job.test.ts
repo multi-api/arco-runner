@@ -218,7 +218,27 @@ describe('runJob: errors and refusals', () => {
     const r = await run(w, { cloud: { claimAnswers: [{ status: 409, body: { error: 'ticket_invalid' } }] } });
     expect(r.order).toEqual(['claim']);
     expect(r.result).toEqual({ deploymentId: 'dep_1', finished: false, buildOk: false, idleReported: false });
-    expect(r.wipes).toHaveLength(1);
+    expect(r.wipes).toEqual([]); // R15: no customer code ran
+  });
+
+  it('does not wipe when start fails, and still reports idle', async () => {
+    const w = await world();
+    const r = await run(w, { cloud: { startAnswer: { status: 500, body: { error: 'boom' } } } });
+    expect(r.order).toEqual(['claim', 'start', 'idle']);
+    expect(r.wipes).toEqual([]);
+    expect(r.phases).toEqual(['running']);
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: false, buildOk: false, idleReported: true });
+    expect(existsSync(join(w.paths.repo, 'composer.json'))).toBe(false);
+  });
+
+  it('skips the run without a wipe when cancelled before start', async () => {
+    const w = await world();
+    const ac = new AbortController();
+    ac.abort();
+    const r = await run(w, { signal: ac.signal });
+    expect(r.order).toEqual([]);
+    expect(r.wipes).toEqual([]);
+    expect(r.result).toMatchObject({ finished: false, idleReported: false });
   });
 
   it('retries 503 claims with the 2 s, 4 s backoff and proceeds', async () => {
@@ -283,6 +303,36 @@ describe('runJob: errors and refusals', () => {
     }
   }, 30_000);
 
+  it('finishes build.cancelled when cancelled while arco deploy runs', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const ac = new AbortController();
+    const poll = setInterval(async () => {
+      if (!ac.signal.aborted && (await readFile(calls, 'utf8').catch(() => '')).includes('pid ')) ac.abort();
+    }, 50);
+    try {
+      const r = await run(w, { env: { FAKE_ARCO_SCENARIO: 'hang', FAKE_ARCO_CALLS: calls }, signal: ac.signal });
+      expect(ac.signal.aborted).toBe(true);
+      expect(r.finishes).toEqual([{
+        result: 'failed', revision: null, rolled_back: false, error_code: 'build.cancelled', error_message: 'Cancelled', arco_version: null,
+      }]);
+      // arco was stopped before `info`: only the deploy ran.
+      expect((await readFile(calls, 'utf8')).split('\n').filter((l) => l && !l.startsWith('pid'))).toEqual(['deploy --env=production --yes --json']);
+      expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+      expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+      expect(r.wipes).toHaveLength(1);
+    } finally {
+      clearInterval(poll);
+    }
+  }, 30_000);
+
+  it('reports buildOk false but finished true when arco reports a failed deploy', async () => {
+    const w = await world();
+    const r = await run(w, { env: { FAKE_ARCO_SCENARIO: 'failed' } });
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'deploy.health_check_failed' });
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+
   it('does not finish when Cloud answers logs with 409 lease_lost, but still wipes and reports idle', async () => {
     const w = await world();
     const r = await run(w, { commands: ['echo hi; sleep 30'], cloud: { logsAnswer: { status: 409, body: { error: 'lease_lost' } } } });
@@ -316,6 +366,30 @@ describe('runJob: cache rules', () => {
   }, 60_000);
 });
 
+describe('runJob: R13 kill before cache save', () => {
+  itTar('kills the build processes before the save', async () => {
+    const w = await world();
+    let killedAt = 0;
+    const r = await run(w, { deps: { killBuildProcesses: async () => { killedAt = Date.now(); } } });
+    const put = r.cloud.calls('/s3/cache', 'PUT');
+    expect(put).toHaveLength(1);
+    expect(killedAt).toBeGreaterThanOrEqual(r.cloud.calls('/finish')[0]!.at);
+    expect(killedAt).toBeLessThanOrEqual(put[0]!.at);
+  }, 30_000);
+
+  it('skips the save when the kill fails, and still wipes and reports idle', async () => {
+    const w = await world();
+    let kills = 0;
+    const r = await run(w, { deps: { killBuildProcesses: async () => { kills++; throw new Error('1 process(es) of uid 1000 survived SIGKILL'); } } });
+    expect(kills).toBe(1);
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+    expect(w.knownCache.get()).toBeNull();
+    expect(r.logs.some((l) => l.startsWith('cache save skipped'))).toBe(true);
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: true, idleReported: true });
+  }, 30_000);
+});
+
 describe('runJob: fargate', () => {
   it('does not wipe in fargate mode', async () => {
     const w = await world();
@@ -343,7 +417,22 @@ describe('claim and reportIdle', () => {
     expect(seen[0]).toBe(`POST https://cloud.test/api/v1/runner/claim {"ticket":"${TICKET}"}`);
     expect(sleeps.slice(0, 6)).toEqual([2000, 4000, 8000, 16000, 30000, 30000]);
     expect(sleeps.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(9 * 60_000);
-    expect(t - 1_000_000).toBeLessThan(9 * 60_000 + 30_000);
+    // The last sleep is clamped to what is left of the window.
+    expect(t - 1_000_000).toBe(9 * 60_000);
+  });
+
+  it('stops at once when cancelled, abandoning the backoff sleep', async () => {
+    const ac = new AbortController();
+    let n = 0;
+    const fetchImpl = (async () => { n++; ac.abort(); return new Response('{"error":"claim_unavailable"}', { status: 503 }); }) as unknown as typeof fetch;
+    const never = () => new Promise<void>(() => {});
+    await expect(claim(ticket, { now: Date.now, sleep: never, receivedAt: Date.now(), fetchImpl, signal: ac.signal })).resolves.toBeNull();
+    expect(n).toBe(1);
+    const busy = (async () => new Response('{"error":"claim_unavailable"}', { status: 503 })) as unknown as typeof fetch;
+    const ac2 = new AbortController();
+    const pending = claim(ticket, { now: Date.now, sleep: never, receivedAt: Date.now(), fetchImpl: busy, signal: ac2.signal });
+    setTimeout(() => ac2.abort(), 20);
+    await expect(pending).resolves.toBeNull();
   });
 
   it('treats 204, 401, 404 and 409 from idle as done and retries anything else 3 times', async () => {
@@ -362,8 +451,10 @@ describe('claim and reportIdle', () => {
       if (n === 1) throw reset();
       return new Response('{"error":"x"}', { status: 500 });
     }) as unknown as typeof fetch;
-    await expect(reportIdle('https://cloud.test', TOKEN, 'dep_1', failing)).rejects.toThrow();
+    const gaps: number[] = [];
+    await expect(reportIdle('https://cloud.test', TOKEN, 'dep_1', failing, async (ms) => { gaps.push(ms); })).rejects.toThrow();
     expect(n).toBe(3);
+    expect(gaps).toEqual([1000, 1000]);
     expect(bodies[0]).toEqual({ deployment_id: 'dep_1' });
-  }, 15_000);
+  });
 });
