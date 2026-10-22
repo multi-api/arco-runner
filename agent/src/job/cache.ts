@@ -51,6 +51,14 @@ export class UnsafeArchive extends CacheError {
   }
 }
 
+/** The retained-symlink budget ran out: a resource limit, not a verdict on one member. */
+export class SymlinkBudgetExceeded extends UnsafeArchive {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SymlinkBudgetExceeded';
+  }
+}
+
 /** Cache roots relative to `home`, without the manifest. A `root_dir` that is not a plain relative path adds none. */
 export function cacheRoots(rootDir: string): string[] {
   const roots = ['work/repo/vendor', 'work/repo/node_modules'];
@@ -150,7 +158,7 @@ export function createEntryChecker(
       throw new UnsafeArchive(`symlink leaves its cache root: ${path}`);
     }
     symlinkBytes += Buffer.byteLength(path);
-    if (symlinkBytes > caps.maxSymlinkBytes) throw new UnsafeArchive('too many symlinks in the archive');
+    if (symlinkBytes > caps.maxSymlinkBytes) throw new SymlinkBudgetExceeded('too many symlinks in the archive');
     symlinks.add(path);
   };
 }
@@ -386,6 +394,10 @@ async function unrestorableMembers(
   const check = createEntryChecker(cacheRoots(rootDir), limits);
   const out: string[] = [];
   let walked = 0;
+  const addExclude = (rel: string): void => {
+    out.push(rel);
+    if (out.length > limits.maxExcludes) throw new CacheError('too many members to exclude from the cache');
+  };
   const visit = async (rel: string): Promise<void> => {
     if (++walked > limits.maxWalked) throw new CacheError('cache roots hold too many entries');
     if (walked % 1000 === 0 && signal.aborted) throw new CacheError('cache save aborted');
@@ -395,10 +407,13 @@ async function unrestorableMembers(
       : st.isFile() ? { path: rel, type: 'file' }
         : st.isSymbolicLink() ? { path: rel, type: 'symlink' } : { path: rel, type: 'other' };
     if (entry.type === 'symlink') {
-      try { entry.target = await readlink(join(home, rel)); } catch { out.push(rel); return; }
+      try { entry.target = await readlink(join(home, rel)); } catch { addExclude(rel); return; }
     }
-    try { check(entry); } catch { out.push(rel); return; }
-    if (out.length > limits.maxExcludes) throw new CacheError('too many members to exclude from the cache');
+    try { check(entry); } catch (e) {
+      if (e instanceof SymlinkBudgetExceeded) throw new CacheError('too many symlinks in the cache roots');
+      addExclude(rel);
+      return;
+    }
     // lstat said real directory: only then do we descend; a link or anything else is never entered.
     if (entry.type !== 'dir') return;
     let names: string[];

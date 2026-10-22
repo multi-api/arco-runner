@@ -264,11 +264,12 @@ describe('archive round trip (GNU tar + zstd)', () => {
 
   it('refuses a member with too many segments quickly and caps retained symlink bytes', () => {
     const check = createEntryChecker(cacheRoots(''), { maxSegments: 4096, maxSymlinkBytes: 64 });
-    const t = Date.now();
+    check({ path: 'work/repo/vendor/l', type: 'symlink', target: 'x' });
     expect(() => check({ path: `work/repo/vendor/${'a/'.repeat(30000)}a`, type: 'file' })).toThrow(UnsafeArchive);
-    const deep = `work/repo/vendor/${'a/'.repeat(3000)}f`;
-    check({ path: deep, type: 'file' });
-    expect(Date.now() - t).toBeLessThan(1000);
+    const t = Date.now();
+    check({ path: `work/repo/vendor/${'a/'.repeat(3990)}f`, type: 'file' });
+    expect(() => check({ path: `work/repo/vendor/l/${'a/'.repeat(3990)}f`, type: 'file' })).toThrow(/below a symlink/);
+    expect(Date.now() - t).toBeLessThan(200);
     const c2 = createEntryChecker(cacheRoots(''), { maxSegments: 4096, maxSymlinkBytes: 40 });
     c2({ path: 'work/repo/vendor/l1', type: 'symlink', target: 'x' });
     expect(() => c2({ path: 'work/repo/vendor/l2xxxxxxxxxxx', type: 'symlink', target: 'x' })).toThrow(/too many symlinks/);
@@ -296,6 +297,20 @@ describe('archive round trip (GNU tar + zstd)', () => {
     const ac = new AbortController();
     ac.abort();
     await expect(saveCache(url, manifest, ctx(a, { signal: ac.signal }), Date.now() + 60_000)).rejects.toBeInstanceOf(CacheError);
+    expect(state.puts).toBe(0);
+    expect(await readdir(a.varDir)).toEqual([]);
+  });
+
+  itTar('enforces the exclude cap when the excluded entries come last, and fails on the symlink budget', async () => {
+    const { a, ctx } = await env();
+    await populate(a.home);
+    await mkdir(join(a.home, 'work/repo/vendor/zz'));
+    for (let i = 0; i < 5; i++) await symlink('/etc', join(a.home, `work/repo/vendor/zz/s${i}`));
+    const { url, state } = await s3();
+    await expect(saveCache(url, manifest, ctx(a, { limits: { maxExcludes: 3 } }), Date.now() + 60_000))
+      .rejects.toThrow(/too many members to exclude/);
+    await expect(saveCache(url, manifest, ctx(a, { limits: { maxSymlinkBytes: 10 } }), Date.now() + 60_000))
+      .rejects.toThrow(/too many symlinks/);
     expect(state.puts).toBe(0);
     expect(await readdir(a.varDir)).toEqual([]);
   });
