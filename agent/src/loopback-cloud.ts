@@ -2,7 +2,10 @@
 // Self-contained (node built-ins only): tests use it, and `/validate` runs it on 127.0.0.1 for its canned job.
 //
 //   POST /api/v1/runner/claim                 {ticket} -> 200 job | 409 ticket_invalid | 503 claim_unavailable
-//   POST /api/v1/deployments/{id}/start       {nonce}  -> 200 credentials
+//   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?} -> 200 credentials (null when deferred)
+//                                             | 409 runner_outdated (job has tests, flag missing)
+//   POST /api/v1/deployments/{id}/credentials {}       -> 200 {credentials, region, permissionsBoundary} once,
+//                                             then 409 credentials_issued | 409 finished
 //   POST /api/v1/deployments/{id}/logs        {seq, lines, events} -> 204 (or the configured answer)
 //   POST /api/v1/deployments/{id}/finish      payload -> 204 | 409 finished
 //   POST /api/v1/runner/idle                  {deployment_id} -> 204 | 409 not_finished | 404
@@ -28,7 +31,7 @@ export interface FakeCloudOptions {
   ticket: string;
   /** Answers given to the first claims, in order, before the job is handed out (e.g. two 503s). */
   claimAnswers?: CannedAnswer[];
-  /** `credentials.expiration` relative to now. Default 1 hour. */
+  /** `credentials.expiration` relative to now, on start and on credentials. Default 1 hour. */
   credentialsTtlMs?: number;
   /** The `start` answer's credentials (defaults are fixed example values). */
   credentials?: { accessKeyId: string; secretAccessKey: string; sessionToken: string };
@@ -36,6 +39,10 @@ export interface FakeCloudOptions {
   permissionsBoundary?: string | null;
   /** When set, every start request gets this answer instead of the credentials. */
   startAnswer?: CannedAnswer;
+  /** An older Cloud: start ignores defer_credentials (and the tests rule) and always returns credentials. */
+  ignoreDefer?: boolean;
+  /** When set, every credentials request gets this answer instead of the credentials. */
+  credentialsAnswer?: CannedAnswer;
   /** When set, every logs request gets this answer instead of 204. */
   logsAnswer?: CannedAnswer;
 }
@@ -83,6 +90,7 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
   const claimAnswers = [...(options.claimAnswers ?? [])];
   let claimed = false;
   let finished = false;
+  let credentialsIssued = false;
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const body = await readBody(req);
@@ -124,26 +132,40 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
       if (!finished) return json(res, 409, { error: 'not_finished' });
       return json(res, 204);
     }
-    const m = /^\/api\/v1\/deployments\/([^/]+)\/(start|logs|finish)$/.exec(pathname);
+    const m = /^\/api\/v1\/deployments\/([^/]+)\/(start|credentials|logs|finish)$/.exec(pathname);
     if (!m) return json(res, 404, { error: 'not_found' });
     if (!authorized || decodeURIComponent(m[1]!) !== id) return json(res, 403, { error: 'not_runner' });
     const action = m[2];
-    if (action === 'start') {
-      if (options.startAnswer) return json(res, options.startAnswer.status, options.startAnswer.body);
+    const issue = () => {
       const c = options.credentials ?? {
         accessKeyId: 'AKIAFAKECLOUD0000001',
         secretAccessKey: 'fake/Secret+Access+Key/0123456789abcdefABCD',
         sessionToken: 'FwoGZXIvYXdzEFAKESESSIONTOKEN0123456789',
       };
-      return json(res, 200, {
+      return {
         credentials: { ...c, expiration: new Date(Date.now() + (options.credentialsTtlMs ?? 3_600_000)).toISOString() },
         region: options.region ?? 'us-east-1',
-        environment: options.job.environment,
-        mode: options.job.mode,
         permissionsBoundary: options.permissionsBoundary ?? null,
-      });
+      };
+    };
+    if (action === 'start') {
+      if (options.startAnswer) return json(res, options.startAnswer.status, options.startAnswer.body);
+      const answer = { environment: options.job.environment, mode: options.job.mode };
+      if (!options.ignoreDefer) {
+        const defer = parse(body)?.defer_credentials === true;
+        const tests = options.job.tests;
+        if (!defer && tests !== undefined && tests !== null) return json(res, 409, { error: 'runner_outdated' });
+        if (defer) return json(res, 200, { ...answer, credentials: null, region: options.region ?? 'us-east-1', permissionsBoundary: null });
+      }
+      return json(res, 200, { ...issue(), ...answer });
     }
     if (finished) return json(res, 409, { error: 'finished' });
+    if (action === 'credentials') {
+      if (options.credentialsAnswer) return json(res, options.credentialsAnswer.status, options.credentialsAnswer.body);
+      if (credentialsIssued) return json(res, 409, { error: 'credentials_issued' });
+      credentialsIssued = true;
+      return json(res, 200, issue());
+    }
     if (action === 'logs') {
       if (options.logsAnswer) return json(res, options.logsAnswer.status, options.logsAnswer.body);
       return json(res, 204);
