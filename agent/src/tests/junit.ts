@@ -231,15 +231,28 @@ export function cutBytes(text: string, maxBytes: number): string {
   return buf.subarray(0, end).toString('utf8');
 }
 
-/** Drops the longest suffix of `text` that is a proper prefix of some secret variant: what a cut leaves of a secret. */
+/**
+ * Drops what a cut may have left of a secret at the end of `text`: the longest suffix that is a proper prefix of some variant. A
+ * full occurrence that the dropped suffix overlaps (secrets may share a border, or overlap each other) would lose its tail and
+ * escape masking, so it is dropped too, and the check repeats at the new end until nothing ends or crosses there.
+ */
 function dropPartialSecret(text: string, variants: readonly string[]): string {
-  let drop = 0;
-  for (const v of variants) {
-    for (let k = Math.min(v.length - 1, text.length); k > drop; k--) {
-      if (text[text.length - k] === v[0] && text.endsWith(v.slice(0, k))) { drop = k; break; }
+  let end = text.length;
+  for (;;) {
+    let next = end;
+    for (const v of variants) {
+      for (let k = Math.min(v.length - 1, end); k > end - next; k--) {
+        if (text[end - k] === v[0] && text.startsWith(v.slice(0, k), end - k)) { next = end - k; break; }
+      }
     }
+    if (next === end) return text.slice(0, end);
+    for (const v of variants) {
+      for (let i = text.indexOf(v, Math.max(0, next - v.length + 1)); i !== -1 && i < next; i = text.indexOf(v, i + 1)) {
+        if (i + v.length > next) { next = i; break; }
+      }
+    }
+    end = next;
   }
-  return drop > 0 ? text.slice(0, text.length - drop) : text;
 }
 
 /**

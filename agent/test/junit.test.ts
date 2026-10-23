@@ -159,6 +159,25 @@ describe('summarize', () => {
       expect(out.replace(/\*\*\*/g, '')).toMatch(/^[a ]*$/);
     }
   });
+  // The pre-cut lands exactly at the end of a full occurrence whose tail is also a prefix of a secret.
+  const atPreCut = (repeated: string, last: string): string => {
+    const head = (repeated + '|').repeat(Math.floor((65536 - last.length) / (repeated.length + 1)));
+    return '.'.repeat(65536 - head.length - last.length) + head + last + 'MORE';
+  };
+  it('never leaves part of a full occurrence that overlaps another secret at a cut', () => {
+    const s1 = 'Q' + 'x'.repeat(300);
+    const s2 = 'y'.repeat(300) + 'Q'; // last char of s2 = first char of s1
+    const msg = atPreCut(s1, s2);
+    const out = summarize([{ class: 'C', name: 'n', status: 'failed', message: msg }], 0, masker(s1, s2)).failures![0]!.message;
+    expect(out.replace(/\*\*\*/g, '')).not.toMatch(/[xyQ]/);
+  });
+  it('never leaves part of a self-bordered secret at a cut', () => {
+    const p = 'p'.repeat(20);
+    const s = p + 'b'.repeat(300) + p;
+    const msg = atPreCut(s, s);
+    const out = summarize([{ class: 'C', name: 'n', status: 'failed', message: msg }], 0, masker(s)).failures![0]!.message;
+    expect(out.replace(/\*\*\*/g, '')).not.toMatch(/[pb]/);
+  });
   it('keeps text that merely looks like a secret prefix when nothing was cut', () => {
     const f = summarize([{ class: 'C', name: 'n', status: 'failed', message: 'value S3CR' }], 0, masker(SECRET)).failures![0]!;
     expect(f.message).toBe('value S3CR');
