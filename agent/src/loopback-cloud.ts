@@ -5,7 +5,7 @@
 //   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?} -> 200 credentials (null when deferred)
 //                                             | 409 runner_outdated (job has tests, flag missing)
 //   POST /api/v1/deployments/{id}/credentials {}       -> 200 {credentials, region, permissionsBoundary} once,
-//                                             then 409 credentials_issued | 409 finished
+//                                             then 409 credentials_already_issued | 409 finished
 //   POST /api/v1/deployments/{id}/logs        {seq, lines, events} -> 204 (or the configured answer)
 //   POST /api/v1/deployments/{id}/finish      payload -> 204 | 409 finished
 //   POST /api/v1/runner/idle                  {deployment_id} -> 204 | 409 not_finished | 404
@@ -162,7 +162,7 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
     if (finished) return json(res, 409, { error: 'finished' });
     if (action === 'credentials') {
       if (options.credentialsAnswer) return json(res, options.credentialsAnswer.status, options.credentialsAnswer.body);
-      if (credentialsIssued) return json(res, 409, { error: 'credentials_issued' });
+      if (credentialsIssued) return json(res, 409, { error: 'credentials_already_issued' });
       credentialsIssued = true;
       return json(res, 200, issue());
     }

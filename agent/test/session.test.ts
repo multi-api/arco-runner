@@ -59,14 +59,14 @@ describe('issueCredentials', () => {
       expect(c.calls('/credentials')[0]!.headers.authorization).toBe(`Bearer ${TOKEN}`);
       expect(JSON.parse(c.calls('/credentials')[0]!.body.toString('utf8'))).toEqual({});
       expect(redactor.redact(FAKE_SECRET)).toBe(FAKE_SECRET);
-      const session = completeSession(o.session, issued, redactor);
+      const session = completeSession(o, issued, redactor);
       expect(redactor.redact(FAKE_SECRET)).toBe('***');
       expect(session.awsEnv.AWS_REGION).toBe('us-east-1');
       expect(session.awsEnv.AWS_ACCESS_KEY_ID).toBe(FAKE_KEY);
       expect(session.started).toMatchObject({ environment: 'production', mode: 'deploy', region: 'us-east-1', permissionsBoundary: null });
       const again = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' }).catch((e) => e);
       expect(again).toBeInstanceOf(CloudApiError);
-      expect(again).toMatchObject({ status: 409, code: 'credentials_issued' });
+      expect(again).toMatchObject({ status: 409, code: 'credentials_already_issued' });
     } finally {
       await o.session.batcher.close();
     }
@@ -93,6 +93,38 @@ describe('issueCredentials', () => {
     expect(err).toMatchObject({ status: 403, code: 'forbidden' });
     expect(c.calls('/credentials')).toHaveLength(1);
     expect(sleeps).toEqual([]);
+  });
+
+  it('rejects a malformed answer without quoting it', async () => {
+    const secret = 'SECRETVALUE0123456789';
+    const bodies = [
+      `{"credentials":{"accessKeyId":"${secret}"`,
+      JSON.stringify({ credentials: { accessKeyId: secret, secretAccessKey: secret, sessionToken: secret }, region: 'us-east-1' }),
+      JSON.stringify({ credentials: { accessKeyId: secret, secretAccessKey: secret, sessionToken: secret, expiration: 'x' }, region: 'us-east-1', permissionsBoundary: 7 }),
+      JSON.stringify({ credentials: null, region: 'us-east-1' }),
+    ];
+    for (const body of bodies) {
+      const sleeps: number[] = [];
+      const fetchImpl = (async () => new Response(body, { status: 200 })) as unknown as typeof fetch;
+      const err = await issueCredentials({
+        apiBase: 'http://cloud.invalid', token: TOKEN, deploymentId: 'dep_1', fetchImpl, sleep: async (ms) => { sleeps.push(ms); },
+      }).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toBe('Arco Cloud credentials answer was malformed');
+      expect(sleeps).toEqual([]);
+    }
+  });
+
+  it('stops the retry sleep and gives up at once when the signal aborts', async () => {
+    const c = await cloud({ credentialsAnswer: { status: 503 } });
+    const ac = new AbortController();
+    const err = await issueCredentials({
+      apiBase: c.url, token: TOKEN, deploymentId: 'dep_1', signal: ac.signal,
+      sleep: () => { ac.abort(); return new Promise<void>(() => {}); },
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe('Arco Cloud credentials call was cancelled');
+    expect(c.calls('/credentials')).toHaveLength(1);
   });
 
   it('answers 409 finished after a finish', async () => {

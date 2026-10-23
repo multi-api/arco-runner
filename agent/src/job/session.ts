@@ -25,17 +25,50 @@ export interface OpenSession {
 const TIMEOUT_MS = 30_000;
 const CREDENTIAL_RETRY_SLEEPS_MS = [1000, 2000];
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-/** The start answer's environment and mode, per open session: completeSession puts them back into `started`. */
-const startAnswers = new WeakMap<OpenSession['session'], { environment: string; mode: string }>();
 
-/** POSTs `body` the way CloudApi does; non-2xx throws CloudApiError (so isRunLost works), a timeout a plain Error. */
+/** The caller's signal ended the call (a cancel or a run Cloud ended): never retried. */
+class CallAborted extends Error {
+  constructor(path: string) {
+    super(`Arco Cloud ${path} call was cancelled`);
+    this.name = 'CallAborted';
+  }
+}
+
+/** A 2xx answer that is not JSON or lacks a field: never retried, and never quotes the body. */
+class MalformedAnswer extends Error {
+  constructor(path: string) {
+    super(`Arco Cloud ${path} answer was malformed`);
+    this.name = 'MalformedAnswer';
+  }
+}
+
+/** `sleep(ms)`, cut short when `signal` aborts. */
+async function abortableSleep(sleep: (ms: number) => Promise<void>, ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return;
+  let onAbort = () => {};
+  const aborted = new Promise<void>((r) => { onAbort = () => r(); signal.addEventListener('abort', onAbort, { once: true }); });
+  try {
+    await Promise.race([sleep(ms), aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/**
+ * POSTs `body` the way CloudApi does; non-2xx throws CloudApiError (so isRunLost works), a timeout a plain Error,
+ * an abort of `signal` a CallAborted. A 2xx body that is not JSON throws a fixed message: V8's SyntaxError quotes
+ * the body, which may hold unmasked credentials.
+ */
 async function post(
   apiBase: string, token: string, deploymentId: string, path: string, body: unknown, fetchImpl: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const url = `${apiBase.replace(/\/+$/, '')}/api/v1/deployments/${encodeURIComponent(deploymentId)}/${path}`;
+  const timeout = AbortSignal.timeout(TIMEOUT_MS);
   try {
     const response = await fetchImpl(url, {
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -55,8 +88,14 @@ async function post(
       }
       throw new CloudApiError(`Arco Cloud ${path} failed with HTTP ${response.status}`, response.status, code);
     }
-    return await response.json();
+    const text = await response.text();
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw new MalformedAnswer(path);
+    }
   } catch (e) {
+    if (signal?.aborted) throw new CallAborted(path);
     if (e instanceof DOMException && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
       throw new Error(`Arco Cloud ${path} timed out after ${TIMEOUT_MS} ms`);
     }
@@ -64,11 +103,25 @@ async function post(
   }
 }
 
-const toIssued = (a: { credentials: Credentials; region: string; permissionsBoundary?: string | null }): Issued => ({
-  credentials: a.credentials,
-  region: a.region,
-  permissionsBoundary: a.permissionsBoundary ?? null,
-});
+const isString = (v: unknown): v is string => typeof v === 'string';
+
+/** The credentials, region and boundary of an answer, checked field by field; `path` names the call in the error. */
+function toIssued(a: unknown, path: string): Issued {
+  const x = (a ?? {}) as { credentials?: Record<string, unknown> | null; region?: unknown; permissionsBoundary?: unknown };
+  const c = x.credentials;
+  const boundary = x.permissionsBoundary ?? null;
+  if (
+    !c || typeof c !== 'object' || !isString(c.accessKeyId) || !isString(c.secretAccessKey) || !isString(c.sessionToken)
+    || !isString(c.expiration) || !isString(x.region) || (boundary !== null && !isString(boundary))
+  ) {
+    throw new MalformedAnswer(path);
+  }
+  return {
+    credentials: { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, sessionToken: c.sessionToken, expiration: c.expiration },
+    region: x.region,
+    permissionsBoundary: boundary,
+  };
+}
 
 /** Calls start (deferring the credentials when `defer`) and wires the log batcher exactly as the shared startRun does. */
 export async function openSession(o: {
@@ -81,7 +134,7 @@ export async function openSession(o: {
   const { redactor } = o;
   redactor.add(o.token);
   redactor.add(o.nonce);
-  const issued = started.credentials ? toIssued({ ...started, credentials: started.credentials }) : null;
+  const issued = started.credentials ? toIssued(started, 'start') : null;
   if (issued) for (const v of credentialValues(issued)) redactor.add(v);
 
   const api = new CloudApi(o.apiBase, o.token, o.deploymentId);
@@ -105,7 +158,6 @@ export async function openSession(o: {
     api, secrets: [...redactor.secrets], redact, batcher, signal: controller.signal,
     abortMessage: () => abortMessage, warn: o.warn,
   };
-  startAnswers.set(session, { environment: started.environment, mode: started.mode });
   return {
     session,
     issued,
@@ -117,37 +169,40 @@ export async function openSession(o: {
 
 /**
  * POSTs `{}` to /credentials. A network error, a timeout or a 5xx is retried twice (1 s, then 2 s); a 4xx is thrown
- * at once as CloudApiError.
+ * at once as CloudApiError, and so is a malformed 200 answer ("Arco Cloud credentials answer was malformed").
+ * An abort of `signal` (a cancel, or Cloud ending the run) stops the request and the retry sleep at once.
  */
 export async function issueCredentials(o: {
   apiBase: string; token: string; deploymentId: string; fetchImpl?: typeof fetch; sleep?: (ms: number) => Promise<void>;
+  signal?: AbortSignal;
 }): Promise<Issued> {
   const sleep = o.sleep ?? realSleep;
   for (let attempt = 0; ; attempt++) {
+    if (o.signal?.aborted) throw new CallAborted('credentials');
+    let answer: unknown;
     try {
-      const answer = await post(o.apiBase, o.token, o.deploymentId, 'credentials', {}, o.fetchImpl ?? fetch);
-      return toIssued(answer as Issued);
+      answer = await post(o.apiBase, o.token, o.deploymentId, 'credentials', {}, o.fetchImpl ?? fetch, o.signal);
     } catch (e) {
-      const clientError = e instanceof CloudApiError && e.status < 500;
-      if (clientError || attempt >= CREDENTIAL_RETRY_SLEEPS_MS.length) throw e;
-      await sleep(CREDENTIAL_RETRY_SLEEPS_MS[attempt]!);
+      const final = e instanceof CallAborted || e instanceof MalformedAnswer || (e instanceof CloudApiError && e.status < 500);
+      if (final || attempt >= CREDENTIAL_RETRY_SLEEPS_MS.length) throw e;
+      await abortableSleep(sleep, CREDENTIAL_RETRY_SLEEPS_MS[attempt]!, o.signal);
+      continue;
     }
+    return toIssued(answer, 'credentials');
   }
 }
 
 const credentialValues = (i: Issued): string[] =>
   [i.credentials.accessKeyId, i.credentials.secretAccessKey, i.credentials.sessionToken];
 
-/** Masks the credentials, then returns the full run session arco deploys with. `open` must be openSession's own object. */
-export function completeSession(open: OpenSession['session'], issued: Issued, redactor: Redactor): RunSession {
+/** Masks the credentials, then returns the full run session arco deploys with. */
+export function completeSession(open: OpenSession, issued: Issued, redactor: Redactor): RunSession {
   for (const v of credentialValues(issued)) redactor.add(v);
   const { credentials, region, permissionsBoundary } = issued;
-  const start = startAnswers.get(open);
-  if (!start) throw new Error('completeSession needs the session object openSession returned');
   return {
-    ...open,
+    ...open.session,
     secrets: [...redactor.secrets],
-    started: { credentials, region, permissionsBoundary, environment: start.environment, mode: start.mode },
+    started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode },
     awsEnv: {
       AWS_ACCESS_KEY_ID: credentials.accessKeyId,
       AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,

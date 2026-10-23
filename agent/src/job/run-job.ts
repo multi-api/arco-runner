@@ -303,7 +303,7 @@ async function deploy(
   } else {
     try {
       issued = await issueCredentials({
-        apiBase, token: doc.runner_token, deploymentId: doc.deployment_id, sleep,
+        apiBase, token: doc.runner_token, deploymentId: doc.deployment_id, sleep, signal,
         ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
       });
     } catch (e) {
@@ -317,7 +317,7 @@ async function deploy(
   }
   // A cancel during the credentials call (its retries included) never starts arco.
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
-  const s: RunSession = { ...completeSession(open.session, issued, redactor), warn: finishWarn };
+  const s: RunSession = { ...completeSession(open, issued, redactor), warn: finishWarn };
   // A cancel stops arco like a run Cloud ended; the RunAbortedError it causes is reported as build.cancelled.
   const view: RunSession = { ...s, signal, abortMessage: () => s.abortMessage() ?? (deps.signal.aborted ? 'Cancelled' : null) };
   return await deployAndFinish(view, {

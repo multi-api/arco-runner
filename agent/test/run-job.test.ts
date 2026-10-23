@@ -654,4 +654,22 @@ describe('runJob: deferred credentials', () => {
     expect(r.wipes).toHaveLength(1);
     expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
   }, 30_000);
+
+  it('finishes build.cancelled when cancelled during the credentials retry, and never runs arco', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const ac = new AbortController();
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls }, job: { defer_credentials: true }, signal: ac.signal,
+      cloud: { credentialsAnswer: { status: 503 } },
+      // The retry sleep never ends by itself: only the abort can cut it short.
+      deps: { sleep: async (ms) => { if (ms === 1000) { ac.abort(); await new Promise<void>(() => {}); } } },
+    });
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+    expect(existsSync(calls)).toBe(false);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'build.cancelled' });
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
 });
