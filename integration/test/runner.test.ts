@@ -6,10 +6,11 @@
 // Like Cloud, the fake Cloud calls the runner's /suspend hook before it answers /idle (R22); every MicroVM
 // scenario that reports idle checks that hook answered 200 (a 503 makes Cloud terminate the VM).
 import { readFileSync } from 'node:fs';
+import { Agent as HttpAgent, request } from 'node:http';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, test } from 'vitest';
 import {
-  API_BASE, CACHE_KEY, CONTROL, INTEGRATION_DIR, compose, commit, execRunner, finishBody, healthz, hook, http,
+  API_BASE, CACHE_KEY, CONTROL, HOOKS, INTEGRATION_DIR, compose, commit, execRunner, finishBody, healthz, hook, http,
   isCachePut, isClaim, isFinish, isIdleCall, isStart, leakedSecrets, logLines, newJob, nodeInRunner, recorded, seedCache, statusesOf,
   steps, untilDone, waitFor, type Job,
 } from './helpers.js';
@@ -342,6 +343,34 @@ describe('runner image against a fake Cloud', () => {
     const out = JSON.parse(r.stdout.trim()) as { version: string; first: number; swapped: number; status: number };
     expect(out.version).toMatch(/^v24\./);
     expect(out).toMatchObject({ first: 1, swapped: 1, status: 200 });
+  });
+
+  test('/resume after a suspend on a kept-alive hook connection', async () => {
+    // Lambda's hook caller sits outside the VM. A socket it kept alive from /suspend must not be
+    // reset when the VM wakes (first staging warm deploy failed: "Resume lifecycle hook failed").
+    // docker pause freezes the container like a suspend; the monotonic clock keeps running.
+    const agent = new HttpAgent({ keepAlive: true, maxSockets: 1 });
+    const post = (name: string) => new Promise<string>((resolve) => {
+      const req = request(`${HOOKS}/${name}`, { method: 'POST', agent }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(String(res.statusCode)));
+      });
+      req.on('error', (e: NodeJS.ErrnoException) => resolve(`error ${e.code ?? e.message}`));
+      req.end('{}');
+    });
+    try {
+      for (let i = 0; i < 3; i++) {
+        expect(await post('suspend')).toBe('200');
+        expect((await compose(['pause', 'runner'])).code).toBe(0);
+        await new Promise((r) => setTimeout(r, 6000));
+        expect((await compose(['unpause', 'runner'])).code).toBe(0);
+        expect(await post('resume')).toBe('200');
+      }
+    } finally {
+      agent.destroy();
+      await compose(['unpause', 'runner']);
+    }
+    expect(await healthz()).toBe('idle');
   });
 
   test('fargate mode', async () => {
