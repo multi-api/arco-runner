@@ -8,7 +8,7 @@ import { SERVICE_USERS, defaultServicePaths } from './services/catalog.js';
 import { startServers } from './servers.js';
 import { buildIdentity, defaultPaths } from './system.js';
 import { runValidation } from './validate.js';
-import { createServicesManager, defaultServicePaths } from './services/manager.js';
+import { createServicesManager } from './services/manager.js';
 import { wipe } from './wipe.js';
 
 const HOOKS_PORT = 9000;
