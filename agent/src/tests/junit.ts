@@ -1,8 +1,14 @@
 /** Flag rule for the JUnit report of `build.tests`, and a dependency-free JUnit parser and summary. */
 
+import { secretVariants } from '@multiapi/arco-cloud-client';
+
 export const JUNIT_PATH = '/tmp/arco-tests/junit.xml';
 
-export interface JUnitCase { class: string; name: string; status: 'passed' | 'failed' | 'error' | 'skipped'; message: string }
+export interface JUnitCase {
+  class: string; name: string; status: 'passed' | 'failed' | 'error' | 'skipped'; message: string;
+  /** Set when the parser cut `message` at its text cap, so it may end in part of a secret. */
+  truncated?: boolean;
+}
 export interface TestsParams {
   passed: number | null; failed: number | null; errors: number | null; skipped: number | null;
   duration_s: number; report: 'junit' | 'none';
@@ -15,7 +21,7 @@ const MAX_DEPTH = 256;
 const MAX_ATTRS = 128;
 const MAX_ELEMENTS = 2_000_000;
 const MAX_ATTR_VALUE = 1024 * 1024;
-const MAX_RAW_MESSAGE_BYTES = 64 * 1024;
+const MAX_RAW_BYTES = 64 * 1024;
 const MAX_LABEL_BYTES = 512;
 const MAX_NODE_TEXT = 64 * 1024;
 
@@ -77,7 +83,7 @@ function decode(s: string): string {
   });
 }
 
-interface Node { name: string; attrs: Record<string, string>; text: string; kids: Node[] }
+interface Node { name: string; attrs: Record<string, string>; text: string; kids: Node[]; truncated?: boolean }
 
 const isSpace = (c: string): boolean => c === ' ' || c === '\t' || c === '\n' || c === '\r';
 const isNameChar = (c: string): boolean => !isSpace(c) && c !== '=' && c !== '>' && c !== '/' && c !== '<' && c !== '"' && c !== "'";
@@ -135,7 +141,9 @@ export function parseJUnit(xml: string): JUnitCase[] {
       if (t.trim() !== '') throw new Error('malformed XML: text outside the root element');
       return;
     }
-    if (caseDepth >= 0 && top.text.length < MAX_NODE_TEXT) top.text += t.slice(0, MAX_NODE_TEXT - top.text.length);
+    if (caseDepth < 0) return;
+    if (top.text.length + t.length > MAX_NODE_TEXT) top.truncated = true;
+    if (top.text.length < MAX_NODE_TEXT) top.text += t.slice(0, MAX_NODE_TEXT - top.text.length);
   };
   const finishCase = (node: Node): void => {
     let status: JUnitCase['status'] = 'passed';
@@ -146,8 +154,11 @@ export function parseJUnit(xml: string): JUnitCase[] {
       const rank = (x: string): number => (x === 'error' || x === 'failed' ? 2 : 1);
       if (!source || rank(s) > rank(status)) { status = s; source = k; }
     }
-    const message = source ? ((source.attrs.message ?? '') !== '' ? source.attrs.message! : source.text.trim()) : '';
-    cases.push({ class: node.attrs.class || node.attrs.classname || '', name: node.attrs.name ?? '', status, message });
+    const fromAttr = source !== null && (source.attrs.message ?? '') !== '';
+    const message = source ? (fromAttr ? source.attrs.message! : source.text.trim()) : '';
+    const c: JUnitCase = { class: node.attrs.class || node.attrs.classname || '', name: node.attrs.name ?? '', status, message };
+    if (source && !fromAttr && source.truncated) c.truncated = true;
+    cases.push(c);
   };
   const closeNode = (node: Node, depth: number): void => {
     if (node.name === 'testcase' && depth === caseDepth) { caseDepth = -1; finishCase(node); return; }
@@ -220,22 +231,49 @@ export function cutBytes(text: string, maxBytes: number): string {
   return buf.subarray(0, end).toString('utf8');
 }
 
-/** Counts, plus up to 50 failures whose messages are masked first and then cut to 2 KB. */
-export function summarize(cases: JUnitCase[] | null, durationMs: number, redact: (s: string) => string): TestsParams {
+/** Drops the longest suffix of `text` that is a proper prefix of some secret variant: what a cut leaves of a secret. */
+function dropPartialSecret(text: string, variants: readonly string[]): string {
+  let drop = 0;
+  for (const v of variants) {
+    for (let k = Math.min(v.length - 1, text.length); k > drop; k--) {
+      if (text[text.length - k] === v[0] && text.endsWith(v.slice(0, k))) { drop = k; break; }
+    }
+  }
+  return drop > 0 ? text.slice(0, text.length - drop) : text;
+}
+
+/**
+ * Masks `text` and cuts it to `maxBytes`. Masking runs before the final cut, so that cut never splits a secret. Masking cost is
+ * bounded by a 64 KiB pre-cut; when that pre-cut (or the parser's text cap, `truncated`) shortened the value, the partial secret it
+ * may have left at the end is dropped before masking, because masking shrinks the text and would slide it into the final window.
+ */
+function maskThenCut(text: string, maxBytes: number, truncated: boolean, masker: Masker, variants: () => readonly string[]): string {
+  let raw = text;
+  let cut = truncated;
+  if (Buffer.byteLength(raw, 'utf8') > MAX_RAW_BYTES) { raw = cutBytes(raw, MAX_RAW_BYTES); cut = true; }
+  if (cut) raw = dropPartialSecret(raw, variants());
+  return cutBytes(masker.redact(raw), maxBytes);
+}
+
+export interface Masker { redact(text: string): string; readonly secrets: readonly string[] }
+
+/** Counts, plus up to 50 failures whose class, name and message are masked first and then cut (512 B, 512 B, 2 KB). */
+export function summarize(cases: JUnitCase[] | null, durationMs: number, masker: Masker): TestsParams {
   const duration_s = Math.round(durationMs / 100) / 10;
   if (cases === null) return { passed: null, failed: null, errors: null, skipped: null, duration_s, report: 'none' };
   const count = (s: JUnitCase['status']): number => cases.filter((c) => c.status === s).length;
   const params: TestsParams = {
     passed: count('passed'), failed: count('failed'), errors: count('error'), skipped: count('skipped'), duration_s, report: 'junit',
   };
+  let cached: string[] | null = null;
+  const variants = (): string[] => (cached ??= masker.secrets.flatMap((x) => secretVariants(x)));
   const failures = cases
     .filter((c) => c.status === 'failed' || c.status === 'error')
     .slice(0, MAX_FAILURES)
     .map((c) => ({
-      class: cutBytes(redact(cutBytes(c.class, MAX_LABEL_BYTES * 2)), MAX_LABEL_BYTES),
-      name: cutBytes(redact(cutBytes(c.name, MAX_LABEL_BYTES * 2)), MAX_LABEL_BYTES),
-      // Pre-cut bounds the redaction work; secrets are far shorter than the slack up to 2 KB, so mask-then-cut still holds.
-      message: cutBytes(redact(cutBytes(c.message, MAX_RAW_MESSAGE_BYTES)), MAX_MESSAGE_BYTES),
+      class: maskThenCut(c.class, MAX_LABEL_BYTES, false, masker, variants),
+      name: maskThenCut(c.name, MAX_LABEL_BYTES, false, masker, variants),
+      message: maskThenCut(c.message, MAX_MESSAGE_BYTES, c.truncated === true, masker, variants),
     }));
   if (failures.length > 0) params.failures = failures;
   return params;

@@ -1,8 +1,10 @@
+import { Redactor } from '@multiapi/arco-cloud-client';
 import { describe, expect, it } from 'vitest';
 import { cutBytes, parseJUnit, summarize, withJUnit, type JUnitCase } from '../src/tests/junit.js';
 
 const P = '/tmp/arco-tests/junit.xml';
-const id = (s: string): string => s;
+const id = new Redactor();
+const masker = (...secrets: string[]): Redactor => { const r = new Redactor(); for (const x of secrets) r.add(x); return r; };
 
 describe('withJUnit', () => {
   it('appends the flag to php artisan test, vendor/bin/pest and vendor/bin/phpunit', () => {
@@ -93,7 +95,7 @@ describe('summarize', () => {
   it('masks a message before cutting it to 2048 bytes', () => {
     const secret = 'S3CR3T-VALUE-XYZ';
     const msg = 'a'.repeat(2040) + secret + 'b'.repeat(960);
-    const redact = (s: string): string => s.split(secret).join('***');
+    const redact = masker(secret);
     const out = summarize([{ class: 'C', name: 'n', status: 'failed', message: msg }], 0, redact).failures![0]!.message;
     expect(Buffer.byteLength(out)).toBeLessThanOrEqual(2048);
     expect(out.slice(2040, 2043)).toBe('***');
@@ -105,7 +107,7 @@ describe('summarize', () => {
   });
   it('bounds huge class, name and message values', () => {
     const secret = 'TOPSECRET';
-    const redact = (s: string): string => s.split(secret).join('***');
+    const redact = masker(secret);
     const f = summarize([{
       class: 'c'.repeat(5_000_000), status: 'failed' as const, name: 'n'.repeat(5_000_000),
       message: 'x'.repeat(100) + secret + 'y'.repeat(3_000_000),
@@ -115,6 +117,51 @@ describe('summarize', () => {
     expect(Buffer.byteLength(f.message)).toBeLessThanOrEqual(2048);
     expect(f.message.slice(100, 103)).toBe('***');
     expect(f.message).not.toContain(secret);
+  });
+  // Masking shrinks text, so a secret cut at a pre-cut (or parser) boundary used to slide unmasked into the final window.
+  const SECRET = 'S3CR3T-' + 'Z'.repeat(996); // 1003 bytes; 'S' and 'Z' appear nowhere else
+  const leaks = (out: string): boolean => /[SZ]/.test(out.replace(/\*\*\*/g, ''));
+  it('never leaves a prefix of a long secret repeated in a failure message (attribute)', () => {
+    const r = masker(SECRET);
+    for (let pad = 0; pad < 1100; pad += 37) {
+      const msg = 'a'.repeat(pad) + (SECRET + ' ').repeat(70);
+      const f = summarize([{ class: 'C', name: 'n', status: 'failed', message: msg }], 0, r).failures![0]!;
+      expect(leaks(f.message), `pad ${pad}`).toBe(false);
+      expect(Buffer.byteLength(f.message)).toBeLessThanOrEqual(2048);
+    }
+  });
+  it('never leaves a prefix of a long secret repeated in a failure body cut by the parser', () => {
+    const r = masker(SECRET);
+    for (let pad = 0; pad < 1100; pad += 101) {
+      const body = 'a'.repeat(pad) + (SECRET + ' ').repeat(70);
+      const xml = `<testsuites><testsuite><testcase class="C" name="n"><failure>${body}</failure></testcase></testsuite></testsuites>`;
+      const f = summarize(parseJUnit(xml), 0, r).failures![0]!;
+      expect(leaks(f.message), `pad ${pad}`).toBe(false);
+    }
+  });
+  it('never leaves a prefix of a token repeated in a test name or class', () => {
+    const token = 'S3CR3T-TOKEN' + 'Z'.repeat(88); // 100 bytes
+    const r = masker(token);
+    for (let pad = 0; pad < 120; pad += 7) {
+      const label = 'with data set "' + 'a'.repeat(pad) + (token + ',').repeat(700);
+      const f = summarize([{ class: label, name: label, status: 'failed', message: 'm' }], 0, r).failures![0]!;
+      expect(leaks(f.name), `name pad ${pad}`).toBe(false);
+      expect(leaks(f.class), `class pad ${pad}`).toBe(false);
+      expect(Buffer.byteLength(f.name)).toBeLessThanOrEqual(512);
+    }
+  });
+  it('never leaves a prefix of an encoded secret variant at a cut', () => {
+    const b64 = Buffer.from(SECRET).toString('base64');
+    const r = masker(SECRET);
+    for (let pad = 0; pad < 1400; pad += 53) {
+      const msg = 'a'.repeat(pad) + (b64 + ' ').repeat(50);
+      const out = summarize([{ class: 'C', name: 'n', status: 'failed', message: msg }], 0, r).failures![0]!.message;
+      expect(out.replace(/\*\*\*/g, '')).toMatch(/^[a ]*$/);
+    }
+  });
+  it('keeps text that merely looks like a secret prefix when nothing was cut', () => {
+    const f = summarize([{ class: 'C', name: 'n', status: 'failed', message: 'value S3CR' }], 0, masker(SECRET)).failures![0]!;
+    expect(f.message).toBe('value S3CR');
   });
   it('returns null counts for report none', () => {
     expect(summarize(null, 1234, id)).toEqual({ passed: null, failed: null, errors: null, skipped: null, duration_s: 1.2, report: 'none' });

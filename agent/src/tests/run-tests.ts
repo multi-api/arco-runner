@@ -238,7 +238,7 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
         deadlineMs: Math.min(testsDeadline, ctx.buildDeadlineMs), timeoutFailure, pipefail: true,
       });
     } catch (e) {
-      if (e instanceof BuildFailure) steps.warning('build.tests', e.message, { ...summarize(null, now() - t0, (s) => redactor.redact(s)) });
+      if (e instanceof BuildFailure) steps.warning('build.tests', e.message, { ...summarize(null, now() - t0, redactor) });
       throw e;
     }
     const durationMs = now() - t0;
@@ -251,7 +251,7 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
       if ('cases' in r) cases = r.cases;
       else steps.note('build.tests_hint', `No usable JUnit report (${r.reason}); the result comes from the exit code`);
     }
-    const params = summarize(cases, durationMs, (s) => redactor.redact(s));
+    const params = summarize(cases, durationMs, redactor);
     if (exitCode === 0) {
       steps.done('build.tests', undefined, { ...params });
       return;
