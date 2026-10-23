@@ -53,6 +53,10 @@ const obj = (x: unknown, path: string, fail: Fail): Record<string, unknown> => {
   return x as Record<string, unknown>;
 };
 
+/** PHP's json_encode turns an empty map into `[]`; accept that as an empty object. */
+const objOrEmptyList = (x: unknown, path: string, fail: Fail): Record<string, unknown> =>
+  Array.isArray(x) && x.length === 0 ? {} : obj(x, path, fail);
+
 const str = (o: Record<string, unknown>, key: string, path: string, fail: Fail): string => {
   const v = o[key];
   if (typeof v !== 'string') fail(`${path}${key} must be a string`);
@@ -81,11 +85,11 @@ const parseTests = (x: unknown, fail: Fail): TestsSpec | null => {
   const primary = (primaryIn ?? services.find((n) => n === 'mysql' || n === 'pgsql') ?? null) as TestsSpec['primary_database'];
 
   const timeoutIn = t.timeout_seconds ?? DEFAULT_TESTS_TIMEOUT_SECONDS;
-  if (typeof timeoutIn !== 'number' || !Number.isFinite(timeoutIn) || timeoutIn <= 0) {
-    fail('tests.timeout_seconds must be a positive number or null');
+  if (typeof timeoutIn !== 'number' || !Number.isFinite(timeoutIn)) {
+    fail('tests.timeout_seconds must be a number or null');
   }
 
-  const envIn = t.env === undefined || t.env === null ? {} : obj(t.env, 'tests.env', fail);
+  const envIn = t.env === undefined || t.env === null ? {} : objOrEmptyList(t.env, 'tests.env', fail);
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(envIn)) {
     if (typeof v !== 'string') fail(`tests.env.${k} must be a string`);
@@ -97,7 +101,7 @@ const parseTests = (x: unknown, fail: Fail): TestsSpec | null => {
     setup_commands: strList(t.setup_commands ?? [], 'tests.setup_commands', fail),
     services: services as ServiceName[],
     primary_database: primary,
-    timeout_seconds: timeoutIn as number,
+    timeout_seconds: (timeoutIn as number) > 0 ? (timeoutIn as number) : DEFAULT_TESTS_TIMEOUT_SECONDS,
     env,
     mask: strList(t.mask ?? [], 'tests.mask', fail),
   };
@@ -115,7 +119,7 @@ export function parseJobDocument(x: unknown): JobDocument {
   const rootDir = s.root_dir ?? '';
   if (typeof rootDir !== 'string') fail('source.root_dir must be a string or null');
 
-  const envIn = obj(o.env, 'env', fail);
+  const envIn = objOrEmptyList(o.env, 'env', fail);
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(envIn)) {
     if (typeof v !== 'string') fail(`env.${k} must be a string`);
