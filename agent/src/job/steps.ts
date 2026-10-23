@@ -13,12 +13,12 @@ export class Steps {
     this.emit(key, 'started', params);
   }
 
-  done(key: string, message?: string): void {
-    this.emit(key, 'done', {}, message, this.elapsed(key));
+  done(key: string, message?: string, params: Params = {}): void {
+    this.emit(key, 'done', params, message, this.elapsed(key));
   }
 
-  warning(key: string, message: string): void {
-    this.emit(key, 'warning', {}, message, this.elapsed(key));
+  warning(key: string, message: string, params: Params = {}): void {
+    this.emit(key, 'warning', params, message, this.elapsed(key));
   }
 
   note(key: string, message: string, params: Params = {}): void {
