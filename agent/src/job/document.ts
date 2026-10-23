@@ -1,3 +1,18 @@
+export type ServiceName = 'mysql' | 'pgsql' | 'redis';
+
+export type TestsSpec = {
+  command: string;
+  setup_commands: string[];
+  services: ServiceName[];
+  primary_database: 'mysql' | 'pgsql' | null;
+  timeout_seconds: number;
+  env: Record<string, string>;
+  mask: string[];
+};
+
+const SERVICE_NAMES: readonly string[] = ['mysql', 'pgsql', 'redis'];
+const DEFAULT_TESTS_TIMEOUT_SECONDS = 900;
+
 export type JobDocument = {
   deployment_id: string;
   environment: string;
@@ -11,6 +26,8 @@ export type JobDocument = {
   mask: string[];
   cache: { restore_url: string; save_url: string; key: string };
   timeout_seconds: number;
+  defer_credentials: boolean;
+  tests: TestsSpec | null;
 };
 
 export type TicketPayload = { ticket: string; api_base: string; deployment_id: string };
@@ -45,6 +62,45 @@ const str = (o: Record<string, unknown>, key: string, path: string, fail: Fail):
 const strList = (v: unknown, path: string, fail: Fail): string[] => {
   if (!Array.isArray(v) || v.some((s) => typeof s !== 'string')) fail(`${path} must be an array of strings`);
   return [...(v as string[])];
+};
+
+const parseTests = (x: unknown, fail: Fail): TestsSpec | null => {
+  if (x === undefined || x === null) return null;
+  const t = obj(x, 'tests', fail);
+  const services = strList(t.services, 'tests.services', fail);
+  for (const name of services) if (!SERVICE_NAMES.includes(name)) fail(`tests.services has unknown service "${name}"`);
+  if (new Set(services).size !== services.length) fail('tests.services must not repeat a service');
+
+  const primaryIn = t.primary_database ?? null;
+  if (primaryIn !== null && primaryIn !== 'mysql' && primaryIn !== 'pgsql') {
+    fail('tests.primary_database must be "mysql", "pgsql" or null');
+  }
+  if (primaryIn !== null && !services.includes(primaryIn as string)) {
+    fail('tests.primary_database must be one of tests.services');
+  }
+  const primary = (primaryIn ?? services.find((n) => n === 'mysql' || n === 'pgsql') ?? null) as TestsSpec['primary_database'];
+
+  const timeoutIn = t.timeout_seconds ?? DEFAULT_TESTS_TIMEOUT_SECONDS;
+  if (typeof timeoutIn !== 'number' || !Number.isFinite(timeoutIn) || timeoutIn <= 0) {
+    fail('tests.timeout_seconds must be a positive number or null');
+  }
+
+  const envIn = t.env === undefined || t.env === null ? {} : obj(t.env, 'tests.env', fail);
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(envIn)) {
+    if (typeof v !== 'string') fail(`tests.env.${k} must be a string`);
+    env[k] = v as string;
+  }
+
+  return {
+    command: str(t, 'command', 'tests.', fail),
+    setup_commands: strList(t.setup_commands ?? [], 'tests.setup_commands', fail),
+    services: services as ServiceName[],
+    primary_database: primary,
+    timeout_seconds: timeoutIn as number,
+    env,
+    mask: strList(t.mask ?? [], 'tests.mask', fail),
+  };
 };
 
 export function parseJobDocument(x: unknown): JobDocument {
@@ -91,6 +147,8 @@ export function parseJobDocument(x: unknown): JobDocument {
       key: str(c, 'key', 'cache.', fail),
     },
     timeout_seconds: o.timeout_seconds as number,
+    defer_credentials: o.defer_credentials === true,
+    tests: parseTests(o.tests, fail),
   };
 }
 
