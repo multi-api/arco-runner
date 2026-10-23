@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ValidationError, prefetchRuntimeCache, runValidation, smokeServices } from '../src/validate.js';
 import type { ServicesManager } from '../src/services/manager.js';
+import type { ServiceName } from '../src/job/document.js';
 import type { Paths } from '../src/system.js';
 
 // The agent's build PATH (/usr/local/bin:/usr/bin:/bin) is the image's; a dev machine has php/composer elsewhere.
@@ -97,8 +98,10 @@ describe('smokeServices', () => {
     const root = await mkdtemp(join(tmpdir(), 'smoke-'));
     roots.push(root);
     const paths: Paths = { home: root, repo: join(root, 'repo'), tmpDirs: [root], agentDir: root, varDir: root };
+    const passwd = join(root, 'passwd');
+    await writeFile(passwd, 'mysql:x:27:27::/:/sbin/nologin\npostgres:x:26:26::/:/bin/sh\nredis:x:980:980::/:/sbin/nologin\n');
     const err = await smokeServices({
-      manager, identity: { uid: 1000, gid: 1000 }, paths, log: () => {},
+      manager, identity: { uid: 1000, gid: 1000 }, paths, log: () => {}, passwdPath: passwd,
       servicePaths: { dataDir: join(root, 'data'), runDir: join(root, 'run'), templateDir: join(root, 't'), binDir: root },
     }).then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(ValidationError);
@@ -106,6 +109,29 @@ describe('smokeServices', () => {
     expect(password.length).toBeGreaterThan(0);
     expect((err as Error).message).not.toContain(password);
     expect(calls).toEqual(['start', 'stop', 'remove']);
+  });
+
+  it('fails when a service user is missing from passwd, leaving nothing running', async () => {
+    const calls: string[] = [];
+    const manager: ServicesManager = {
+      start: async (s) => { calls.push('start'); return { [s[0]!]: 1 } as Record<ServiceName, number>; },
+      dropDatabases: async () => { calls.push('drop'); return []; },
+      stopAll: async () => { calls.push('stop'); },
+      removeData: async () => { calls.push('remove'); },
+      phpRedis: async () => true,
+    };
+    const root = await mkdtemp(join(tmpdir(), 'smoke-'));
+    roots.push(root);
+    const passwd = join(root, 'passwd');
+    await writeFile(passwd, 'mysql:x:27:27::/:/sbin/nologin\nredis:x:980:980::/:/sbin/nologin\n');
+    const paths: Paths = { home: root, repo: join(root, 'repo'), tmpDirs: [root], agentDir: root, varDir: root };
+    const err = await smokeServices({
+      manager, identity: { uid: 1000, gid: 1000 }, paths, log: () => {}, passwdPath: passwd,
+      servicePaths: { dataDir: join(root, 'data'), runDir: join(root, 'run'), templateDir: join(root, 't'), binDir: root },
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as Error).message).toBe('services: system user missing from the image: postgres');
+    expect(calls).toEqual(['stop', 'remove']);
   });
 });
 

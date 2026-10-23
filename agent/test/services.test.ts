@@ -14,6 +14,7 @@ import {
   listDatabasesSql,
   probeArgv,
   serverArgv,
+  serviceUserIds,
   type ServicePaths,
 } from '../src/services/catalog.js';
 import { ServiceStartError, createServicesManager, type ServerProcess } from '../src/services/manager.js';
@@ -85,6 +86,11 @@ function harness(o: { ready?: (s: ServiceName) => boolean; ignoreTerm?: boolean;
 }
 
 describe('catalog', () => {
+  it('looks up the service users in passwd and names the missing ones', () => {
+    const passwd = 'root:x:0:0::/root:/bin/sh\nmysql:x:27:27::/var/lib/mysql:/sbin/nologin\nredis:x:0:0::/:/sbin/nologin\nbuild:x:1000:1000::/home/build:/bin/bash\n';
+    expect(serviceUserIds(passwd)).toEqual({ uids: { mysql: 27 }, missing: ['postgres', 'redis'] });
+    expect(serviceUserIds('')).toEqual({ uids: {}, missing: ['mysql', 'postgres', 'redis'] });
+  });
   it('binds every server to 127.0.0.1 on its port and never puts the password in argv', async () => {
     const p = await makePaths();
     const password = "S3cr3t'pw-xyz";

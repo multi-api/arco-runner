@@ -23,6 +23,21 @@ export type DatabaseService = Exclude<ServiceName, 'redis'>;
 
 export const SERVICE_PORTS = { mysql: 3306, pgsql: 5432, redis: 6379 } as const satisfies Record<ServiceName, number>;
 export const SERVICE_USERS = { mysql: 'mysql', pgsql: 'postgres', redis: 'redis' } as const satisfies Record<ServiceName, string>;
+/**
+ * The test services' system users looked up in `/etc/passwd` text: each one's uid, and the names that are missing.
+ * A user with uid 0 or a malformed uid counts as missing.
+ */
+export function serviceUserIds(passwd: string): { uids: Partial<Record<ServiceName, number>>; missing: string[] } {
+  const rows = passwd.split('\n').map((l) => l.split(':'));
+  const uids: Partial<Record<ServiceName, number>> = {};
+  const missing: string[] = [];
+  for (const [s, name] of Object.entries(SERVICE_USERS) as Array<[ServiceName, string]>) {
+    const uid = rows.find((f) => f[0] === name)?.[2] ?? '';
+    if (/^\d+$/.test(uid) && Number(uid) > 0) uids[s] = Number(uid);
+    else missing.push(name);
+  }
+  return { uids, missing };
+}
 export const SERVICE_LABELS = { mysql: 'MySQL', pgsql: 'PostgreSQL', redis: 'Redis' } as const satisfies Record<ServiceName, string>;
 
 export const SYSTEM_DATABASES: Record<DatabaseService, readonly string[]> = {

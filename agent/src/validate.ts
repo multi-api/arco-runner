@@ -11,7 +11,7 @@ import { startFakeCloud, type FakeCloud } from './loopback-cloud.js';
 import type { CacheManifest } from './job/cache.js';
 import type { ServiceName, TicketPayload } from './job/document.js';
 import { runJob, type JobResult } from './job/run-job.js';
-import { SERVICE_LABELS, SERVICE_USERS } from './services/catalog.js';
+import { SERVICE_LABELS, SERVICE_USERS, serviceUserIds } from './services/catalog.js';
 import { createServicesManager, defaultServicePaths, type ServicePaths, type ServicesManager } from './services/manager.js';
 import { buildEnv, type Identity, type Paths } from './system.js';
 import { generatePassword, serviceVariables } from './tests/env.js';
@@ -252,12 +252,6 @@ try {
 
 const SMOKE_SERVICES: readonly ServiceName[] = ['mysql', 'pgsql', 'redis'];
 
-async function uidOf(name: string): Promise<number | null> {
-  const passwd = await readFile('/etc/passwd', 'utf8').catch(() => '');
-  const f = passwd.split('\n').map((l) => l.split(':')).find((x) => x[0] === name);
-  return f && /^\d+$/.test(f[2] ?? '') ? Number(f[2]) : null;
-}
-
 async function entries(dir: string): Promise<string[]> {
   try { return await readdir(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []; throw e; }
 }
@@ -265,15 +259,21 @@ async function entries(dir: string): Promise<string[]> {
 /**
  * Starts each test service once (spec §8), connects to it from PHP as the build user with the §5.3 variables, then
  * drops its databases, stops it and removes its data, and checks that no process of the service user and no data
- * are left. Returns each start time (cold start plus database creation). Throws ValidationError.
+ * are left. Returns each start time (cold start plus database creation). Throws ValidationError, also when a service
+ * user is missing: the wipe could not kill its processes and the survivor check would pass silently.
  */
 export async function smokeServices(o: {
   manager: ServicesManager; identity: Identity; paths: Paths; log: (m: string) => void; servicePaths?: ServicePaths;
+  /** Default /etc/passwd. */
+  passwdPath?: string;
 }): Promise<Record<ServiceName, number>> {
   const { manager, identity, paths } = o;
   const sp = o.servicePaths ?? defaultServicePaths();
   const out = {} as Record<ServiceName, number>;
   try {
+    const { uids, missing } = serviceUserIds(await readFile(o.passwdPath ?? '/etc/passwd', 'utf8').catch(() => ''));
+    const missingHere = SMOKE_SERVICES.map((s) => SERVICE_USERS[s]).filter((n) => missing.includes(n));
+    if (missingHere.length > 0) throw new ValidationError(`services: system user missing from the image: ${missingHere.join(', ')}`);
     for (const s of SMOKE_SERVICES) {
       const label = SERVICE_LABELS[s];
       const password = generatePassword();
@@ -306,8 +306,7 @@ export async function smokeServices(o: {
       } catch (e) {
         throw new ValidationError(`services: cleaning up ${label} failed: ${mask((e as Error).message)}`);
       }
-      const uid = await uidOf(SERVICE_USERS[s]);
-      const alive = uid === null ? [] : await processesOf(uid);
+      const alive = await processesOf(uids[s]!);
       if (alive.length > 0) throw new ValidationError(`services: ${label} processes survived the stop: ${alive.join(', ')}`);
       const left = [...(await entries(sp.dataDir)), ...(await entries(sp.runDir))];
       if (left.length > 0) throw new ValidationError(`services: ${label} left data behind: ${left.join(', ')}`);

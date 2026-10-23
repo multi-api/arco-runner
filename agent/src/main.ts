@@ -4,11 +4,11 @@ import type { CacheManifest } from './job/cache.js';
 import { parseTicketPayload, type TicketPayload } from './job/document.js';
 import { runJob } from './job/run-job.js';
 import { selfCheck } from './ready.js';
-import { SERVICE_USERS, defaultServicePaths } from './services/catalog.js';
+import { defaultServicePaths, serviceUserIds } from './services/catalog.js';
+import { createServicesManager } from './services/manager.js';
 import { startServers } from './servers.js';
 import { buildIdentity, defaultPaths } from './system.js';
 import { runValidation } from './validate.js';
-import { createServicesManager } from './services/manager.js';
 import { wipe } from './wipe.js';
 
 const HOOKS_PORT = 9000;
@@ -34,14 +34,15 @@ process.on('uncaughtException', (e) => {
   process.exit(1);
 });
 
-// The test services' uids, by name from /etc/passwd; a missing user (dev machine) is skipped.
+// The test services' uids, by name from /etc/passwd. A missing user (dev machine) is skipped by the wipe and /ready, logged once
+// here; /validate fails on it, so an image without one is never snapshotted.
 const servicePaths = defaultServicePaths();
 const serviceUids = (() => {
   let passwd = '';
   try { passwd = readFileSync('/etc/passwd', 'utf8'); } catch { /* none */ }
-  const names: string[] = Object.values(SERVICE_USERS);
-  return passwd.split('\n').map((l) => l.split(':')).filter((f) => names.includes(f[0] ?? '') && /^\d+$/.test(f[2] ?? ''))
-    .map((f) => Number(f[2])).filter((u) => u > 0);
+  const { uids, missing } = serviceUserIds(passwd);
+  if (missing.length > 0) log(`service users missing from /etc/passwd: ${missing.join(', ')}; their processes are not killed by the wipe`);
+  return Object.values(uids);
 })();
 const jobWipe = (rootDir: string) => wipe(paths, rootDir, {
   ...(identity ? { uid: identity.uid } : {}),
