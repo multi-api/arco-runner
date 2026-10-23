@@ -19,6 +19,11 @@ export interface Versions {
   tini: { version: string; sha256: string; size: number };
   corepack: { version: string };
   base_image_digest: string;
+  services: {
+    mysql: { version: string; asset: string; url: string; sha256: string; size: number; note?: string };
+    postgresql: { package: 'postgresql17-server' };
+    redis: { package: string; note?: string };
+  };
 }
 
 export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');

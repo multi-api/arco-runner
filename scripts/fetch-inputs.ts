@@ -1,8 +1,11 @@
-// Downloads the PHP CLI, FrankenPHP, Composer and tini for one PHP minor and verifies them against
-// image/versions.json: size, sha256 and the arco-runtime build attestation. Any mismatch exits 1.
+// Downloads the PHP CLI, FrankenPHP, Composer, tini and the MySQL tarball for one PHP minor and verifies them
+// against image/versions.json: size, sha256 and the arco-runtime build attestation. Any mismatch exits 1.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createWriteStream, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ReadableStream } from 'node:stream/web';
 import { checkFile, defaultVersionsPath, parseArgs, phpEntry, readVersions } from './lib/versions.ts';
 
 const RELEASE_BASE = process.env.ARCO_RUNTIME_RELEASE_BASE ?? 'https://github.com/multi-api/arco-runtime/releases/download';
@@ -22,8 +25,9 @@ interface Input {
 
 async function download(url: string, dest: string): Promise<void> {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-  writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+  if (!res.ok || !res.body) throw new Error(`${url}: HTTP ${res.status}`);
+  // Streamed: the MySQL tarball is several hundred MB.
+  await pipeline(Readable.fromWeb(res.body as ReadableStream<Uint8Array>), createWriteStream(dest));
 }
 
 async function verify(input: Input, path: string): Promise<void> {
@@ -78,6 +82,15 @@ async function main(): Promise<void> {
       dest: join(out, 'tini'),
       sha256: versions.tini.sha256,
       size: versions.tini.size,
+      attest: false,
+    },
+    {
+      // MySQL publishes MD5s and GPG signatures, no attestation: the pinned size and sha256 are the check.
+      asset: versions.services.mysql.asset,
+      url: versions.services.mysql.url,
+      dest: join(out, 'mysql.tar.xz'),
+      sha256: versions.services.mysql.sha256,
+      size: versions.services.mysql.size,
       attest: false,
     },
   ];

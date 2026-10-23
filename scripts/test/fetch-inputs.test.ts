@@ -15,7 +15,9 @@ const files: Record<string, Buffer> = {
   '/frankenphp-1.13.1-r1/frankenphp-linux-aarch64': Buffer.from('fake frankenphp'),
   '/composer/2.10.3/composer.phar': Buffer.from('fake composer'),
   '/tini/v0.19.0/tini-static-arm64': Buffer.from('fake tini'),
+  '/mysql/mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz': Buffer.from('fake mysql tarball'),
 };
+const mysqlAsset = 'mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz';
 
 let server: Server;
 let base: string;
@@ -23,7 +25,7 @@ let work: string;
 let fakeBin: string;
 let ghLog: string;
 
-function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string } = {}): string {
+function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string } = {}): string {
   const path = join(work, `versions-${Math.random().toString(36).slice(2)}.json`);
   const php = files['/frankenphp-1.13.1-r1/php-linux-aarch64']!;
   const fp = files['/frankenphp-1.13.1-r1/frankenphp-linux-aarch64']!;
@@ -44,6 +46,17 @@ function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: 
       composer: { version: '2.10.3', sha256: sha(files['/composer/2.10.3/composer.phar']!) },
       tini: { version: '0.19.0', sha256: overrides.tiniSha ?? sha(files['/tini/v0.19.0/tini-static-arm64']!), size: files['/tini/v0.19.0/tini-static-arm64']!.length },
       base_image_digest: 'sha256:0',
+      services: {
+        mysql: {
+          version: '8.4.13',
+          asset: mysqlAsset,
+          url: `${base}/mysql/${mysqlAsset}`,
+          sha256: overrides.mysqlSha ?? sha(files[`/mysql/${mysqlAsset}`]!),
+          size: files[`/mysql/${mysqlAsset}`]!.length,
+        },
+        postgresql: { package: 'postgresql17-server' },
+        redis: { package: 'redis6' },
+      },
     }),
   );
   return path;
@@ -123,6 +136,25 @@ describe('fetch-inputs', () => {
     expect(r.stderr).toContain('tini-static-arm64');
     expect(r.stderr).toContain('sha256');
     expect(existsSync(join(out, 'tini'))).toBe(false);
+  });
+
+  it('exits 1 naming the MySQL asset when its sha256 does not match', async () => {
+    const out = join(work, 'out-mysql');
+    const r = await run(versionsFile({ mysqlSha: 'd'.repeat(64) }), out);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(mysqlAsset);
+    expect(r.stderr).toContain('sha256');
+    expect(existsSync(join(out, 'mysql.tar.xz'))).toBe(false);
+    expect(readdirSync(out).filter((f) => f.startsWith('mysql'))).toEqual([]); // no .part left behind
+  });
+
+  it('downloads and verifies the MySQL tarball', async () => {
+    const out = join(work, 'out-mysql-ok');
+    const r = await run(versionsFile(), out);
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`ok ${mysqlAsset}`);
+    expect(readFileSync(join(out, 'mysql.tar.xz'), 'utf8')).toBe('fake mysql tarball');
   });
 
   it('exits 1 when a download returns 404', async () => {
