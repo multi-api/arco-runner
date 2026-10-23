@@ -39,7 +39,7 @@ export function serviceVariables(
 /** Precedence: services > tests.env > build defaults. Never AWS credentials nor the permissions boundary. */
 export function testEnv(paths: Paths, tests: TestsSpec, serviceVars: Record<string, string>, appKey: string | null): NodeJS.ProcessEnv {
   const env = buildEnv(paths, { APP_ENV: 'testing', ...tests.env, ...serviceVars, ...(appKey ? { APP_KEY: appKey } : {}) });
-  for (const k of Object.keys(env)) if (k.startsWith('AWS_') || k === 'ARCO_PERMISSIONS_BOUNDARY') delete env[k];
+  for (const k of Object.keys(env)) if (/^aws_/i.test(k) || k.toUpperCase() === 'ARCO_PERMISSIONS_BOUNDARY') delete env[k];
   return env;
 }
 
@@ -47,16 +47,31 @@ const dotenvHasKey = (text: string): boolean => {
   for (const raw of text.split(/\r?\n/)) {
     const m = /^\s*(?:export\s+)?APP_KEY\s*=\s*(.*)$/.exec(raw);
     if (!m) continue;
-    let v = m[1]!.trim();
+    const v = m[1]!.trim();
     const q = /^(["'])(.*?)\1/.exec(v);
-    v = q ? q[2]! : v.replace(/\s+#.*$/, '').trim();
-    if (v !== '') return true;
+    // Linear emptiness check: an unquoted value is empty when blank or when a comment starts it.
+    if (q ? q[2]! !== '' : v !== '' && !v.startsWith('#')) return true;
   }
   return false;
 };
 
+/** Removes `<!-- -->` comments in one linear pass; an unterminated one runs to the end. */
+const stripXmlComments = (text: string): string => {
+  let out = '';
+  let i = 0;
+  for (;;) {
+    const open = text.indexOf('<!--', i);
+    if (open < 0) return out + text.slice(i);
+    out += text.slice(i, open);
+    const close = text.indexOf('-->', open + 4);
+    if (close < 0) return out;
+    i = close + 3;
+  }
+};
+
 const phpunitHasKey = (text: string): boolean => {
-  for (const tag of text.match(/<(?:env|server)\b[^>]*>/gi) ?? []) {
+  // [^<>] (not [^>]) keeps the scan linear: a run of unterminated "<env" cannot rescan to the end each time.
+  for (const tag of stripXmlComments(text).match(/<(?:env|server)\b[^<>]*>/gi) ?? []) {
     if (!/\bname\s*=\s*(["'])APP_KEY\1/.test(tag)) continue;
     const v = /\bvalue\s*=\s*(["'])(.*?)\1/.exec(tag);
     if (v && v[2]!.trim() !== '') return true;
@@ -95,8 +110,9 @@ export async function copyEnvExample(projectDir: string, identity: Identity | nu
   let fh;
   try {
     fh = await open(target, 'wx', 0o644);
-  } catch {
-    return false;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw e;
   }
   try {
     await fh.writeFile(content);

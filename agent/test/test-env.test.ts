@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, symlink, writeFile, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { stat } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { TestsSpec } from '../src/job/document.js';
 import type { Paths } from '../src/system.js';
@@ -50,6 +51,8 @@ describe('testEnv', () => {
     const env = testEnv(paths, tests({ AWS_SECRET_ACCESS_KEY: 's', AWS_REGION: 'r', ARCO_PERMISSIONS_BOUNDARY: 'b', KEEP: '1' }), {}, null);
     expect(Object.keys(env).filter((k) => k.startsWith('AWS_') || k === 'ARCO_PERMISSIONS_BOUNDARY')).toEqual([]);
     expect(env.KEEP).toBe('1');
+    const lower = testEnv(paths, tests({ aws_session_token: 't', arco_permissions_boundary: 'b' }), {}, null);
+    expect(Object.keys(lower).filter((k) => /^aws_|^arco_permissions/i.test(k))).toEqual([]);
   });
 });
 
@@ -114,6 +117,39 @@ describe('files', () => {
     await writeFile(join(dir, 'secret'), 'S=1');
     await symlink(join(dir, 'secret'), join(dir, '.env.example'));
     expect(await copyEnvExample(dir, null)).toBe(false);
+    await expect(lstat(join(dir, '.env'))).rejects.toThrow();
+  });
+  it('hasAppKey stays linear on adversarial 1 MiB files', async () => {
+    await writeFile(join(dir, '.env'), 'APP_KEY=a' + ' '.repeat(1_000_000) + 'b');
+    const t = Date.now();
+    expect(await hasAppKey(dir, {})).toBe(true);
+    await writeFile(join(dir, '.env'), 'APP_KEY=' + ' '.repeat(1_000_000) + '#c');
+    expect(await hasAppKey(dir, {})).toBe(false);
+    await writeFile(join(dir, 'phpunit.xml'), '<env '.repeat(200_000));
+    expect(await hasAppKey(dir, {})).toBe(false);
+    await writeFile(join(dir, 'phpunit.xml'), '<!-- '.repeat(200_000));
+    expect(await hasAppKey(dir, {})).toBe(false);
+    expect(Date.now() - t).toBeLessThan(1000);
+  });
+  it('ignores an APP_KEY inside an XML comment and unquoted inline comments', async () => {
+    await writeFile(join(dir, 'phpunit.xml'), '<!-- <env name="APP_KEY" value="base64:x"/> -->');
+    expect(await hasAppKey(dir, {})).toBe(false);
+    await writeFile(join(dir, 'phpunit.xml'), '<!-- c --><env name="APP_KEY" value="base64:x"/>');
+    expect(await hasAppKey(dir, {})).toBe(true);
+    await rm(join(dir, 'phpunit.xml'));
+    await writeFile(join(dir, '.env'), 'APP_KEY= # none');
+    expect(await hasAppKey(dir, {})).toBe(false);
+  });
+  it('chowns .env to the identity', async () => {
+    await writeFile(join(dir, '.env.example'), 'A=1\n');
+    const id = { uid: process.getuid!(), gid: process.getgid!() };
+    expect(await copyEnvExample(dir, id)).toBe(true);
+    const st = await stat(join(dir, '.env'));
+    expect([st.uid, st.gid]).toEqual([id.uid, id.gid]);
+  });
+  it.skipIf(process.getuid?.() === 0)('removes the new .env and rethrows when the chown fails', async () => {
+    await writeFile(join(dir, '.env.example'), 'A=1\n');
+    await expect(copyEnvExample(dir, { uid: 0, gid: 0 })).rejects.toThrow();
     await expect(lstat(join(dir, '.env'))).rejects.toThrow();
   });
   it('returns false when there is no .env.example', async () => {
