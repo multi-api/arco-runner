@@ -41,7 +41,7 @@ describe('package-image tini', () => {
     const sha = (s: string) => createHash('sha256').update(s).digest('hex');
     const inputs = join(work, 'inputs-tini');
     mkdirSync(inputs);
-    for (const [f, c] of [['php', 'p'], ['frankenphp', 'f'], ['composer.phar', 'c'], ['tini', 'tampered']] as const) writeFileSync(join(inputs, f), c);
+    for (const [f, c] of [['php', 'p'], ['frankenphp', 'f'], ['composer.phar', 'c'], ['tini', 'tinX']] as const) writeFileSync(join(inputs, f), c);
     const v = readVersions();
     v.php['8.5'] = { ...v.php['8.5']!, php_cli_sha256: sha('p'), php_cli_size: 1, frankenphp_sha256: sha('f'), frankenphp_size: 1 };
     v.composer.sha256 = sha('c');
@@ -50,7 +50,7 @@ describe('package-image tini', () => {
     writeFileSync(file, JSON.stringify(v));
     const r = await run(inputs, join(work, 'out-tini.zip'), { ARCO_VERSIONS_FILE: file });
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain('tini:');
+    expect(r.stderr).toContain('tini: sha256'); // same length, so the hash (not the size) catches it
   });
 });
 
@@ -59,7 +59,7 @@ describe('package-image mysql', () => {
     const sha = (s: string) => createHash('sha256').update(s).digest('hex');
     const inputs = join(work, 'inputs-mysql');
     mkdirSync(inputs);
-    for (const [f, c] of [['php', 'p'], ['frankenphp', 'f'], ['composer.phar', 'c'], ['tini', 't'], ['mysql.tar.xz', 'tampered']] as const) writeFileSync(join(inputs, f), c);
+    for (const [f, c] of [['php', 'p'], ['frankenphp', 'f'], ['composer.phar', 'c'], ['tini', 't'], ['mysql.tar.xz', 'mysqX']] as const) writeFileSync(join(inputs, f), c);
     const v = readVersions();
     v.php['8.5'] = { ...v.php['8.5']!, php_cli_sha256: sha('p'), php_cli_size: 1, frankenphp_sha256: sha('f'), frankenphp_size: 1 };
     v.composer.sha256 = sha('c');
@@ -69,7 +69,7 @@ describe('package-image mysql', () => {
     writeFileSync(file, JSON.stringify(v));
     const r = await run(inputs, join(work, 'out-mysql.zip'), { ARCO_VERSIONS_FILE: file });
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain('mysql.tar.xz:');
+    expect(r.stderr).toContain('mysql.tar.xz: sha256'); // same length, so the hash (not the size) catches it
   });
 });
 
@@ -96,8 +96,9 @@ describe('renderDockerfile', () => {
     expect(text).toContain('ARG MYSQL_VERSION=8.4.99');
     expect(text).toContain('ARG REDIS_PACKAGE=redis42');
     // Every stage is pinned to the same base digest.
+    // Both stages (the MySQL extraction stage and the runner) are pinned to the same base digest.
     const froms = text.split('\n').filter((l) => l.startsWith('FROM '));
-    expect(froms.length).toBeGreaterThan(0);
-    for (const f of froms.filter((l) => l.includes('@sha256:'))) expect(f).toContain('@sha256:' + 'b'.repeat(64));
+    expect(froms).toHaveLength(2);
+    for (const f of froms) expect(f).toContain('@sha256:' + 'b'.repeat(64));
   });
 });

@@ -32,6 +32,7 @@ RUN useradd -u 1000 -U -m -s /bin/bash build
 
 # Test services (spec §5): MySQL 8.4 LTS (official tarball), PostgreSQL 17 and Redis (AL2023 packages).
 # Each runs as its own system user; the agent starts them only for a build that selects them.
+# REDIS_PACKAGE comes from versions.json; its binaries are /usr/bin/${REDIS_PACKAGE}-server and -cli.
 ARG REDIS_PACKAGE=redis6
 RUN dnf install -y --setopt=install_weak_deps=0 postgresql17-server postgresql17 ${REDIS_PACKAGE} libaio numactl-libs \
  && dnf clean all
@@ -44,12 +45,14 @@ RUN chown -R root:root /opt/mysql && chmod -R u=rwX,go=rX /opt/mysql \
  && for b in mysqld mysql mysqladmin postgres initdb pg_isready psql redis-server redis-cli; do test -x /usr/local/bin/$b || { echo "missing $b"; exit 1; }; done \
  && install -d -o root -g root -m 0755 /opt/arco-services /opt/arco-services/templates /var/lib/arco-services /run/arco-services
 # Pristine data templates: the agent copies one to /var/lib/arco-services/<service> at start. No server keeps running.
+# The MySQL TLS/RSA keys and server UUID are deleted so no VM shares them; mysqld regenerates them on first start.
 RUN mysqld --no-defaults --initialize-insecure --user=mysql --basedir=/opt/mysql --datadir=/opt/arco-services/templates/mysql \
  && install -d -o postgres -g postgres -m 0700 /opt/arco-services/templates/pgsql \
  && LC_ALL=C.UTF-8 runuser -u postgres -- initdb -D /opt/arco-services/templates/pgsql -U postgres --auth-local=trust --auth-host=scram-sha-256 -E UTF8 --no-instructions \
  && chown -R mysql:mysql /opt/arco-services/templates/mysql \
  && chmod 0700 /opt/arco-services/templates/mysql /opt/arco-services/templates/pgsql \
- && rm -f /opt/arco-services/templates/mysql/*.pid /opt/arco-services/templates/pgsql/postmaster.pid
+ && rm -f /opt/arco-services/templates/mysql/*.pid /opt/arco-services/templates/pgsql/postmaster.pid \
+ && rm -f /opt/arco-services/templates/mysql/*.pem /opt/arco-services/templates/mysql/auto.cnf
 
 COPY inputs/php /usr/local/bin/php
 COPY inputs/composer.phar /usr/local/bin/composer
@@ -69,7 +72,8 @@ RUN chown -R root:root /opt/arco-runner \
  && chmod -R u=rwX,go=rX /opt/arco-runner
 
 # No test server may be running or hold data when the image is snapshotted.
-RUN ! pgrep -x 'mysqld|postgres|redis-server|redis6-server' \
+# pgrep exits 1 only when nothing matches (2 and 3 are errors, which must fail the build too).
+RUN pgrep -x 'mysqld|postgres|redis-server|redis6-server'; test $? -eq 1 \
  && test -z "$(ls -A /var/lib/arco-services)"
 
 ENV ARCO_RUNNER_IMAGE=php85 ARCO_RUNNER_IMAGE_REVISION=$REVISION

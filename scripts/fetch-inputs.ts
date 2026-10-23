@@ -16,7 +16,8 @@ const ATTEST_SIGNER = 'multi-api/arco-runtime/.github/workflows/publish.yml';
 
 interface Input {
   asset: string;
-  url: string;
+  /** Tried in order until one answers; the bytes are verified the same whichever host served them. */
+  urls: string[];
   dest: string;
   sha256: string;
   size?: number;
@@ -54,7 +55,7 @@ async function main(): Promise<void> {
   const inputs: Input[] = [
     {
       asset: 'php-linux-aarch64',
-      url: `${RELEASE_BASE}/${php.release}/php-linux-aarch64`,
+      urls: [`${RELEASE_BASE}/${php.release}/php-linux-aarch64`],
       dest: join(out, 'php'),
       sha256: php.php_cli_sha256,
       size: php.php_cli_size,
@@ -62,7 +63,7 @@ async function main(): Promise<void> {
     },
     {
       asset: 'frankenphp-linux-aarch64',
-      url: `${RELEASE_BASE}/${php.release}/frankenphp-linux-aarch64`,
+      urls: [`${RELEASE_BASE}/${php.release}/frankenphp-linux-aarch64`],
       dest: join(out, 'frankenphp'),
       sha256: php.frankenphp_sha256,
       size: php.frankenphp_size,
@@ -70,7 +71,7 @@ async function main(): Promise<void> {
     },
     {
       asset: 'composer.phar',
-      url: `${COMPOSER_BASE}/${versions.composer.version}/composer.phar`,
+      urls: [`${COMPOSER_BASE}/${versions.composer.version}/composer.phar`],
       dest: join(out, 'composer.phar'),
       sha256: versions.composer.sha256,
       attest: false,
@@ -78,7 +79,7 @@ async function main(): Promise<void> {
     {
       // tini publishes no attestation: the pinned size and sha256 in versions.json are the only check.
       asset: 'tini-static-arm64',
-      url: `${TINI_BASE}/v${versions.tini.version}/tini-static-arm64`,
+      urls: [`${TINI_BASE}/v${versions.tini.version}/tini-static-arm64`],
       dest: join(out, 'tini'),
       sha256: versions.tini.sha256,
       size: versions.tini.size,
@@ -87,7 +88,8 @@ async function main(): Promise<void> {
     {
       // MySQL publishes MD5s and GPG signatures, no attestation: the pinned size and sha256 are the check.
       asset: versions.services.mysql.asset,
-      url: versions.services.mysql.url,
+      // The current-release URL first, then the archive a release moves to once a newer 8.4 ships.
+      urls: versions.services.mysql.urls,
       dest: join(out, 'mysql.tar.xz'),
       sha256: versions.services.mysql.sha256,
       size: versions.services.mysql.size,
@@ -98,8 +100,21 @@ async function main(): Promise<void> {
   for (const input of inputs) {
     // Unverified bytes only ever exist under a temp name, and are removed on any failure.
     const temp = `${input.dest}.part`;
+    const failures: string[] = [];
+    let fetched = false;
+    for (const url of input.urls) {
+      try {
+        await download(url, temp);
+        fetched = true;
+        break;
+      } catch (e) {
+        failures.push(e instanceof Error ? e.message : String(e));
+        rmSync(temp, { force: true });
+      }
+    }
+    if (!fetched) throw new Error(`${input.asset}: no URL served it: ${failures.join('; ')}`);
     try {
-      await download(input.url, temp);
+      // A host that serves the wrong bytes fails the run: no fallback past a failed check.
       await verify(input, temp);
       renameSync(temp, input.dest);
     } finally {

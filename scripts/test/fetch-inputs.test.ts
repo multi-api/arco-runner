@@ -25,7 +25,7 @@ let work: string;
 let fakeBin: string;
 let ghLog: string;
 
-function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string } = {}): string {
+function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string; mysqlUrls?: string[] } = {}): string {
   const path = join(work, `versions-${Math.random().toString(36).slice(2)}.json`);
   const php = files['/frankenphp-1.13.1-r1/php-linux-aarch64']!;
   const fp = files['/frankenphp-1.13.1-r1/frankenphp-linux-aarch64']!;
@@ -50,7 +50,7 @@ function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: 
         mysql: {
           version: '8.4.13',
           asset: mysqlAsset,
-          url: `${base}/mysql/${mysqlAsset}`,
+          urls: overrides.mysqlUrls ?? [`${base}/mysql/${mysqlAsset}`],
           sha256: overrides.mysqlSha ?? sha(files[`/mysql/${mysqlAsset}`]!),
           size: files[`/mysql/${mysqlAsset}`]!.length,
         },
@@ -155,6 +155,24 @@ describe('fetch-inputs', () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(`ok ${mysqlAsset}`);
     expect(readFileSync(join(out, 'mysql.tar.xz'), 'utf8')).toBe('fake mysql tarball');
+  });
+
+  it('falls back to the next MySQL URL when the first returns 404', async () => {
+    const out = join(work, 'out-mysql-fallback');
+    const r = await run(versionsFile({ mysqlUrls: [`${base}/gone/${mysqlAsset}`, `${base}/mysql/${mysqlAsset}`] }), out);
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(readFileSync(join(out, 'mysql.tar.xz'), 'utf8')).toBe('fake mysql tarball');
+    expect(readdirSync(out).filter((f) => f.endsWith('.part'))).toEqual([]);
+  });
+
+  it('exits 1 naming the MySQL asset when every URL returns 404', async () => {
+    const out = join(work, 'out-mysql-gone');
+    const r = await run(versionsFile({ mysqlUrls: [`${base}/gone/${mysqlAsset}`, `${base}/archives/${mysqlAsset}`] }), out);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(mysqlAsset);
+    expect(r.stderr).toContain('HTTP 404');
+    expect(readdirSync(out).filter((f) => f.startsWith('mysql'))).toEqual([]);
   });
 
   it('exits 1 when a download returns 404', async () => {

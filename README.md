@@ -71,11 +71,13 @@ Besides PHP, FrankenPHP, Composer, Node and tini, the image carries the test ser
 
 | Service | Version | Source | Binaries (`/usr/local/bin`) | Pristine template |
 | --- | --- | --- | --- | --- |
-| MySQL | 8.4.13 LTS | official `mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz` (pinned in `versions.json`, verified by `fetch-inputs` and `package-image`), extracted to `/opt/mysql` without `bin/mysqld-debug` and `lib/plugin/debug` | `mysqld`, `mysql`, `mysqladmin` | `/opt/arco-services/templates/mysql` (`--initialize-insecure`, owner `mysql`, `0700`) |
+| MySQL | 8.4.13 LTS | official `mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz` (pinned in `versions.json`, verified by `fetch-inputs` and `package-image`; fetched from `cdn.mysql.com/Downloads/MySQL-8.4/`, falling back to `cdn.mysql.com/archives/mysql-8.4/` once a newer 8.4 replaces it), extracted to `/opt/mysql` without `bin/mysqld-debug` and `lib/plugin/debug` | `mysqld`, `mysql`, `mysqladmin` | `/opt/arco-services/templates/mysql` (`--initialize-insecure`, then its `*.pem` keys and `auto.cnf` removed, owner `mysql`, `0700`) |
 | PostgreSQL | 17.11 | AL2023 `postgresql17-server`, `postgresql17` | `postgres`, `initdb`, `pg_isready`, `psql` | `/opt/arco-services/templates/pgsql` (`initdb -U postgres --auth-local=trust --auth-host=scram-sha-256 -E UTF8`, `LC_ALL=C.UTF-8`, owner `postgres`, `0700`) |
 | Redis | 6.2.20 | AL2023 `redis6`: `redis7` does not exist on AL2023 arm64 (`dnf repoquery redis7`, 2026-10-23) | `redis-server`, `redis-cli` | none |
 
 Each server has its own system user (`mysql`, `postgres`, `redis`). `/var/lib/arco-services` (where the agent copies a template at start) and `/run/arco-services` are root `0755` and empty; the last `RUN` fails the build if a server process is running or `/var/lib/arco-services` is not empty. MySQL is extracted in a separate build stage, so the tarball itself never lands in an image layer. dev.mysql.com lists no `-minimal` aarch64 tarball for 8.4, so the full one is used.
+
+The MySQL template carries no TLS/RSA keys and no `auto.cnf`, so VMs never share keys or a server UUID: `mysqld` regenerates them at its first start from the copy. Measured locally (6 starts each, template copy to `mysqladmin ping`): 440–560 ms with baked keys, 550–840 ms without, about +150 ms at the median. A `caching_sha2_password` user still logs in over TCP from `mysql -h127.0.0.1` (TLS) and PHP's PDO.
 
 The image's PHP has `pdo_mysql`, `pdo_pgsql`, `pdo_sqlite` and the `redis` extension (`php -m`), so the agent sets `REDIS_CLIENT=phpredis`.
 
@@ -83,7 +85,7 @@ Measured locally (Docker Desktop, arm64, 2026-10-23; "before" is the image at `c
 
 | Measure | Before | After | Growth |
 | --- | --- | --- | --- |
-| `docker image inspect --format '{{.Size}}'` (compressed content) | 266,136,832 B | 885,551,410 B | +619 MB |
+| `docker image inspect --format '{{.Size}}'` (compressed content) | 266,136,832 B | 885,697,327 B | +620 MB |
 | `docker images` disk usage | 1.12 GB | 3.24 GB | +2.12 GB |
 | `du -sx /` in the container | 803 MiB | 2.17 GiB | +1.37 GiB |
 

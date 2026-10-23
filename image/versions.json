@@ -27,7 +27,10 @@
     "mysql": {
       "version": "8.4.13",
       "asset": "mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz",
-      "url": "https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz",
+      "urls": [
+        "https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz",
+        "https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz"
+      ],
       "sha256": "6531bb50f64c986a2abdab6b647cbd553e8740b3e5d3867f5415e33568879fc9",
       "size": 823781920,
       "note": "dev.mysql.com (2026-10-23) lists no aarch64 -minimal tarball for 8.4 LTS, only this full one (MD5 93961907cdc7b106e5082399ce13ad54 per the download page)"

@@ -20,8 +20,11 @@ export interface Versions {
   corepack: { version: string };
   base_image_digest: string;
   services: {
-    mysql: { version: string; asset: string; url: string; sha256: string; size: number; note?: string };
+    /** `urls`: tried in order (current-release CDN path, then the archive path it moves to). */
+    mysql: { version: string; asset: string; urls: string[]; sha256: string; size: number; note?: string };
+    /** Informational: the Dockerfile installs `postgresql17-server postgresql17` itself. */
     postgresql: { package: 'postgresql17-server' };
+    /** Rendered into `ARG REDIS_PACKAGE`; the binaries are `/usr/bin/<package>-server` and `-cli`. */
     redis: { package: string; note?: string };
   };
 }
