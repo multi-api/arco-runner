@@ -14,6 +14,9 @@ const MAX_MESSAGE_BYTES = 2048;
 const MAX_DEPTH = 256;
 const MAX_ATTRS = 128;
 const MAX_ELEMENTS = 2_000_000;
+const MAX_ATTR_VALUE = 1024 * 1024;
+const MAX_RAW_MESSAGE_BYTES = 64 * 1024;
+const MAX_LABEL_BYTES = 512;
 const MAX_NODE_TEXT = 64 * 1024;
 
 /** Splits on top-level `&&`, `||` and `;` outside single and double quotes. */
@@ -109,6 +112,7 @@ function parseStartTag(xml: string, from: number): { node: Node; selfClosing: bo
     if (q !== '"' && q !== "'") throw new Error('malformed XML: unquoted attribute value');
     const close = xml.indexOf(q, i + 1);
     if (close < 0) throw new Error('malformed XML: unterminated attribute value');
+    if (close - i - 1 > MAX_ATTR_VALUE) throw new Error('malformed XML: attribute value too long');
     if (++count > MAX_ATTRS) throw new Error('malformed XML: too many attributes');
     node.attrs[attr] = decode(xml.slice(i + 1, close));
     i = close + 1;
@@ -185,6 +189,7 @@ export function parseJUnit(xml: string): JUnitCase[] {
     } else if (xml.startsWith('<!', lt)) {
       const e = xml.indexOf('>', lt + 2);
       if (e < 0) throw new Error('malformed XML: unterminated declaration');
+      if (xml.slice(lt, e).includes('[')) throw new Error('malformed XML: DOCTYPE internal subset not supported');
       i = e + 1;
     } else if (xml[lt + 1] === '/') {
       const e = xml.indexOf('>', lt + 2);
@@ -226,7 +231,12 @@ export function summarize(cases: JUnitCase[] | null, durationMs: number, redact:
   const failures = cases
     .filter((c) => c.status === 'failed' || c.status === 'error')
     .slice(0, MAX_FAILURES)
-    .map((c) => ({ class: redact(c.class), name: redact(c.name), message: cutBytes(redact(c.message), MAX_MESSAGE_BYTES) }));
+    .map((c) => ({
+      class: cutBytes(redact(cutBytes(c.class, MAX_LABEL_BYTES * 2)), MAX_LABEL_BYTES),
+      name: cutBytes(redact(cutBytes(c.name, MAX_LABEL_BYTES * 2)), MAX_LABEL_BYTES),
+      // Pre-cut bounds the redaction work; secrets are far shorter than the slack up to 2 KB, so mask-then-cut still holds.
+      message: cutBytes(redact(cutBytes(c.message, MAX_RAW_MESSAGE_BYTES)), MAX_MESSAGE_BYTES),
+    }));
   if (failures.length > 0) params.failures = failures;
   return params;
 }

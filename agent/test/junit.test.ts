@@ -24,6 +24,13 @@ describe('withJUnit', () => {
       'php artisan test `id`', 'php artisan test --log-junit=foo', 'php artisan test\nrm x',
     ]) expect(withJUnit(c, P)).toEqual({ command: c, report: 'none' });
   });
+  it('stays conservative on quoted operators and quoted assignments', () => {
+    const q = 'php artisan test --filter "a|b"';
+    expect(withJUnit(q, P)).toEqual({ command: q, report: 'none' });
+    // A quoted assignment value with a space is not recognised as an assignment: no flag.
+    const a = 'FOO="a b" php artisan test';
+    expect(withJUnit(a, P)).toEqual({ command: a, report: 'none' });
+  });
   it('appends nothing to other commands', () => {
     for (const c of ['composer test', 'phpunit', 'php artisan testing', 'vendor/bin/pestx']) {
       expect(withJUnit(c, P)).toEqual({ command: c, report: 'none' });
@@ -61,6 +68,11 @@ describe('parseJUnit', () => {
       expect(() => parseJUnit(x), x).toThrow(Error);
     }
   });
+  it('throws on a DOCTYPE internal subset and on oversized attribute values', () => {
+    expect(() => parseJUnit('<!DOCTYPE a [<!ENTITY x "y">]><a/>')).toThrow(/DOCTYPE/);
+    expect(() => parseJUnit(`<a name="${'x'.repeat(1024 * 1024 + 1)}"/>`)).toThrow(/too long/);
+    expect(parseJUnit(`<testcase name="${'x'.repeat(1024 * 1024)}"/>`)).toHaveLength(1);
+  });
   it('bounds hostile input', () => {
     expect(() => parseJUnit('<a>'.repeat(10_000))).toThrow(/too deeply/);
     const attrs = Array.from({ length: 1000 }, (_, i) => `a${i}="x"`).join(' ');
@@ -90,6 +102,19 @@ describe('summarize', () => {
     expect(e).not.toContain('�');
     expect(Buffer.byteLength(e)).toBeLessThanOrEqual(2048);
     expect(cutBytes('é'.repeat(5), 3)).toBe('é');
+  });
+  it('bounds huge class, name and message values', () => {
+    const secret = 'TOPSECRET';
+    const redact = (s: string): string => s.split(secret).join('***');
+    const f = summarize([{
+      class: 'c'.repeat(5_000_000), status: 'failed' as const, name: 'n'.repeat(5_000_000),
+      message: 'x'.repeat(100) + secret + 'y'.repeat(3_000_000),
+    }], 0, redact).failures![0]!;
+    expect(Buffer.byteLength(f.name)).toBeLessThanOrEqual(512);
+    expect(Buffer.byteLength(f.class)).toBeLessThanOrEqual(512);
+    expect(Buffer.byteLength(f.message)).toBeLessThanOrEqual(2048);
+    expect(f.message.slice(100, 103)).toBe('***');
+    expect(f.message).not.toContain(secret);
   });
   it('returns null counts for report none', () => {
     expect(summarize(null, 1234, id)).toEqual({ passed: null, failed: null, errors: null, skipped: null, duration_s: 1.2, report: 'none' });
