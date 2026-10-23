@@ -5,7 +5,9 @@ import {
   CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, isRunLost, redactValue, type RunSession,
 } from '@multiapi/arco-cloud-client';
 import { registerJobSecrets, shortMaskValues } from '../mask.js';
+import type { ServicesManager } from '../services/manager.js';
 import { buildEnv, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
+import { runTestPhase } from '../tests/run-tests.js';
 import { killUserProcesses } from '../wipe.js';
 import { CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
 import { runBuildCommands } from './commands.js';
@@ -47,6 +49,11 @@ export interface JobDeps {
    * Defaults to killUserProcesses(identity.uid) when an identity is set, else nothing.
    */
   killBuildProcesses?: () => Promise<void>;
+  /**
+   * The test services (MySQL, PostgreSQL, Redis) of this image. Absent: a job that selects services fails
+   * build.test_service_failed.
+   */
+  services?: () => ServicesManager;
   /** Tests and offline validation only (file:// clones), and http:// clones under ARCO_RUNNER_ALLOW_HTTP=1. */
   checkoutOptions?: Pick<CheckoutContext, 'extraGitArgs' | 'allowFileUrl' | 'allowHttpUrl'>;
   /** Agent diagnostics (stdout). Every message is redacted first. */
@@ -99,7 +106,8 @@ const repoKeep = (rootDir: string): string[] =>
 
 /**
  * One job, from ticket to idle, in the order of spec §6.3: claim, mask, start, source, cache restore (only when
- * the VM knows no cache), build commands, deploy + finish, cache save, wipe (MicroVM only), idle.
+ * the VM knows no cache), tests (deploy mode, when the job has them), build commands, deploy + finish, cache save,
+ * wipe (MicroVM only), idle.
  */
 export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult> {
   const now = deps.now ?? Date.now;
@@ -150,7 +158,7 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
     let finishRejected = false;
     const finishWarn = (m: string) => { finishRejected = true; log(m); };
     try {
-      restoreTransientFailure = await build(doc, deps, s, steps, runSignal, deadlineMs);
+      restoreTransientFailure = await build(doc, deps, s, steps, redactor, runSignal, deadlineMs);
       const exitCode = await deploy(doc, deps, p.api_base, redactor, open, finishWarn, runSignal, now, sleep);
       saveBy = now() + SAVE_TIME_BOX_MS;
       result.finished = !finishRejected;
@@ -200,9 +208,10 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
   return result;
 }
 
-/** Steps 4-6: source, cache restore, build commands. Returns whether the restore failed transiently (R23). */
+/** Steps 4-6: source, cache restore, tests, build commands. Returns whether the restore failed transiently (R23). */
 async function build(
-  doc: JobDocument, deps: JobDeps, s: OpenSession['session'], steps: Steps, signal: AbortSignal, deadlineMs: number,
+  doc: JobDocument, deps: JobDeps, s: OpenSession['session'], steps: Steps, redactor: Redactor, signal: AbortSignal,
+  deadlineMs: number,
 ): Promise<boolean> {
   const { paths, identity } = deps;
   const env = buildEnv(paths, doc.env);
@@ -224,7 +233,7 @@ async function build(
     await revokeGithubToken(doc.source.clone_url, doc.source.auth_header, deps.fetchImpl);
   }
   if (hasSubmodules) steps.note('build.clone', 'Submodules are not checked out');
-  const projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
+  let projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
   steps.done('build.clone');
   cancelled();
 
@@ -249,6 +258,18 @@ async function build(
     }
   }
   cancelled();
+
+  // Tests (spec §4): without build secrets or credentials; a failure ends the run before the build commands.
+  if (doc.mode === 'deploy' && doc.tests) {
+    await runTestPhase({
+      doc, tests: doc.tests, projectDir, paths, identity, batcher: s.batcher, steps, redactor, signal,
+      buildDeadlineMs: deadlineMs, services: deps.services, killBuildProcesses: buildProcessKiller(deps),
+      ...(deps.now ? { now: deps.now } : {}),
+    });
+    cancelled();
+    // The tests ran in the tree: resolve root_dir again rather than trust the earlier answer.
+    projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
+  }
 
   // 6. Build commands
   await runBuildCommands(doc.commands, {

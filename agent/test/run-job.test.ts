@@ -673,3 +673,57 @@ describe('runJob: deferred credentials', () => {
     expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
   }, 30_000);
 });
+
+describe('runJob: tests before deploy', () => {
+  const eventsOf = (r: Awaited<ReturnType<typeof run>>) =>
+    r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).events as { key: string; status: string }[]);
+
+  it('runs the test phase between the cache restore and the build commands', async () => {
+    const w = await world();
+    const r = await run(w, { job: { tests: { command: 'echo testing', setup_commands: ['echo setup'], services: [] } } });
+    expect(r.result.buildOk).toBe(true);
+    const keys = [...new Set(eventsOf(r).map((e) => e.key))];
+    const at = (k: string) => keys.indexOf(k);
+    expect(keys.slice(0, 2)).toEqual(['build.clone', 'build.cache_restore']);
+    expect(at('build.test_setup.1')).toBe(2);
+    expect(at('build.tests')).toBeGreaterThan(at('build.test_setup.1'));
+    expect(at('build.command.1')).toBeGreaterThan(at('build.tests'));
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+  }, 30_000);
+
+  it('a failed test run issues no credentials, deploys nothing and saves no cache', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const built = join(w.out, 'built');
+    const r = await run(w, {
+      commands: [`touch "${built}"`], env: { FAKE_ARCO_CALLS: calls },
+      job: { tests: { command: 'exit 1', services: [] } },
+    });
+    expect(r.cloud.calls('/credentials')).toHaveLength(0);
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+    expect(existsSync(calls)).toBe(false);
+    expect(existsSync(built)).toBe(false);
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'build.tests_failed',
+      error_message: 'The test command exited with code 1', arco_version: null,
+    }]);
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+
+  it('skips the test phase in inventory mode', async () => {
+    const w = await world();
+    const r = await run(w, { job: { mode: 'inventory', tests: { command: 'exit 1', services: [] } } });
+    expect(eventsOf(r).some((e) => e.key.startsWith('build.test'))).toBe(false);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).not.toMatchObject({ error_code: 'build.tests_failed' });
+  }, 30_000);
+
+  it('fails build.test_service_failed when services are selected but the runner has none', async () => {
+    const w = await world();
+    const r = await run(w, { job: { tests: { command: 'true', services: ['redis'] } } });
+    expect(r.finishes[0]).toMatchObject({
+      result: 'failed', error_code: 'build.test_service_failed', error_message: 'Test services are not available on this runner',
+    });
+  }, 30_000);
+});

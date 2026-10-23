@@ -6,6 +6,7 @@ import { selfCheck } from './ready.js';
 import { startServers } from './servers.js';
 import { buildIdentity, defaultPaths } from './system.js';
 import { runValidation } from './validate.js';
+import { createServicesManager, defaultServicePaths } from './services/manager.js';
 import { wipe } from './wipe.js';
 
 const HOOKS_PORT = 9000;
@@ -34,6 +35,7 @@ process.on('uncaughtException', (e) => {
 const jobWipe = (rootDir: string) => wipe(paths, rootDir, identity ? { uid: identity.uid } : {});
 // ARCO_RUNNER_ALLOW_HTTP=1 (integration tests only) also lets the fake Cloud serve the clone over http://.
 const checkoutOptions = allowHttp ? { allowHttpUrl: true } : undefined;
+const services = () => createServicesManager(defaultServicePaths());
 
 async function runFargate(): Promise<void> {
   let payload: TicketPayload;
@@ -59,7 +61,7 @@ async function runFargate(): Promise<void> {
     await runJob(payload, {
       paths, identity, mode: 'fargate', signal: abort.signal, receivedAt: Date.now(),
       knownCache: { get: () => cache, set: (m) => { cache = m; } },
-      onPhase: () => {}, wipe: jobWipe, log, checkoutOptions,
+      onPhase: () => {}, wipe: jobWipe, log, checkoutOptions, services,
     });
     process.exit(0);
   } catch (e) {
@@ -69,7 +71,7 @@ async function runFargate(): Promise<void> {
 }
 
 async function runMicroVm(): Promise<void> {
-  const agent = new Agent({ paths, identity, mode: 'microvm', wipe: jobWipe, log, checkoutOptions });
+  const agent = new Agent({ paths, identity, mode: 'microvm', wipe: jobWipe, log, checkoutOptions, services });
 
   let readyResult: Promise<boolean> | null = null;
   const ready = () => (readyResult ??= selfCheck(paths, identity).then((problem) => {
