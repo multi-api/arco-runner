@@ -92,6 +92,21 @@ export async function startServers(agent: Agent, o: ServerOptions): Promise<Runn
             log(`/run ignored: ${(e as Error).message}`);
             return send(res, 200);
           }
+          // Lambda wraps RunMicrovm's runHookPayload: {"microvmId": "...", "runHookPayload": "<string>"}.
+          // Cloud's payload is that string, JSON-encoded. A bare payload (local tests) is accepted too.
+          if (typeof body === 'object' && body !== null && 'microvmId' in body) {
+            const raw = (body as { runHookPayload?: unknown }).runHookPayload;
+            if (typeof raw !== 'string' || raw === '') {
+              log('/run without a runHookPayload: nothing to do');
+              return send(res, 200);
+            }
+            try {
+              body = JSON.parse(raw);
+            } catch {
+              log('/run ignored: runHookPayload is not JSON');
+              return send(res, 200);
+            }
+          }
           const hasTicket = typeof body === 'object' && body !== null && 'ticket' in body;
           if (!hasTicket) return send(res, 200); // no ticket: a validate run or an empty run is a no-op
           const p = ticketOf(body);

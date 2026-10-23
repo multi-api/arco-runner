@@ -60,6 +60,26 @@ describe('hooks server', () => {
     expect(logs.join('\n')).not.toContain(GOOD.ticket);
   });
 
+  it('/run unwraps the Lambda envelope {microvmId, runHookPayload: "<json string>"}', async () => {
+    const agent = fakeAgent();
+    const { hooks, logs } = await boot(agent);
+    const envelope = { microvmId: 'mvm-01234567', runHookPayload: JSON.stringify(GOOD) };
+    expect((await hooks('run', envelope)).status).toBe(200);
+    expect(agent.accept).toHaveBeenCalledWith(GOOD);
+    expect(logs.join('\n')).not.toContain(GOOD.ticket);
+  });
+
+  it('/run with an envelope whose payload is empty or not JSON is a logged no-op 200', async () => {
+    const agent = fakeAgent();
+    const { hooks, logs } = await boot(agent);
+    expect((await hooks('run', { microvmId: 'mvm-1', runHookPayload: '' })).status).toBe(200);
+    expect((await hooks('run', { microvmId: 'mvm-1' })).status).toBe(200);
+    expect((await hooks('run', { microvmId: 'mvm-1', runHookPayload: `not json ${GOOD.ticket}` })).status).toBe(200);
+    expect(agent.accept).not.toHaveBeenCalled();
+    expect(logs.join('\n')).toMatch(/runHookPayload/);
+    expect(logs.join('\n')).not.toContain(GOOD.ticket);
+  });
+
   it('/run with an invalid api_base is 200, logged, nothing starts', async () => {
     const agent = fakeAgent();
     const { hooks, logs } = await boot(agent);

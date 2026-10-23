@@ -50,7 +50,8 @@ beforeAll(async () => {
 describe('runner image against a fake Cloud', () => {
   test('deploy happy path', async () => {
     const job = await newJob('happy', { sha: sha1 });
-    expect((await hook('run', job.payload)).status).toBe(200); // a new VM: Lambda delivers the ticket to /run
+    // A new VM: Lambda delivers RunMicrovm's runHookPayload (Cloud's JSON-encoded payload) wrapped in this envelope.
+    expect((await hook('run', { microvmId: 'mvm-integration', runHookPayload: JSON.stringify(job.payload) })).status).toBe(200);
     const done = await untilDone(job);
     const { cloud, git } = done;
     expectSuspended(done);
