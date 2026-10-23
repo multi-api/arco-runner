@@ -3,16 +3,26 @@
 
 # MySQL is extracted in its own stage so the tarball (inputs/mysql.tar.xz, verified by fetch-inputs and
 # package-image) never lands in a layer of the runner image; only the trimmed /opt/mysql is copied over.
-FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108 AS mysql
+# Global so both stages see the same pinned version (each stage re-declares it).
 ARG MYSQL_VERSION=8.4.13
+FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108 AS mysql
+ARG MYSQL_VERSION
 COPY inputs/mysql.tar.xz /tmp/mysql.tar.xz
-# Dropped: the debug server and debug plugins (the tarball ships no test directories).
-RUN dnf install -y tar xz \
+# Trimmed (same release, nothing the server loads at runtime is removed): the debug server and debug plugins
+# are not extracted; every ELF binary and shared library is stripped (binutils lives in this stage only);
+# the client headers, static libraries, pkg-config/aclocal files, man pages, docs and the MeCab dictionaries
+# (only read by the opt-in MeCab full-text parser) are deleted. bin/, lib/plugin/, lib/private/ and share/ stay.
+# The INFO_SRC release check runs before docs/ is deleted.
+RUN dnf install -y tar xz binutils findutils \
  && mkdir /opt/mysql \
  && tar -xJf /tmp/mysql.tar.xz -C /opt/mysql --strip-components=1 --no-same-owner \
       --exclude='*/bin/mysqld-debug' --exclude='*/lib/plugin/debug' \
  && test -x /opt/mysql/bin/mysqld && test ! -e /opt/mysql/bin/mysqld-debug \
- && grep -qx "branch: mysql-${MYSQL_VERSION}-release" /opt/mysql/docs/INFO_SRC
+ && grep -qx "branch: mysql-${MYSQL_VERSION}-release" /opt/mysql/docs/INFO_SRC \
+ && rm -rf /opt/mysql/include /opt/mysql/man /opt/mysql/docs /opt/mysql/lib/mecab /opt/mysql/lib/pkgconfig \
+      /opt/mysql/share/aclocal /opt/mysql/mysql-test \
+ && find /opt/mysql -name '*.a' -type f -delete \
+ && find /opt/mysql -type f -exec sh -c 'for f; do if [ "$(head -c 4 "$f" | tr -d "\0")" = "$(printf "\177ELF")" ]; then strip --strip-unneeded "$f" || exit 1; fi; done' sh {} +
 
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108
 
@@ -34,6 +44,7 @@ RUN useradd -u 1000 -U -m -s /bin/bash build
 # Each runs as its own system user; the agent starts them only for a build that selects them.
 # REDIS_PACKAGE comes from versions.json; its binaries are /usr/bin/${REDIS_PACKAGE}-server and -cli.
 ARG REDIS_PACKAGE=redis6
+ARG MYSQL_VERSION
 RUN dnf install -y --setopt=install_weak_deps=0 postgresql17-server postgresql17 ${REDIS_PACKAGE} libaio numactl-libs \
  && dnf clean all
 COPY --from=mysql /opt/mysql /opt/mysql
@@ -46,7 +57,9 @@ RUN chown -R root:root /opt/mysql && chmod -R u=rwX,go=rX /opt/mysql \
  && install -d -o root -g root -m 0755 /opt/arco-services /opt/arco-services/templates /var/lib/arco-services /run/arco-services
 # Pristine data templates: the agent copies one to /var/lib/arco-services/<service> at start. No server keeps running.
 # The MySQL TLS/RSA keys and server UUID are deleted so no VM shares them; mysqld regenerates them on first start.
-RUN mysqld --no-defaults --initialize-insecure --user=mysql --basedir=/opt/mysql --datadir=/opt/arco-services/templates/mysql \
+# The MySQL template's redo log is 8M (the default is 100M); the agent starts mysqld with the same capacity.
+RUN mysqld --no-defaults --version | grep -q "Ver ${MYSQL_VERSION} " \
+ && mysqld --no-defaults --initialize-insecure --user=mysql --basedir=/opt/mysql --datadir=/opt/arco-services/templates/mysql --innodb-redo-log-capacity=8M \
  && install -d -o postgres -g postgres -m 0700 /opt/arco-services/templates/pgsql \
  && LC_ALL=C.UTF-8 runuser -u postgres -- initdb -D /opt/arco-services/templates/pgsql -U postgres --auth-local=trust --auth-host=scram-sha-256 -E UTF8 --no-instructions \
  && chown -R mysql:mysql /opt/arco-services/templates/mysql \

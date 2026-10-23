@@ -64,6 +64,7 @@ export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number):
         '--secure-file-priv=NULL',
         '--performance-schema=OFF',
         '--innodb-flush-log-at-trx-commit=0',
+        '--innodb-redo-log-capacity=8M', // the template is initialised with the same 8M, so no redo resize at start
         `--log-error=${data}/error.log`,
       ];
     case 'pgsql':

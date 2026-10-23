@@ -96,7 +96,7 @@ describe('catalog', () => {
     }
     expect(serverArgv('mysql', p, 7)).toEqual(expect.arrayContaining([
       '--bind-address=127.0.0.1', '--port=3306', '--mysqlx=OFF', '--skip-log-bin', '--secure-file-priv=NULL',
-      '--performance-schema=OFF', '--innodb-flush-log-at-trx-commit=0', '--skip-name-resolve',
+      '--performance-schema=OFF', '--innodb-flush-log-at-trx-commit=0', '--innodb-redo-log-capacity=8M', '--skip-name-resolve',
       `--socket=${p.runDir}/mysql/mysqld.sock`, `--log-error=${p.dataDir}/mysql/error.log`,
     ]));
     expect(serverArgv('pgsql', p, 7).slice(1).join(' ')).toBe(
