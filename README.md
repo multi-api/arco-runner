@@ -102,7 +102,16 @@ Measured locally (Docker Desktop, arm64, 2026-10-23; "before" is the image at `c
 
 **MySQL adds about 307 MB on disk (209 MB binaries + 98 MB template), within the 600 MB checkpoint (spec §5.2).** Untrimmed it added about 1.29 GB. Owner's decision: keep the official MySQL 8.4 LTS tarball, trimmed (strip, no MeCab dictionaries, static libraries or headers). MariaDB was considered and rejected for parity with production (MySQL's default collation `utf8mb4_0900_ai_ci` and its native `JSON` type); it may be added later as a fourth service.
 
-Snapshot growth and each service's start time are recorded after the first `/validate` with tests and the first staging publish.
+`/validate` starts each service once before the canned jobs (`smokeServices`): it copies the template, starts the server as its user, creates database `testing` and user `arco`, connects from PHP as `build` with the injected variables (PDO for MySQL and PostgreSQL, phpredis for Redis; the password is masked in any failure), then drops the databases, stops the server, deletes its data and fails unless no process of the service user and nothing in `/var/lib/arco-services` or `/run/arco-services` is left. The first canned job also runs a test phase (`php artisan test`, setup `composer install`, offline) against the fixture's fake PHPUnit (`fixture/packages/fake-phpunit`), so a broken service or test phase fails the image build. Start times as `/validate` logs them (`[validate] <service> ready in N ms`: template copy, cold start and database creation), measured locally (Docker Desktop, arm64, 2026-10-23; three `validate-cli` runs and one through the hooks):
+
+| Service | Start time | Runs |
+| --- | --- | --- |
+| MySQL 8.4.13 (98 MB template copy) | 880–911 ms | 911, 882, 880, 886 |
+| PostgreSQL 17.11 | 369–433 ms | 433, 384, 369, 374 |
+| Redis 6.2.20 | 14–271 ms | 271, 14, 268, 270 |
+| Fixture test phase (`build.tests`, 2 tests through the fake PHPUnit) | 0.1 s | 0.1 s in every run |
+
+The whole `/validate` (service smoke plus both canned jobs) took 9.9–10.3 s. Snapshot growth is recorded after the first staging publish.
 
 ## Publishing
 

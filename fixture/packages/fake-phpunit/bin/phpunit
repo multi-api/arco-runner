@@ -1,0 +1,85 @@
+#!/usr/bin/env php
+<?php
+// Stand-in for vendor/bin/phpunit, offline. Runs tests/*Test.php in order: each file returns
+// array<string, Closure>; a closure that throws fails, one that returns 'skip' is skipped.
+// Writes PHPUnit-11-style JUnit to --log-junit=<path>. With --parallel it first creates
+// ${DB_DATABASE}_test_1 and _test_2 through PDO, as Laravel's parallel testing does.
+$junit = null;
+$parallel = false;
+foreach (array_slice($argv, 1) as $arg) {
+    if (str_starts_with($arg, '--log-junit=')) {
+        $junit = substr($arg, strlen('--log-junit='));
+    } elseif ($arg === '--parallel') {
+        $parallel = true;
+    }
+}
+
+$env = fn (string $k): string => (string) getenv($k);
+
+if ($parallel && in_array($env('DB_CONNECTION'), ['mysql', 'pgsql'], true)) {
+    $driver = $env('DB_CONNECTION');
+    $dsn = $driver === 'mysql'
+        ? sprintf('mysql:host=%s;port=%s', $env('DB_HOST'), $env('DB_PORT'))
+        : sprintf('pgsql:host=%s;port=%s;dbname=%s', $env('DB_HOST'), $env('DB_PORT'), $env('DB_DATABASE'));
+    $pdo = new PDO($dsn, $env('DB_USERNAME'), $env('DB_PASSWORD'), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $q = $driver === 'mysql' ? '`' : '"';
+    foreach ([1, 2] as $n) {
+        $name = $q.str_replace($q, $q.$q, $env('DB_DATABASE')."_test_{$n}").$q;
+        $pdo->exec("DROP DATABASE IF EXISTS {$name}");
+        $pdo->exec("CREATE DATABASE {$name}");
+    }
+    $pdo = null;
+}
+
+$x = fn (string $s): string => htmlspecialchars($s, ENT_XML1 | ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+$files = glob(getcwd().'/tests/*Test.php') ?: [];
+sort($files, SORT_STRING);
+
+$total = $failures = $skipped = 0;
+$started = microtime(true);
+$suites = '';
+foreach ($files as $file) {
+    $class = 'Tests\\'.basename($file, '.php');
+    $relative = 'tests/'.basename($file);
+    $cases = '';
+    $counts = ['tests' => 0, 'failures' => 0, 'skipped' => 0];
+    $t0 = microtime(true);
+    foreach ((static fn () => require $file)() as $name => $test) {
+        $counts['tests']++;
+        $t = microtime(true);
+        $body = '';
+        try {
+            if ($test() === 'skip') {
+                $counts['skipped']++;
+                $body = '<skipped/>';
+            }
+        } catch (Throwable $e) {
+            $counts['failures']++;
+            $body = sprintf('<failure type="%s">%s</failure>', $x(get_class($e)), $x("{$class}::{$name}\n".$e->getMessage()));
+        }
+        $cases .= sprintf(
+            '<testcase name="%s" file="%s" class="%s" classname="%s" assertions="0" time="%.6F">%s</testcase>',
+            $x((string) $name), $x($relative), $x($class), $x(str_replace('\\', '.', $class)), microtime(true) - $t, $body,
+        );
+    }
+    $suites .= sprintf(
+        '<testsuite name="%s" file="%s" tests="%d" assertions="0" errors="0" failures="%d" skipped="%d" time="%.6F">%s</testsuite>',
+        $x($class), $x($relative), $counts['tests'], $counts['failures'], $counts['skipped'], microtime(true) - $t0, $cases,
+    );
+    $total += $counts['tests'];
+    $failures += $counts['failures'];
+    $skipped += $counts['skipped'];
+}
+
+if ($junit !== null) {
+    file_put_contents($junit, sprintf(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites><testsuite name=\"\" tests=\"%d\" assertions=\"0\" errors=\"0\" failures=\"%d\" skipped=\"%d\" time=\"%.6F\">%s</testsuite></testsuites>\n",
+        $total, $failures, $skipped, microtime(true) - $started, $suites,
+    ));
+}
+
+if ($failures > 0) {
+    echo "FAILURES! Tests: {$total}, Failures: {$failures}.\n";
+    exit(1);
+}
+echo "OK ({$total} tests)\n";

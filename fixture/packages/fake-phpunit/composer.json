@@ -1,0 +1,7 @@
+{
+    "name": "arco-runner/fake-phpunit",
+    "description": "Offline stand-in for PHPUnit, used only by the runner image's /validate fixture",
+    "version": "1.0.0",
+    "license": "MIT",
+    "bin": ["bin/phpunit"]
+}
