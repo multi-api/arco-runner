@@ -71,34 +71,36 @@ Besides PHP, FrankenPHP, Composer, Node and tini, the image carries the test ser
 
 | Service | Version | Source | Binaries (`/usr/local/bin`) | Pristine template |
 | --- | --- | --- | --- | --- |
-| MySQL | 8.4.13 LTS | official `mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz` (pinned in `versions.json`, verified by `fetch-inputs` and `package-image`; fetched from `cdn.mysql.com/Downloads/MySQL-8.4/`, falling back to `cdn.mysql.com/archives/mysql-8.4/` once a newer 8.4 replaces it), extracted to `/opt/mysql` without `bin/mysqld-debug` and `lib/plugin/debug` | `mysqld`, `mysql`, `mysqladmin` | `/opt/arco-services/templates/mysql` (`--initialize-insecure`, then its `*.pem` keys and `auto.cnf` removed, owner `mysql`, `0700`) |
+| MySQL | 8.4.13 LTS | official `mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz` (pinned in `versions.json`, verified by `fetch-inputs` and `package-image`; fetched from `cdn.mysql.com/Downloads/MySQL-8.4/`, falling back to `cdn.mysql.com/archives/mysql-8.4/` once a newer 8.4 replaces it), extracted to `/opt/mysql` and trimmed (see below) | `mysqld`, `mysql`, `mysqladmin` | `/opt/arco-services/templates/mysql` (`--initialize-insecure --innodb-redo-log-capacity=8M`, then its `*.pem` keys and `auto.cnf` removed, owner `mysql`, `0700`) |
 | PostgreSQL | 17.11 | AL2023 `postgresql17-server`, `postgresql17` | `postgres`, `initdb`, `pg_isready`, `psql` | `/opt/arco-services/templates/pgsql` (`initdb -U postgres --auth-local=trust --auth-host=scram-sha-256 -E UTF8`, `LC_ALL=C.UTF-8`, owner `postgres`, `0700`) |
 | Redis | 6.2.20 | AL2023 `redis6`: `redis7` does not exist on AL2023 arm64 (`dnf repoquery redis7`, 2026-10-23) | `redis-server`, `redis-cli` | none |
 
-Each server has its own system user (`mysql`, `postgres`, `redis`). `/var/lib/arco-services` (where the agent copies a template at start) and `/run/arco-services` are root `0755` and empty; the last `RUN` fails the build if a server process is running or `/var/lib/arco-services` is not empty. MySQL is extracted in a separate build stage, so the tarball itself never lands in an image layer. dev.mysql.com lists no `-minimal` aarch64 tarball for 8.4, so the full one is used.
+Each server has its own system user (`mysql`, `postgres`, `redis`). `/var/lib/arco-services` (where the agent copies a template at start) and `/run/arco-services` are root `0755` and empty; the last `RUN` fails the build if a server process is running or `/var/lib/arco-services` is not empty. MySQL is extracted in a separate build stage, so the tarball itself never lands in an image layer. dev.mysql.com lists no `-minimal` aarch64 tarball for 8.4, so the full one is used and trimmed in that stage: `bin/mysqld-debug` and `lib/plugin/debug` are not extracted, every ELF binary and shared library is stripped (`strip --strip-unneeded`; `binutils` exists only in the build stage), and `include/`, `man/`, `docs/` (after the `INFO_SRC` release check), `lib/mecab` (dictionaries for the opt-in MeCab full-text parser), the static `*.a` libraries, `lib/pkgconfig` and `share/aclocal` are deleted. Every binary, `lib/plugin`, `lib/private` and `share/` stay, so the server is the same release with the same plugins (the `information_schema.plugins` list, collations, character sets and time zones are identical to the untrimmed build).
 
-The MySQL template carries no TLS/RSA keys and no `auto.cnf`, so VMs never share keys or a server UUID: `mysqld` regenerates them at its first start from the copy. Measured locally (6 starts each, template copy to `mysqladmin ping`): 440–560 ms with baked keys, 550–840 ms without, about +150 ms at the median. A `caching_sha2_password` user still logs in over TCP from `mysql -h127.0.0.1` (TLS) and PHP's PDO.
+The template's redo log is 8 MB instead of the default 100 MB, and the agent starts `mysqld` with the same `--innodb-redo-log-capacity=8M`, so no start resizes it. Tests run with `--innodb-flush-log-at-trx-commit=0` on a throwaway copy, so the smaller redo log only means more frequent checkpoints.
+
+The MySQL template carries no TLS/RSA keys and no `auto.cnf`, so VMs never share keys or a server UUID: `mysqld` regenerates them at its first start from the copy. Measured locally (6 starts each, template copy to `mysqladmin ping`): 440–560 ms with baked keys, 550–840 ms without, about +150 ms at the median. With the trimmed build and the 8 MB redo log (the agent's argv, as user `mysql`, TCP ping as the agent probes): 548–706 ms over 10 starts, medians 559 and 662 ms over two runs of 5. A `caching_sha2_password` user still logs in over TCP from `mysql -h127.0.0.1` (TLS) and PHP's PDO.
 
 The image's PHP has `pdo_mysql`, `pdo_pgsql`, `pdo_sqlite` and the `redis` extension (`php -m`), so the agent sets `REDIS_CLIENT=phpredis`.
 
-Measured locally (Docker Desktop, arm64, 2026-10-23; "before" is the image at `c88c9f8`):
+Measured locally (Docker Desktop, arm64, 2026-10-23; "before" is the image at `c88c9f8`, "untrimmed" the first build with the services, "after" the trimmed MySQL):
 
-| Measure | Before | After | Growth |
-| --- | --- | --- | --- |
-| `docker image inspect --format '{{.Size}}'` (compressed content) | 266,136,832 B | 885,697,327 B | +620 MB |
-| `docker images` disk usage | 1.12 GB | 3.24 GB | +2.12 GB |
-| `du -sx /` in the container | 803 MiB | 2.17 GiB | +1.37 GiB |
+| Measure | Before | Untrimmed | After | Growth (after vs before) |
+| --- | --- | --- | --- | --- |
+| `docker image inspect --format '{{.Size}}'` (compressed content) | 266,136,832 B | 885,697,327 B | 393,656,463 B | +128 MB |
+| `docker images` disk usage | 1.12 GB | 3.24 GB | 1.78 GB | +0.66 GB |
+| `du -sx /` in the container | 803 MiB | 2.17 GiB | 1,303 MiB | +500 MiB |
 
 | What | On disk |
 | --- | --- |
-| `/opt/mysql` (`bin` 631 MB, `lib` 394 MB: `lib/private` 133 MB, `lib/mecab` 130 MB, `libmysqlclient.a` 63 MB, `lib/plugin` 46 MB) | 1.1 GB |
-| `/opt/arco-services/templates/mysql` (101 MB of it is the default redo log) | 190 MB |
+| `/opt/mysql`, trimmed (`bin` 159 MB, `lib` 39 MB: `lib/private` 23 MB, `lib/plugin` 9 MB; `share` 11 MB). Untrimmed it was 1.1 GB | 209 MB |
+| `/opt/arco-services/templates/mysql` (8 MB redo log; `mysql.ibd` 28 MB, two undo tablespaces 16 MB each, `ibdata1` 12 MB, doublewrite 12 MB). With the default redo log it was 190 MB | 98 MB |
 | `/opt/arco-services/templates/pgsql` | 39 MB |
 | PostgreSQL packages (`postgresql17-server`, `postgresql17`, `postgresql17-private-libs`) | 49 MB |
 | `redis6` package | 5 MB |
 | the services' `dnf` layer in total, with the required `systemd`, `selinux-policy`, `libicu` and `util-linux` dependencies | 169 MB |
 
-**MySQL adds about 1.29 GB on disk, over the 600 MB checkpoint (spec §5.2); the owner decides before this ships.** For reference only (not applied): stripping the tarball's unstripped binaries and libraries brings `/opt/mysql` to 403 MB, and also dropping `lib/mecab`, `libmysqlclient.a` and `include` to 210 MB; a smaller `innodb_redo_log_capacity` at `--initialize` would shrink the template.
+**MySQL adds about 307 MB on disk (209 MB binaries + 98 MB template), within the 600 MB checkpoint (spec §5.2).** Untrimmed it added about 1.29 GB. Owner's decision: keep the official MySQL 8.4 LTS tarball, trimmed (strip, no MeCab dictionaries, static libraries or headers). MariaDB was considered and rejected for parity with production (MySQL's default collation `utf8mb4_0900_ai_ci` and its native `JSON` type); it may be added later as a fourth service.
 
 Snapshot growth and each service's start time are recorded after the first `/validate` with tests and the first staging publish.
 
