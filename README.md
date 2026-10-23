@@ -17,7 +17,7 @@ This repository is public and MIT licensed so customers can audit what runs thei
 | Path | What |
 | --- | --- |
 | `agent/` | The agent (TypeScript, esbuild bundle `agent/dist/arco-runner.mjs`) |
-| `image/` | `Dockerfile`, `versions.json` (pinned PHP, Composer, corepack, base digest), `rootfs/` |
+| `image/` | `Dockerfile`, `versions.json` (pinned PHP, Composer, corepack, base digest, test services), `rootfs/` |
 | `scripts/` | Image tooling: `fetch-inputs`, `package-image`, `bump-php`, `publish-microvm-image`, `prune-microvm-images` |
 | `fixture/` | Canned app used by `/validate` and the integration tests |
 | `integration/` | Docker integration suite with a fake Cloud |
@@ -65,12 +65,49 @@ ARCO_SMOKE_TICKET=<ticket> npm run smoke:herd -- --deployment <id>
 
 It runs the image with `ARCO_RUNNER_ALLOW_HTTP=1` and `--add-host arco-cloud.test:host-gateway`, trusts Herd's CA in the agent (`NODE_EXTRA_CA_CERTS`), waits for the control port, posts the ticket to `/job`, follows `/healthz` until the runner is idle again, prints the agent's output and removes the container. If the site is not secured in Herd, pass `--api-base http://arco-cloud.test`. The project's own `vendor/bin/arco` runs for real, so use a deployment whose app and AWS account you are happy to deploy to. It is manual and not part of CI.
 
+## Image
+
+Besides PHP, FrankenPHP, Composer, Node and tini, the image carries the test services (design spec §5), stopped:
+
+| Service | Version | Source | Binaries (`/usr/local/bin`) | Pristine template |
+| --- | --- | --- | --- | --- |
+| MySQL | 8.4.13 LTS | official `mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz` (pinned in `versions.json`, verified by `fetch-inputs` and `package-image`; fetched from `cdn.mysql.com/Downloads/MySQL-8.4/`, falling back to `cdn.mysql.com/archives/mysql-8.4/` once a newer 8.4 replaces it), extracted to `/opt/mysql` without `bin/mysqld-debug` and `lib/plugin/debug` | `mysqld`, `mysql`, `mysqladmin` | `/opt/arco-services/templates/mysql` (`--initialize-insecure`, then its `*.pem` keys and `auto.cnf` removed, owner `mysql`, `0700`) |
+| PostgreSQL | 17.11 | AL2023 `postgresql17-server`, `postgresql17` | `postgres`, `initdb`, `pg_isready`, `psql` | `/opt/arco-services/templates/pgsql` (`initdb -U postgres --auth-local=trust --auth-host=scram-sha-256 -E UTF8`, `LC_ALL=C.UTF-8`, owner `postgres`, `0700`) |
+| Redis | 6.2.20 | AL2023 `redis6`: `redis7` does not exist on AL2023 arm64 (`dnf repoquery redis7`, 2026-10-23) | `redis-server`, `redis-cli` | none |
+
+Each server has its own system user (`mysql`, `postgres`, `redis`). `/var/lib/arco-services` (where the agent copies a template at start) and `/run/arco-services` are root `0755` and empty; the last `RUN` fails the build if a server process is running or `/var/lib/arco-services` is not empty. MySQL is extracted in a separate build stage, so the tarball itself never lands in an image layer. dev.mysql.com lists no `-minimal` aarch64 tarball for 8.4, so the full one is used.
+
+The MySQL template carries no TLS/RSA keys and no `auto.cnf`, so VMs never share keys or a server UUID: `mysqld` regenerates them at its first start from the copy. Measured locally (6 starts each, template copy to `mysqladmin ping`): 440–560 ms with baked keys, 550–840 ms without, about +150 ms at the median. A `caching_sha2_password` user still logs in over TCP from `mysql -h127.0.0.1` (TLS) and PHP's PDO.
+
+The image's PHP has `pdo_mysql`, `pdo_pgsql`, `pdo_sqlite` and the `redis` extension (`php -m`), so the agent sets `REDIS_CLIENT=phpredis`.
+
+Measured locally (Docker Desktop, arm64, 2026-10-23; "before" is the image at `c88c9f8`):
+
+| Measure | Before | After | Growth |
+| --- | --- | --- | --- |
+| `docker image inspect --format '{{.Size}}'` (compressed content) | 266,136,832 B | 885,697,327 B | +620 MB |
+| `docker images` disk usage | 1.12 GB | 3.24 GB | +2.12 GB |
+| `du -sx /` in the container | 803 MiB | 2.17 GiB | +1.37 GiB |
+
+| What | On disk |
+| --- | --- |
+| `/opt/mysql` (`bin` 631 MB, `lib` 394 MB: `lib/private` 133 MB, `lib/mecab` 130 MB, `libmysqlclient.a` 63 MB, `lib/plugin` 46 MB) | 1.1 GB |
+| `/opt/arco-services/templates/mysql` (101 MB of it is the default redo log) | 190 MB |
+| `/opt/arco-services/templates/pgsql` | 39 MB |
+| PostgreSQL packages (`postgresql17-server`, `postgresql17`, `postgresql17-private-libs`) | 49 MB |
+| `redis6` package | 5 MB |
+| the services' `dnf` layer in total, with the required `systemd`, `selinux-policy`, `libicu` and `util-linux` dependencies | 169 MB |
+
+**MySQL adds about 1.29 GB on disk, over the 600 MB checkpoint (spec §5.2); the owner decides before this ships.** For reference only (not applied): stripping the tarball's unstripped binaries and libraries brings `/opt/mysql` to 403 MB, and also dropping `lib/mecab`, `libmysqlclient.a` and `include` to 210 MB; a smaller `innodb_redo_log_capacity` at `--initialize` would shrink the template.
+
+Snapshot growth and each service's start time are recorded after the first `/validate` with tests and the first staging publish.
+
 ## Publishing
 
 `.github/workflows/publish.yml` runs on every push to `main` (stage `staging`), monthly (`0 6 1 * *`, staging) and by `workflow_dispatch` with `stage` (`staging` or `prod`) and `os_capabilities_all`. `prod` runs in the GitHub environment `prod`, where the owner sets a required reviewer. Per stage it:
 
 1. assumes the publisher role through GitHub OIDC (`vars.PUBLISHER_ROLE_ARN`, `vars.AWS_REGION`);
-2. downloads and verifies the PHP CLI, FrankenPHP and Composer, bundles the agent and packages `build/image.zip`;
+2. downloads and verifies the PHP CLI, FrankenPHP, Composer, tini and the MySQL tarball, bundles the agent and packages `build/image.zip`;
 3. runs `scripts/publish-microvm-image.ts`: uploads the zip to `s3://$ARTIFACT_BUCKET/images/arco-runner-php85/<sha>.zip`, creates or updates the MicroVM image `arco-runner-php85` on the newest managed `al2023` base, and waits (up to 60 minutes) for the new version to reach `SUCCESSFUL`, which includes the `/validate` fixture build. A `FAILED` version fails the job and prints its `stateReason`;
 4. builds and pushes `$ECR_REPO:php85-<sha>-<run id>-<run attempt>` (ECR tags are immutable, so every run, including the monthly rebuild of an unchanged `main` and re-runs, gets its own tag) and registers a new revision of the Fargate task definition `arco-runner-php85` (2 vCPU / 4 GB, ARM64, 30 GiB ephemeral storage, no task role);
 5. writes the three values below to the job summary.
