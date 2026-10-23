@@ -40,6 +40,17 @@ describe('registerJobSecrets', () => {
   });
 });
 
+describe('tests.mask', () => {
+  it('redacts tests.mask values and counts short ones', () => {
+    const base = doc();
+    const d = { ...base, tests: { command: 'php artisan test', setup_commands: [], services: [], primary_database: null, timeout_seconds: 900, env: {}, mask: ['test-secret-9', 'xyz'] } } as typeof base;
+    const r = new Redactor();
+    registerJobSecrets(r, d);
+    expect(r.redact('a test-secret-9 b')).toBe('a *** b');
+    expect(shortMaskValues(d)).toBe(2);
+  });
+});
+
 describe('BuildFailure', () => {
   it('carries a code', () => {
     const e = new BuildFailure('build.timeout', 'x');

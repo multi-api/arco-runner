@@ -24,6 +24,7 @@ const signature = (url: string): string | null => {
 export function registerJobSecrets(r: Redactor, d: JobDocument): void {
   const secrets: Array<string | null> = [
     ...d.mask,
+    ...(d.tests?.mask ?? []),
     d.runner_token,
     d.nonce,
     d.source.auth_header,
@@ -37,5 +38,5 @@ export function registerJobSecrets(r: Redactor, d: JobDocument): void {
 }
 
 export function shortMaskValues(d: JobDocument): number {
-  return d.mask.filter((v) => v.length < MIN_MASK_LENGTH).length;
+  return [...d.mask, ...(d.tests?.mask ?? [])].filter((v) => v.length < MIN_MASK_LENGTH).length;
 }
