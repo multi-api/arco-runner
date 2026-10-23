@@ -228,7 +228,6 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     return lines.length ? `\n${lines.join('\n')}` : '';
   }
 
-  /** Fresh data and socket dirs for `s`, owned by its user; returns the open server log (created by root, never through a link). */
   /** Root writes pg_hba.conf into runDir, which must be a real directory the agent owns (lstat, never through a link). */
   async function writePgHba(): Promise<void> {
     const st = await lstat(p.runDir);
@@ -244,6 +243,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     }
   }
 
+  /** Fresh data and socket dirs for `s`, owned by its user; returns the open server log (created by root, never through a link). */
   async function prepare(s: ServiceName, as: RunAs): Promise<FileHandle> {
     const data = join(p.dataDir, s);
     const run = join(p.runDir, s);

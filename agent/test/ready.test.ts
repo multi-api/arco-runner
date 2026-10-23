@@ -57,6 +57,17 @@ describe('selfCheck with services', () => {
     expect(await check(s)).toMatch(/service data/);
   });
 
+  it('fails the self-check while service sockets or files are left in the run dir', async () => {
+    const s = await setup();
+    await mkdir(s.svc.runDir);
+    expect(await check(s)).toBeNull();
+    await mkdir(join(s.svc.runDir, 'mysql'));
+    expect(await check(s)).toMatch(/service files exist in .*run/);
+    await rm(join(s.svc.runDir, 'mysql'), { recursive: true });
+    await writeFile(join(s.svc.runDir, 'pg_hba.conf'), 'x');
+    expect(await check(s)).toMatch(/service files exist/);
+  });
+
   it('fails when a service binary does not run', async () => {
     const s = await setup();
     await writeFile(join(s.root, 'bin/postgres'), '#!/bin/sh\nexit 3\n', { mode: 0o755 });

@@ -60,8 +60,11 @@ export async function selfCheck(
       for (const uid of services.uids) {
         if ((await pidsOfUid(uid, services.procDir ?? '/proc')).length > 0) return `a process of service uid ${uid} is running`;
       }
-      const left = await readdir(services.paths.dataDir).catch((e: NodeJS.ErrnoException) => (e.code === 'ENOENT' ? [] : Promise.reject(e)));
-      if (left.length > 0) return `service data exists in ${services.paths.dataDir}`;
+      const entries = (dir: string): Promise<string[]> =>
+        readdir(dir).catch((e: NodeJS.ErrnoException) => (e.code === 'ENOENT' ? [] : Promise.reject(e)));
+      if ((await entries(services.paths.dataDir)).length > 0) return `service data exists in ${services.paths.dataDir}`;
+      // Sockets, pid files and pg_hba.conf: the wipe empties runDir too.
+      if ((await entries(services.paths.runDir)).length > 0) return `service files exist in ${services.paths.runDir}`;
     }
     return null;
   } catch (e) {
