@@ -10,6 +10,7 @@ import type { ServiceName } from '../job/document.js';
 import type { Identity } from '../system.js';
 import { killUserProcesses } from '../wipe.js';
 import {
+  PG_HBA,
   SERVICE_LABELS,
   SERVICE_USERS,
   SYSTEM_DATABASES,
@@ -17,6 +18,7 @@ import {
   createSql,
   dropSql,
   listDatabasesSql,
+  pgHbaPath,
   probeArgv,
   serverArgv,
   type DatabaseService,
@@ -31,6 +33,8 @@ const READY_TIMEOUT_MS = 30_000;
 const PROBE_INTERVAL_MS = 250;
 const STOP_GRACE_MS = 10_000;
 const KILL_WAIT_MS = 5_000;
+const DROP_TIMEOUT_MS = 15_000;
+const PROBE_TIMEOUT_MS = 5_000;
 const ADMIN_TIMEOUT_MS = 60_000;
 const LOG_TAIL_LINES = 20;
 const LOG_TAIL_BYTES = 64 * 1024;
@@ -68,7 +72,8 @@ export interface AdminResult { exitCode: number; stdout: string; stderr: string 
 
 export interface ServicesManagerOptions {
   spawnServer?: (s: ServiceName, argv: string[], o: SpawnServerOptions) => ServerProcess;
-  probe?: (s: ServiceName, argv: string[], as: RunAs) => Promise<boolean>;
+  /** `timeoutMs` never reaches past the readiness deadline. */
+  probe?: (s: ServiceName, argv: string[], as: RunAs, timeoutMs: number) => Promise<boolean>;
   admin?: (s: DatabaseService, argv: string[], sql: string, o: RunAs & { signal?: AbortSignal }) => Promise<AdminResult>;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -118,9 +123,9 @@ function defaultSpawnServer(_s: ServiceName, argv: string[], o: SpawnServerOptio
   };
 }
 
-async function defaultProbe(s: ServiceName, argv: string[], as: RunAs): Promise<boolean> {
+async function defaultProbe(s: ServiceName, argv: string[], as: RunAs, timeoutMs: number): Promise<boolean> {
   try {
-    const { stdout } = await execFileP(argv[0]!, argv.slice(1), { env: serverEnv('/'), cwd: '/', timeout: 5000, encoding: 'utf8', ...asUser(as) });
+    const { stdout } = await execFileP(argv[0]!, argv.slice(1), { env: serverEnv('/'), cwd: '/', timeout: Math.max(1, timeoutMs), killSignal: 'SIGKILL', encoding: 'utf8', ...asUser(as) });
     return s !== 'redis' || stdout.trim() === 'PONG';
   } catch {
     return false;
@@ -204,7 +209,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     return exitCode === 0;
   });
 
-  const running: Array<{ s: ServiceName; proc: ServerProcess; uid: number }> = [];
+  const running: Array<{ s: ServiceName; proc: ServerProcess; uid: number; exited: () => boolean }> = [];
   /** Service users whose leftovers have not been killed yet (kept until a kill succeeds). */
   const pendingUsers = new Set<number>();
 
@@ -224,6 +229,21 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
   }
 
   /** Fresh data and socket dirs for `s`, owned by its user; returns the open server log (created by root, never through a link). */
+  /** Root writes pg_hba.conf into runDir, which must be a real directory the agent owns (lstat, never through a link). */
+  async function writePgHba(): Promise<void> {
+    const st = await lstat(p.runDir);
+    if (!st.isDirectory() || st.uid !== process.getuid?.()) throw new ServiceStartError('pgsql', `PostgreSQL: ${p.runDir} is not a directory owned by the agent`);
+    const path = pgHbaPath(p);
+    await removeTree(path);
+    const fh = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+    try {
+      await fh.writeFile(PG_HBA);
+      await fh.chmod(0o644); // the umask may have narrowed it; postgres must read it
+    } finally {
+      await fh.close();
+    }
+  }
+
   async function prepare(s: ServiceName, as: RunAs): Promise<FileHandle> {
     const data = join(p.dataDir, s);
     const run = join(p.runDir, s);
@@ -231,6 +251,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     await ensureRealDir(p.runDir);
     await removeTree(data);
     await removeTree(run);
+    if (s === 'pgsql') await writePgHba();
     if (s === 'redis') {
       await mkdir(data, { mode: 0o700 });
     } else {
@@ -268,18 +289,19 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     } finally {
       await log.close(); // the server holds its own copy
     }
-    running.push({ s, proc, uid: as.uid });
-    pendingUsers.add(as.uid);
     let exited = false;
     void proc.exited.then(() => { exited = true; });
+    running.push({ s, proc, uid: as.uid, exited: () => exited });
+    pendingUsers.add(as.uid);
 
     const deadline = now() + READY_TIMEOUT_MS;
     for (;;) {
       if (signal.aborted) throw abortError();
       if (exited) throw new ServiceStartError(s, `${label} exited before becoming ready${await logTail(s, password)}`);
-      if (await probe(s, probeArgv(s, p), as)) break;
+      const left = deadline - now();
+      if (left <= 0) throw new ServiceStartError(s, `${label} did not become ready within 30 seconds${await logTail(s, password)}`);
+      if (await probe(s, probeArgv(s, p), as, Math.min(PROBE_TIMEOUT_MS, left))) break;
       if (signal.aborted) throw abortError();
-      if (now() >= deadline) throw new ServiceStartError(s, `${label} did not become ready within 30 seconds${await logTail(s, password)}`);
       await Promise.race([sleep(PROBE_INTERVAL_MS), aborted]);
     }
 
@@ -294,7 +316,8 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     return now() - t0;
   }
 
-  async function stopOne(proc: ServerProcess): Promise<void> {
+  async function stopOne({ proc, exited }: { proc: ServerProcess; exited: () => boolean }): Promise<void> {
+    if (exited()) return; // its pid (and group id) may already belong to someone else
     proc.kill('SIGTERM');
     const outcome = await Promise.race([proc.exited.then(() => 'exited' as const), sleep(STOP_GRACE_MS).then(() => 'timeout' as const)]);
     if (outcome === 'exited') return;
@@ -304,7 +327,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
 
   async function stopAll(): Promise<void> {
     const procs = running.splice(0).reverse();
-    for (const r of procs) await stopOne(r.proc);
+    for (const r of procs) await stopOne(r);
     let first: unknown = null;
     for (const uid of [...pendingUsers]) {
       try {
@@ -342,11 +365,11 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
       for (const { s } of running) {
         if (s === 'redis') continue;
         const as = ids(s);
-        const list = await admin(s, adminArgv(s, p), listDatabasesSql(s), as);
+        const list = await admin(s, adminArgv(s, p), listDatabasesSql(s), { ...as, signal: AbortSignal.timeout(DROP_TIMEOUT_MS) });
         if (list.exitCode !== 0) throw new Error(`${SERVICE_LABELS[s]}: listing databases failed (exit ${list.exitCode})`);
         const names = list.stdout.split('\n').map((l) => l.trim()).filter((n) => n && !SYSTEM_DATABASES[s].includes(n));
         if (names.length === 0) continue;
-        const drop = await admin(s, adminArgv(s, p), dropSql(s, names), as);
+        const drop = await admin(s, adminArgv(s, p), dropSql(s, names), { ...as, signal: AbortSignal.timeout(DROP_TIMEOUT_MS) });
         if (drop.exitCode !== 0) throw new Error(`${SERVICE_LABELS[s]}: dropping databases failed (exit ${drop.exitCode})`);
         dropped.push(...names);
       }

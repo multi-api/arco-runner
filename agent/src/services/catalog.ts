@@ -32,6 +32,18 @@ export const SYSTEM_DATABASES: Record<DatabaseService, readonly string[]> = {
 
 const HOST = '127.0.0.1';
 
+/** The PostgreSQL client-authentication file, root-owned in the root-owned runDir. */
+export const pgHbaPath = (p: ServicePaths) => `${p.runDir}/pg_hba.conf`;
+
+/** Superuser only over the 0700 socket by peer; `arco` over 127.0.0.1 by password; every other TCP login refused. */
+export const PG_HBA = [
+  'local all postgres peer',
+  'host all arco 127.0.0.1/32 scram-sha-256',
+  'host all all 0.0.0.0/0 reject',
+  'host all all ::/0 reject',
+  '',
+].join('\n');
+
 /** The server argv (argv[0] is the binary). Never carries a secret. `redisMajor` gates the Redis 7-only flags. */
 export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number): string[] {
   const data = `${p.dataDir}/${s}`;
@@ -43,6 +55,9 @@ export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number):
         `--datadir=${data}`,
         `--socket=${p.runDir}/mysql/mysqld.sock`,
         `--bind-address=${HOST}`,
+        // The template's root@localhost has no password: without name resolution a 127.0.0.1 TCP connection
+        // never matches `localhost`, so those accounts are reachable only through the 0700 socket.
+        '--skip-name-resolve',
         `--port=${SERVICE_PORTS.mysql}`,
         '--mysqlx=OFF',
         '--skip-log-bin',
@@ -61,6 +76,9 @@ export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number):
         '-c', 'fsync=off',
         '-c', 'synchronous_commit=off',
         '-c', 'full_page_writes=off',
+        // Never the template's pg_hba.conf (initdb trusts host lines): ours is written by root at start.
+        '-c', `hba_file=${pgHbaPath(p)}`,
+        '-c', 'password_encryption=scram-sha-256',
       ];
     case 'redis':
       return [
@@ -71,7 +89,11 @@ export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number):
         '--save', '',
         '--appendonly', 'no',
         '--protected-mode', 'yes',
-        ...(redisMajor >= 7 ? ['--enable-protected-configs', 'no', '--enable-module-command', 'no'] : []),
+        // Redis 6 has no enable-* switches: the commands are disabled by renaming them to "" instead.
+        ...(redisMajor >= 7
+          ? ['--enable-protected-configs', 'no', '--enable-module-command', 'no']
+          : ['--rename-command', 'MODULE', '', '--rename-command', 'CONFIG', '']),
+        '--rename-command', 'DEBUG', '',
       ];
   }
 }
@@ -80,7 +102,8 @@ export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number):
 export function probeArgv(s: ServiceName, p: ServicePaths): string[] {
   switch (s) {
     case 'mysql':
-      // Exit 0 whenever the server answers, even "Access denied".
+      // mysqladmin exits 0 whenever the server is running, even on "Access denied" (MySQL manual, mysqladmin):
+      // root has no TCP access (--skip-name-resolve), and a running server still counts as ready.
       return [`${p.binDir}/mysqladmin`, '--no-defaults', '--protocol=TCP', `--host=${HOST}`, `--port=${SERVICE_PORTS.mysql}`, '--user=root', '--connect-timeout=2', 'ping'];
     case 'pgsql':
       return [`${p.binDir}/pg_isready`, '-h', HOST, '-p', String(SERVICE_PORTS.pgsql), '-t', '2'];

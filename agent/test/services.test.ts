@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -96,17 +96,23 @@ describe('catalog', () => {
     }
     expect(serverArgv('mysql', p, 7)).toEqual(expect.arrayContaining([
       '--bind-address=127.0.0.1', '--port=3306', '--mysqlx=OFF', '--skip-log-bin', '--secure-file-priv=NULL',
-      '--performance-schema=OFF', '--innodb-flush-log-at-trx-commit=0',
+      '--performance-schema=OFF', '--innodb-flush-log-at-trx-commit=0', '--skip-name-resolve',
       `--socket=${p.runDir}/mysql/mysqld.sock`, `--log-error=${p.dataDir}/mysql/error.log`,
     ]));
     expect(serverArgv('pgsql', p, 7).slice(1).join(' ')).toBe(
-      `-D ${p.dataDir}/pgsql -c listen_addresses=127.0.0.1 -c port=5432 -k ${p.runDir}/pgsql -c fsync=off -c synchronous_commit=off -c full_page_writes=off`,
+      `-D ${p.dataDir}/pgsql -c listen_addresses=127.0.0.1 -c port=5432 -k ${p.runDir}/pgsql -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c hba_file=${p.runDir}/pg_hba.conf -c password_encryption=scram-sha-256`,
     );
     expect(serverArgv('redis', p, 7).slice(1)).toEqual([
       '--bind', '127.0.0.1', '--port', '6379', '--dir', `${p.dataDir}/redis`, '--save', '', '--appendonly', 'no',
       '--protected-mode', 'yes', '--enable-protected-configs', 'no', '--enable-module-command', 'no',
+      '--rename-command', 'DEBUG', '',
     ]);
-    expect(serverArgv('redis', p, 6)).not.toContain('--enable-protected-configs');
+    // Redis 6 (AL2023 redis6) has no enable-* switches: MODULE, CONFIG and DEBUG are renamed away instead.
+    expect(serverArgv('redis', p, 6).slice(1)).toEqual([
+      '--bind', '127.0.0.1', '--port', '6379', '--dir', `${p.dataDir}/redis`, '--save', '', '--appendonly', 'no',
+      '--protected-mode', 'yes', '--rename-command', 'MODULE', '', '--rename-command', 'CONFIG', '',
+      '--rename-command', 'DEBUG', '',
+    ]);
 
     // Through the manager: no argv it runs carries the password; the password only travels on stdin.
     const h = harness();
@@ -137,6 +143,82 @@ describe('catalog', () => {
 });
 
 describe('services manager', () => {
+  it('writes a root-owned pg_hba.conf that refuses every TCP login but arco, and removeData deletes it', async () => {
+    const p = await makePaths();
+    const h = harness();
+    const m = createServicesManager(p, h.fakes);
+    await m.start(['pgsql'], 'pw', new AbortController().signal);
+    const hba = join(p.runDir, 'pg_hba.conf');
+    expect(h.procs.pgsql!.argv).toContain(`hba_file=${hba}`);
+    expect(readFileSync(hba, 'utf8')).toBe(
+      'local all postgres peer\nhost all arco 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n',
+    );
+    const st = lstatSync(hba);
+    expect(st.isFile()).toBe(true);
+    expect(st.mode & 0o777).toBe(0o644);
+    expect(st.uid).toBe(process.getuid!());
+    await m.stopAll();
+    await m.removeData();
+    expect(existsSync(hba)).toBe(false);
+  });
+
+  it('never writes pg_hba.conf through a link planted at its path', async () => {
+    const p = await makePaths();
+    const outside = await mkdtemp(join(tmpdir(), 'arco-outside-'));
+    roots.push(outside);
+    await writeFile(join(outside, 'target'), 'keep');
+    await mkdir(p.runDir, { recursive: true });
+    await symlink(join(outside, 'target'), join(p.runDir, 'pg_hba.conf'));
+    const m = createServicesManager(p, harness().fakes);
+    await m.start(['pgsql'], 'pw', new AbortController().signal);
+    expect(readFileSync(join(outside, 'target'), 'utf8')).toBe('keep');
+    expect(lstatSync(join(p.runDir, 'pg_hba.conf')).isFile()).toBe(true);
+  });
+
+  it('never gives a probe more time than is left before the 30 s deadline', async () => {
+    const p = await makePaths();
+    const h = harness({ ready: () => false });
+    const timeouts: Array<{ at: number; ms: number }> = [];
+    const m = createServicesManager(p, {
+      ...h.fakes,
+      probe: async (_s, _argv, _as, ms) => { timeouts.push({ at: h.clock(), ms }); return false; },
+    });
+    await m.start(['redis'], 'pw', new AbortController().signal).catch(() => {});
+    expect(timeouts.length).toBeGreaterThan(100);
+    for (const t of timeouts) {
+      expect(t.ms).toBeGreaterThan(0);
+      expect(t.ms).toBeLessThanOrEqual(5_000);
+      expect(t.at + t.ms).toBeLessThanOrEqual(30_000);
+    }
+  });
+
+  it('never signals a server that has already exited', async () => {
+    const p = await makePaths();
+    const h = harness();
+    const m = createServicesManager(p, h.fakes);
+    await m.start(['redis'], 'pw', new AbortController().signal);
+    h.procs.redis!.kill('SIGTERM'); // it exits on its own
+    h.procs.redis!.signals.length = 0;
+    await new Promise((r) => setImmediate(r));
+    await m.stopAll();
+    expect(h.procs.redis!.signals).toEqual([]);
+  });
+
+  it('bounds the drop statements with a signal', async () => {
+    const p = await makePaths();
+    const signals: Array<AbortSignal | undefined> = [];
+    const h = harness({ listing: 'testing\n' });
+    const m = createServicesManager(p, {
+      ...h.fakes,
+      admin: async (s, argv, sql, o) => { signals.push(o.signal); return h.fakes.admin(s, argv, sql); },
+    });
+    await m.start(['pgsql'], 'pw', new AbortController().signal);
+    signals.length = 0;
+    expect(await m.dropDatabases()).toEqual(['testing']);
+    expect(signals).toHaveLength(2);
+    for (const sg of signals) expect(sg).toBeInstanceOf(AbortSignal);
+  });
+
   it('drops every non-system database', async () => {
     const p = await makePaths();
     const h = harness({ listing: 'testing\ntesting_test_1\nmysql\nsys\n' });
