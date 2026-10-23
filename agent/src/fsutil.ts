@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, readdir, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
 import { isAbsolute, join, posix } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -58,5 +59,21 @@ export async function wipeExcept(dir: string, keep: string[], prefix = ''): Prom
       continue;
     }
     await removeTree(full);
+  }
+}
+
+/** Reads a regular file without following a symlink in its last component; null if absent or not a plain file. */
+export async function readPlainFile(path: string, maxBytes: number): Promise<Buffer | null> {
+  let fh;
+  try {
+    // O_NONBLOCK so that a planted FIFO cannot hang the agent; O_NOFOLLOW so a planted link is never read.
+    fh = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const st = await fh.stat();
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return await fh.readFile();
+  } catch {
+    return null;
+  } finally {
+    await fh?.close();
   }
 }
