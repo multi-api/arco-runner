@@ -4,9 +4,30 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "0b6d06f23692bb0096b79d1103ad25b0",
+    "content-hash": "5d1e4007bb209888963c6b4f7aa844b3",
     "packages": [],
     "packages-dev": [
+        {
+            "name": "arco-runner/fake-phpunit",
+            "version": "1.0.0",
+            "dist": {
+                "type": "path",
+                "url": "../packages/fake-phpunit",
+                "reference": "368d36e58a7d5e3b83dec0386f87eab282ae2a34"
+            },
+            "bin": [
+                "bin/phpunit"
+            ],
+            "type": "library",
+            "license": [
+                "MIT"
+            ],
+            "description": "Offline stand-in for PHPUnit, used only by the runner image's /validate fixture",
+            "transport-options": {
+                "symlink": false,
+                "relative": true
+            }
+        },
         {
             "name": "multiapi/arco",
             "version": "0.10.0",

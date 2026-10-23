@@ -1,8 +1,11 @@
+import { readFileSync } from 'node:fs';
 import { Agent } from './agent.js';
 import type { CacheManifest } from './job/cache.js';
 import { parseTicketPayload, type TicketPayload } from './job/document.js';
 import { runJob } from './job/run-job.js';
 import { selfCheck } from './ready.js';
+import { defaultServicePaths, serviceUserIds } from './services/catalog.js';
+import { createServicesManager } from './services/manager.js';
 import { startServers } from './servers.js';
 import { buildIdentity, defaultPaths } from './system.js';
 import { runValidation } from './validate.js';
@@ -31,9 +34,23 @@ process.on('uncaughtException', (e) => {
   process.exit(1);
 });
 
-const jobWipe = (rootDir: string) => wipe(paths, rootDir, identity ? { uid: identity.uid } : {});
+// The test services' uids, by name from /etc/passwd. A missing user (dev machine) is skipped by the wipe and /ready, logged once
+// here; /validate fails on it, so an image without one is never snapshotted.
+const servicePaths = defaultServicePaths();
+const serviceUids = (() => {
+  let passwd = '';
+  try { passwd = readFileSync('/etc/passwd', 'utf8'); } catch { /* none */ }
+  const { uids, missing } = serviceUserIds(passwd);
+  if (missing.length > 0) log(`service users missing from /etc/passwd: ${missing.join(', ')}; their processes are not killed by the wipe`);
+  return Object.values(uids);
+})();
+const jobWipe = (rootDir: string) => wipe(paths, rootDir, {
+  ...(identity ? { uid: identity.uid } : {}),
+  services: { uids: serviceUids, dataDir: servicePaths.dataDir, runDir: servicePaths.runDir },
+});
 // ARCO_RUNNER_ALLOW_HTTP=1 (integration tests only) also lets the fake Cloud serve the clone over http://.
 const checkoutOptions = allowHttp ? { allowHttpUrl: true } : undefined;
+const services = () => createServicesManager(defaultServicePaths());
 
 async function runFargate(): Promise<void> {
   let payload: TicketPayload;
@@ -59,7 +76,7 @@ async function runFargate(): Promise<void> {
     await runJob(payload, {
       paths, identity, mode: 'fargate', signal: abort.signal, receivedAt: Date.now(),
       knownCache: { get: () => cache, set: (m) => { cache = m; } },
-      onPhase: () => {}, wipe: jobWipe, log, checkoutOptions,
+      onPhase: () => {}, wipe: jobWipe, log, checkoutOptions, services,
     });
     process.exit(0);
   } catch (e) {
@@ -69,10 +86,10 @@ async function runFargate(): Promise<void> {
 }
 
 async function runMicroVm(): Promise<void> {
-  const agent = new Agent({ paths, identity, mode: 'microvm', wipe: jobWipe, log, checkoutOptions });
+  const agent = new Agent({ paths, identity, mode: 'microvm', wipe: jobWipe, log, checkoutOptions, services });
 
   let readyResult: Promise<boolean> | null = null;
-  const ready = () => (readyResult ??= selfCheck(paths, identity).then((problem) => {
+  const ready = () => (readyResult ??= selfCheck(paths, identity, { paths: servicePaths, uids: serviceUids }).then((problem) => {
     if (problem) log(`self-check failed: ${problem}`);
     return problem === null;
   }));

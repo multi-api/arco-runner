@@ -31,6 +31,7 @@ async function main(): Promise<void> {
   await checkFile(join(inputs, 'frankenphp'), 'frankenphp', php.frankenphp_sha256, php.frankenphp_size);
   await checkFile(join(inputs, 'composer.phar'), 'composer.phar', versions.composer.sha256);
   await checkFile(join(inputs, 'tini'), 'tini', versions.tini.sha256, versions.tini.size);
+  await checkFile(join(inputs, 'mysql.tar.xz'), 'mysql.tar.xz', versions.services.mysql.sha256, versions.services.mysql.size);
 
   const zip = new yazl.ZipFile();
   const add = (file: string, name: string, mode: number) =>
@@ -44,6 +45,8 @@ async function main(): Promise<void> {
     runtimeBuild: php.arco_build_id,
     revision,
     corepack: versions.corepack.version,
+    mysqlVersion: versions.services.mysql.version,
+    redisPackage: versions.services.redis.package,
   });
   addBuffer(Buffer.from(dockerfile), 'Dockerfile', 0o644);
 
@@ -54,6 +57,7 @@ async function main(): Promise<void> {
   add(join(inputs, 'frankenphp'), 'inputs/frankenphp', 0o755);
   add(join(inputs, 'composer.phar'), 'inputs/composer.phar', 0o755);
   add(join(inputs, 'tini'), 'inputs/tini', 0o755);
+  add(join(inputs, 'mysql.tar.xz'), 'inputs/mysql.tar.xz', 0o644);
 
   add(resolve(args.agent!), 'agent/arco-runner.mjs', 0o644);
   // Optional: the standalone /validate runner used by image smoke tests.

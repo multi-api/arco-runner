@@ -6,6 +6,7 @@ import { join, posix } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { runCommand } from '@multiapi/arco-cloud-client';
+import { readPlainFile } from '../fsutil.js';
 import type { Identity, Paths } from '../system.js';
 
 export type Locks = { composer: string | null; npm: string | null; yarn: string | null; pnpm: string | null };
@@ -75,22 +76,6 @@ export function cacheRoots(rootDir: string): string[] {
   }
   roots.push('.cache/composer', '.npm');
   return [...new Set(roots)];
-}
-
-/** Reads a regular file without following a symlink in its last component; null if absent or not a plain file. */
-async function readPlainFile(path: string, maxBytes: number): Promise<Buffer | null> {
-  let fh;
-  try {
-    // O_NONBLOCK so that a planted FIFO cannot hang the agent; O_NOFOLLOW so a planted link is never read.
-    fh = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const st = await fh.stat();
-    if (!st.isFile() || st.size > maxBytes) return null;
-    return await fh.readFile();
-  } catch {
-    return null;
-  } finally {
-    await fh?.close();
-  }
 }
 
 const LOCK_FILES: Record<keyof Locks, string> = {

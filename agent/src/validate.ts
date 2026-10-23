@@ -9,9 +9,12 @@ import { runCommand } from '@multiapi/arco-cloud-client';
 import { removeTree } from './fsutil.js';
 import { startFakeCloud, type FakeCloud } from './loopback-cloud.js';
 import type { CacheManifest } from './job/cache.js';
-import type { TicketPayload } from './job/document.js';
+import type { ServiceName, TicketPayload } from './job/document.js';
 import { runJob, type JobResult } from './job/run-job.js';
-import type { Identity, Paths } from './system.js';
+import { SERVICE_LABELS, SERVICE_USERS, serviceUserIds } from './services/catalog.js';
+import { createServicesManager, defaultServicePaths, type ServicePaths, type ServicesManager } from './services/manager.js';
+import { buildEnv, type Identity, type Paths } from './system.js';
+import { generatePassword, serviceVariables } from './tests/env.js';
 import { killUserProcesses, wipe } from './wipe.js';
 
 const execFileP = promisify(execFile);
@@ -26,6 +29,14 @@ export class ValidationError extends Error {
 
 const ROOT_DIR = 'app';
 const COMMANDS = ['composer install --no-interaction --prefer-dist', 'npm ci --offline', 'npm run build', 'sleep 300 &'];
+/**
+ * The first canned job also runs a test phase: the fixture's `php artisan test` runs the offline fake PHPUnit.
+ * The setup installs it (offline): the test phase runs before the build commands, and the first job has no cache.
+ */
+const CANNED_TESTS = {
+  command: 'php artisan test', setup_commands: ['composer install --no-interaction --prefer-dist'], services: [],
+  primary_database: null, timeout_seconds: 300, env: { COMPOSER_DISABLE_NETWORK: '1' }, mask: [],
+};
 const GIT_ENV = (home: string): NodeJS.ProcessEnv => ({ PATH: '/usr/local/bin:/usr/bin:/bin', HOME: home, GIT_CONFIG_NOSYSTEM: '1', LC_ALL: 'C' });
 const PERMISSION_TROUBLE = /EPERM|operation not permitted|survived SIGKILL|setuid|setgid|cannot kill/i;
 
@@ -60,7 +71,9 @@ interface Pass {
 }
 
 /** One canned job through runJob with the real wipe, against an in-process Cloud on 127.0.0.1. */
-async function cannedJob(o: { paths: Paths; identity: Identity | null; bundle: string; knownCache: CacheManifest | null; seed?: FakeCloud }): Promise<Pass> {
+async function cannedJob(o: {
+  paths: Paths; identity: Identity | null; bundle: string; knownCache: CacheManifest | null; seed?: FakeCloud; withTests?: boolean;
+}): Promise<Pass> {
   const { paths, identity } = o;
   const source = await prepareSource(o.bundle, paths, identity);
   const token = `rt_${randomBytes(12).toString('hex')}`;
@@ -78,6 +91,7 @@ async function cannedJob(o: { paths: Paths; identity: Identity | null; bundle: s
       php_version: '8.5', commands: COMMANDS, env: { COMPOSER_DISABLE_NETWORK: '1' }, mask: [],
       cache: { restore_url: `${cloud.url}/s3/cache?X-Amz-Signature=sig${randomBytes(8).toString('hex')}`, save_url: `${cloud.url}/s3/cache?X-Amz-Signature=sig${randomBytes(8).toString('hex')}`, key: 'validate' },
       timeout_seconds: 600,
+      ...(o.withTests ? { tests: CANNED_TESTS, defer_credentials: true } : {}),
     };
     const payload: TicketPayload = { ticket, api_base: cloud.url, deployment_id: 'dep_validate' };
     let known = o.knownCache;
@@ -107,11 +121,12 @@ async function cannedJob(o: { paths: Paths; identity: Identity | null; bundle: s
 }
 
 /** What the job sent to Cloud's `logs` endpoint: the lines (for failure messages) and the step events. */
-function sentLogs(cloud: FakeCloud): { lines: string[]; events: { key: string; status: string }[] } {
-  const out = { lines: [] as string[], events: [] as { key: string; status: string }[] };
+type SentEvent = { key: string; status: string; params?: Record<string, unknown> };
+function sentLogs(cloud: FakeCloud): { lines: string[]; events: SentEvent[] } {
+  const out = { lines: [] as string[], events: [] as SentEvent[] };
   for (const r of cloud.calls('/logs')) {
     try {
-      const body = JSON.parse(r.body.toString('utf8')) as { lines?: string[]; events?: { key: string; status: string }[] };
+      const body = JSON.parse(r.body.toString('utf8')) as { lines?: string[]; events?: SentEvent[] };
       out.lines.push(...(body.lines ?? []));
       out.events.push(...(body.events ?? []));
     } catch { /* not a batch */ }
@@ -201,8 +216,115 @@ export async function prefetchRuntimeCache(home: string): Promise<{ files: numbe
 }
 
 /**
- * The image's smoke test (spec §9.3): two canned jobs through the real pipeline against an in-process Cloud on
- * 127.0.0.1 and no network. The first builds and saves the cache, the second restores it. Throws ValidationError.
+ * Connects as the app would, from the §5.3 variables: PDO for a database, phpredis for Redis (a raw PING when
+ * the extension is missing). Prints "ok" or why it failed; never prints a variable's value.
+ */
+const SMOKE_PHP = `
+$e = fn (string $k): string => (string) getenv($k);
+try {
+    if ($e('DB_CONNECTION') !== '') {
+        $c = $e('DB_CONNECTION');
+        $pdo = new PDO("{$c}:host={$e('DB_HOST')};port={$e('DB_PORT')};dbname={$e('DB_DATABASE')}", $e('DB_USERNAME'), $e('DB_PASSWORD'), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $pdo->exec('CREATE TABLE arco_smoke (id integer)');
+        $pdo->exec('INSERT INTO arco_smoke (id) VALUES (1)');
+        if ((int) $pdo->query('SELECT count(*) FROM arco_smoke')->fetchColumn() !== 1) throw new RuntimeException('the inserted row was not read back');
+    } elseif ($e('REDIS_HOST') !== '') {
+        if ($e('REDIS_CLIENT') === 'phpredis') {
+            $r = new Redis();
+            $r->connect($e('REDIS_HOST'), (int) $e('REDIS_PORT'), 5.0);
+            $r->set('arco_smoke', '1');
+            if ($r->get('arco_smoke') !== '1') throw new RuntimeException('the value was not read back');
+        } else {
+            $s = fsockopen($e('REDIS_HOST'), (int) $e('REDIS_PORT'), $errno, $errstr, 5.0);
+            if ($s === false) throw new RuntimeException("connect failed: {$errstr}");
+            fwrite($s, "PING\\r\\n");
+            if (fgets($s) !== "+PONG\\r\\n") throw new RuntimeException('no PONG');
+        }
+    } else {
+        throw new RuntimeException('no service variables');
+    }
+    echo "ok\\n";
+} catch (Throwable $t) {
+    fwrite(STDERR, get_class($t) . ': ' . $t->getMessage() . "\\n");
+    exit(1);
+}
+`;
+
+const SMOKE_SERVICES: readonly ServiceName[] = ['mysql', 'pgsql', 'redis'];
+
+async function entries(dir: string): Promise<string[]> {
+  try { return await readdir(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []; throw e; }
+}
+
+/**
+ * Starts each test service once (spec §8), connects to it from PHP as the build user with the §5.3 variables, then
+ * drops its databases, stops it and removes its data, and checks that no process of the service user and no data
+ * are left. Returns each start time (cold start plus database creation). Throws ValidationError, also when a service
+ * user is missing: the wipe could not kill its processes and the survivor check would pass silently.
+ */
+export async function smokeServices(o: {
+  manager: ServicesManager; identity: Identity; paths: Paths; log: (m: string) => void; servicePaths?: ServicePaths;
+  /** Default /etc/passwd. */
+  passwdPath?: string;
+}): Promise<Record<ServiceName, number>> {
+  const { manager, identity, paths } = o;
+  const sp = o.servicePaths ?? defaultServicePaths();
+  const out = {} as Record<ServiceName, number>;
+  try {
+    const { uids, missing } = serviceUserIds(await readFile(o.passwdPath ?? '/etc/passwd', 'utf8').catch(() => ''));
+    const missingHere = SMOKE_SERVICES.map((s) => SERVICE_USERS[s]).filter((n) => missing.includes(n));
+    if (missingHere.length > 0) throw new ValidationError(`services: system user missing from the image: ${missingHere.join(', ')}`);
+    for (const s of SMOKE_SERVICES) {
+      const label = SERVICE_LABELS[s];
+      const password = generatePassword();
+      const mask = (t: string) => t.split(password).join('***');
+      let ms: number;
+      try {
+        ms = (await manager.start([s], password, AbortSignal.timeout(120_000)))[s];
+      } catch (e) {
+        throw new ValidationError(`services: ${label} did not start: ${mask((e as Error).message)}`);
+      }
+      const redisClient = s === 'redis' && !(await manager.phpRedis(buildEnv(paths, {}), identity)) ? 'predis' : 'phpredis';
+      const output: string[] = [];
+      let exitCode: number;
+      try {
+        ({ exitCode } = await runCommand('php', ['-r', SMOKE_PHP], {
+          cwd: '/', env: buildEnv(paths, serviceVariables([s], null, password, redisClient)),
+          onStdoutLine: (l) => output.push(l), onStderrLine: (l) => output.push(l), signal: AbortSignal.timeout(30_000),
+          uid: identity.uid, gid: identity.gid,
+        }));
+      } catch (e) {
+        throw new ValidationError(`services: cannot run PHP as uid ${identity.uid}: ${mask((e as Error).message)}`);
+      }
+      if (exitCode !== 0 || output.at(-1) !== 'ok') {
+        throw new ValidationError(`services: PHP could not use ${label} (exit ${exitCode}): ${mask(output.join(' ')).slice(0, 1000)}`);
+      }
+      try {
+        await manager.dropDatabases();
+        await manager.stopAll();
+        await manager.removeData();
+      } catch (e) {
+        throw new ValidationError(`services: cleaning up ${label} failed: ${mask((e as Error).message)}`);
+      }
+      const alive = await processesOf(uids[s]!);
+      if (alive.length > 0) throw new ValidationError(`services: ${label} processes survived the stop: ${alive.join(', ')}`);
+      const left = [...(await entries(sp.dataDir)), ...(await entries(sp.runDir))];
+      if (left.length > 0) throw new ValidationError(`services: ${label} left data behind: ${left.join(', ')}`);
+      out[s] = ms;
+      o.log(`${s} ready in ${ms} ms`);
+    }
+    return out;
+  } finally {
+    // After a failure: nothing may run or stay (the snapshot is taken after /validate).
+    await manager.stopAll().catch(() => {});
+    await manager.removeData().catch(() => {});
+  }
+}
+
+/**
+ * The image's smoke test (spec §9.3): in the image, each test service is started once (smokeServices); then two
+ * canned jobs run through the real pipeline against an in-process Cloud on 127.0.0.1 and no network. The first runs
+ * a test phase, builds and saves the cache, the second restores it. Throws ValidationError.
  */
 export async function runValidation(o: { paths: Paths; identity: Identity | null; fixtureDir: string }): Promise<void> {
   const { paths, identity } = o;
@@ -229,10 +351,20 @@ export async function runValidation(o: { paths: Paths; identity: Identity | null
     if (!pass.result.idleReported) return fail('idle was not reported');
   };
 
+  // The test services, each started once with nothing left behind; only in the image (as root, with the users).
+  if (identity !== null) {
+    try {
+      await smokeServices({ manager: createServicesManager(defaultServicePaths()), identity, paths, log: (m) => console.log(`[validate] ${m}`) });
+    } catch (e) {
+      if (e instanceof ValidationError) throw e;
+      throw new ValidationError(`services: ${(e as Error).message}`);
+    }
+  }
+
   try {
     let first: Pass;
     try {
-      first = await cannedJob({ paths, identity, bundle, knownCache: null });
+      first = await cannedJob({ paths, identity, bundle, knownCache: null, withTests: true });
     } catch (e) {
       if (e instanceof ValidationError) throw e;
       const msg = (e as Error).message;
@@ -240,6 +372,9 @@ export async function runValidation(o: { paths: Paths; identity: Identity | null
     }
     clouds.push(first.cloud);
     check(first, 'first job');
+    const tests = sentLogs(first.cloud).events.find((ev) => ev.key === 'build.tests' && ev.status === 'done');
+    if (!tests) throw new ValidationError(`first job: the test phase did not pass\n${tail([...cloudLines(first.cloud), ...first.logs])}`);
+    console.log(`[validate] test phase passed: ${String(tests.params?.passed)} tests in ${String(tests.params?.duration_s)} s`);
 
     if (identity) {
       const alive = await processesOf(identity.uid);

@@ -262,6 +262,45 @@ describe('wipe', () => {
     await writeFile(join(f.root, 'proc/4242/status'), 'Name:\tx\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n');
     await expect(wipe(f.paths, '', { ...f.opts, uid: 1000, kill: () => undefined, killTimeoutMs: 150 })).rejects.toThrow(WipeError);
   });
+
+  it('kills service-user processes and removes the services data dir', async () => {
+    const f = await fixture();
+    const dataDir = join(f.root, 'svc-data'), runDir = join(f.root, 'svc-run');
+    await put(join(dataDir, 'mysql/ibdata1'));
+    await put(join(runDir, 'mysql/mysqld.sock'));
+    await symlink(f.outside, join(dataDir, 'planted'));
+    await mkdir(join(f.root, 'proc/27'));
+    await writeFile(join(f.root, 'proc/27/status'), 'Name:\tmysqld\nState:\tS (sleeping)\nUid:\t27\t27\t27\t27\n');
+    const killed: Array<[number, string]> = [];
+    await wipe(f.paths, '', {
+      ...f.opts, services: { uids: [27], dataDir, runDir },
+      kill: (pid, sig) => { killed.push([pid, sig]); rmSync(join(f.root, 'proc', String(pid)), { recursive: true }); },
+    });
+    expect(killed).toContainEqual([27, 'SIGKILL']);
+    expect(existsSync(join(dataDir, 'mysql/ibdata1'))).toBe(false);
+    expect(await readdir(dataDir)).toEqual([]);
+    expect(await readdir(runDir)).toEqual([]);
+    expect(existsSync(join(f.outside, 'precious'))).toBe(true);
+  });
+
+  it('a service process that survives makes the wipe fail', async () => {
+    const f = await fixture();
+    await mkdir(join(f.root, 'proc/27'));
+    await writeFile(join(f.root, 'proc/27/status'), 'Name:\tmysqld\nState:\tS (sleeping)\nUid:\t27\t27\t27\t27\n');
+    await expect(wipe(f.paths, '', {
+      ...f.opts, services: { uids: [27], dataDir: join(f.root, 'd'), runDir: join(f.root, 'r') }, kill: () => undefined, killTimeoutMs: 150,
+    })).rejects.toBeInstanceOf(WipeError);
+  });
+
+  it('services data that cannot be emptied makes the wipe fail', async () => {
+    const f = await fixture();
+    const dataDir = join(f.root, 'svc-data');
+    await put(join(dataDir, 'x'));
+    // dataDir is a regular file here, so it can neither be listed nor emptied
+    await rm(dataDir, { recursive: true });
+    await writeFile(dataDir, 'not a dir');
+    await expect(wipe(f.paths, '', { ...f.opts, services: { uids: [], dataDir, runDir: join(f.root, 'r') } })).rejects.toBeInstanceOf(WipeError);
+  });
 });
 
 function lstatExists(p: string): boolean {

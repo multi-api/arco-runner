@@ -1,0 +1,15 @@
+#!/usr/bin/env php
+<?php
+// Stand-in for Laravel's artisan: `test …` re-executes vendor/bin/phpunit with the same arguments.
+$args = array_slice($argv, 1);
+if (($args[0] ?? '') !== 'test') {
+    fwrite(STDERR, "unknown command\n");
+    exit(1);
+}
+$phpunit = __DIR__.'/vendor/bin/phpunit';
+if (! is_file($phpunit)) {
+    fwrite(STDERR, "vendor/bin/phpunit not found: run composer install\n");
+    exit(1);
+}
+$proc = proc_open([PHP_BINARY, $phpunit, ...array_slice($args, 1)], [STDIN, STDOUT, STDERR], $pipes, __DIR__);
+exit($proc === false ? 1 : proc_close($proc));

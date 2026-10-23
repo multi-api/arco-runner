@@ -5,14 +5,15 @@
 //
 // Like Cloud, the fake Cloud calls the runner's /suspend hook before it answers /idle (R22); every MicroVM
 // scenario that reports idle checks that hook answered 200 (a 503 makes Cloud terminate the VM).
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Agent as HttpAgent, request } from 'node:http';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, test } from 'vitest';
 import {
   API_BASE, CACHE_KEY, CONTROL, HOOKS, INTEGRATION_DIR, compose, commit, execRunner, finishBody, healthz, hook, http,
-  isCachePut, isClaim, isFinish, isIdleCall, isStart, leakedSecrets, logLines, newJob, nodeInRunner, recorded, seedCache, statusesOf,
-  steps, untilDone, waitFor, type Job,
+  isCachePut, isClaim, isCredentials, isFinish, isIdleCall, isStart, leakedSecrets, logLines, newJob, nodeInRunner, recorded, seedCache,
+  statusesOf, steps, testsJob, untilDone, waitFor, type Job, type Recorded,
 } from './helpers.js';
 
 const BOUNDARY = 'arn:aws:iam::123456789012:policy/ArcoBoundary';
@@ -26,6 +27,137 @@ const postJob = async (job: Job) => {
   const r = await http('POST', `${CONTROL}/job`, job.payload);
   expect(r.status).toBe(202);
 };
+
+// ---------------------------------------------------------------- the test files (run by the fixture's fake PHPUnit)
+// Each file returns array<string, Closure>: a closure that throws fails.
+
+/** A round trip through PDO with the `<prefix>HOST`, `PORT`, `DATABASE`, `USERNAME`, `PASSWORD` variables. */
+const pdoTest = (driver: 'mysql' | 'pgsql', prefix: string) => `<?php
+return [
+    '${driver} round trip through ${prefix}*' => function (): void {
+        $e = fn (string $k): string => (string) getenv('${prefix}'.$k);
+        if ('${prefix}' === 'DB_' && getenv('DB_CONNECTION') !== '${driver}') {
+            throw new RuntimeException('DB_CONNECTION is '.getenv('DB_CONNECTION'));
+        }
+        $pdo = new PDO(sprintf('${driver}:host=%s;port=%s;dbname=%s', $e('HOST'), $e('PORT'), $e('DATABASE')), $e('USERNAME'), $e('PASSWORD'),
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $pdo->exec('CREATE TABLE arco_${driver} (v VARCHAR(20))');
+        $pdo->exec("INSERT INTO arco_${driver} VALUES ('round trip')");
+        if ($pdo->query('SELECT v FROM arco_${driver}')->fetchColumn() !== 'round trip') {
+            throw new RuntimeException('${driver}: the row did not come back');
+        }
+    },
+];
+`;
+
+const SQLITE_TEST = `<?php
+return [
+    'sqlite round trip' => function (): void {
+        if (getenv('DB_CONNECTION') !== 'sqlite') {
+            throw new RuntimeException('DB_CONNECTION is not sqlite');
+        }
+        $pdo = new PDO('sqlite:'.getenv('DB_DATABASE'), null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $pdo->exec('CREATE TABLE t (v TEXT)');
+        $pdo->exec("INSERT INTO t VALUES ('round trip')");
+        if ($pdo->query('SELECT v FROM t')->fetchColumn() !== 'round trip') {
+            throw new RuntimeException('the row did not come back');
+        }
+    },
+    'runs in the test environment' => function (): void {
+        if (getenv('APP_ENV') !== 'testing' || ! str_starts_with((string) getenv('APP_KEY'), 'base64:')) {
+            throw new RuntimeException('not the test environment');
+        }
+    },
+];
+`;
+
+const FAILING_TEST = `<?php
+return [
+    'passes' => fn () => null,
+    'fails on purpose' => function (): void {
+        throw new RuntimeException('the assertion failed');
+    },
+];
+`;
+
+const ENV_TEST = `<?php
+return [
+    'dumps its environment' => function (): void {
+        foreach (getenv() as $k => $v) {
+            echo 'ENV ', $k, '=', str_replace("\n", '\\n', $v), "\n";
+        }
+    },
+];
+`;
+
+const REDIS_TEST = `<?php
+return [
+    'redis round trip' => function (): void {
+        if (getenv('REDIS_CLIENT') !== 'phpredis') {
+            throw new RuntimeException('REDIS_CLIENT is '.getenv('REDIS_CLIENT'));
+        }
+        $redis = new Redis();
+        $redis->connect(getenv('REDIS_HOST'), (int) getenv('REDIS_PORT'), 5.0);
+        $redis->set('arco', 'round trip');
+        if ($redis->get('arco') !== 'round trip') {
+            throw new RuntimeException('the value did not come back');
+        }
+    },
+];
+`;
+
+const SLEEP_TEST = `<?php
+return [
+    'sleeps' => function (): void {
+        sleep(60);
+    },
+];
+`;
+
+const PGSQL_SLEEP_TEST = `<?php
+return [
+    'sleeps in PostgreSQL' => function (): void {
+        $pdo = new PDO(sprintf('pgsql:host=%s;port=%s;dbname=%s', getenv('DB_HOST'), getenv('DB_PORT'), getenv('DB_DATABASE')),
+            getenv('DB_USERNAME'), getenv('DB_PASSWORD'), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        echo "sleeping in PostgreSQL\n";
+        $pdo->query('SELECT pg_sleep(60)');
+    },
+];
+`;
+
+/** The test files committed so far (the fixture's ExampleTest first): each commitTests replaces them all. */
+let testFiles = ['ExampleTest'];
+
+/** Commits `files` as app/tests/<name>.php, deleting the test files of earlier commits; returns the sha. */
+async function commitTests(files: Record<string, string>): Promise<string> {
+  const change: Record<string, string | null> = Object.fromEntries(testFiles.map((n) => [`app/tests/${n}.php`, null]));
+  for (const [name, source] of Object.entries(files)) change[`app/tests/${name}.php`] = source;
+  testFiles = Object.keys(files);
+  return commit(change, `tests: ${testFiles.join(', ')}`);
+}
+
+/** The events of a /logs request (none for any other request). */
+const logsEvents = (r: Recorded): Record<string, unknown>[] =>
+  r.pathname.endsWith('/logs') ? (JSON.parse(r.body) as { events: Record<string, unknown>[] }).events : [];
+
+/** Runs a job whose tests use `services`, and checks the services started and the tests and the deploy passed. */
+async function expectServicesPass(job: Job, services: string[]): Promise<Recorded[]> {
+  await postJob(job);
+  const done = await untilDone(job);
+  const { cloud } = done;
+  expectSuspended(done);
+  expect(leakedSecrets(job, cloud)).toEqual([]);
+
+  expect(statusesOf(cloud, 'build.test_services')).toEqual(['started', 'done']);
+  const startMs = steps(cloud).find((s) => s.key === 'build.test_services' && s.status === 'done')?.params?.start_ms as Record<string, number>;
+  expect(Object.keys(startMs).sort()).toEqual([...services].sort());
+  for (const s of services) expect(startMs[s]).toBeGreaterThanOrEqual(0);
+  expect(statusesOf(cloud, 'build.tests')).toEqual(['started', 'done']);
+  expect(steps(cloud).find((s) => s.key === 'build.tests' && s.status === 'done')?.params).toMatchObject({ report: 'junit', failed: 0 });
+  expect(finishBody(cloud)).toMatchObject({ result: 'succeeded' });
+  expect(cloud.filter(isCredentials)).toHaveLength(1);
+  return cloud;
+}
 
 let sha1 = '';
 let sha3 = '';
@@ -370,6 +502,154 @@ describe('runner image against a fake Cloud', () => {
       agent.destroy();
       await compose(['unpause', 'runner']);
     }
+    expect(await healthz()).toBe('idle');
+  });
+
+  // ---------------------------------------------------------------- tests before deploy (the fake PHPUnit)
+
+  test('tests: SQLite suite passes, then build and deploy', async () => {
+    const sha = await commitTests({ SqliteTest: SQLITE_TEST });
+    const job = await testsJob('tests-sqlite', sha, { env: { DB_CONNECTION: 'sqlite', DB_DATABASE: ':memory:' } });
+    await postJob(job);
+    const done = await untilDone(job);
+    const { cloud } = done;
+    expectSuspended(done);
+    expect(leakedSecrets(job, cloud)).toEqual([]);
+
+    expect(statusesOf(cloud, 'build.tests')).toEqual(['started', 'done']);
+    expect(steps(cloud).find((s) => s.key === 'build.tests' && s.status === 'done')?.params).toMatchObject({ report: 'junit', passed: 2, failed: 0 });
+    // Credentials are issued once, after the tests and the build commands passed.
+    const credentials = cloud.flatMap((r, i) => (isCredentials(r) ? [i] : []));
+    expect(credentials).toHaveLength(1);
+    const lastCommand = cloud.reduce((last, r, i) => (logsEvents(r).some((e) => String(e.key).startsWith('build.command.')) ? i : last), -1);
+    expect(lastCommand).toBeGreaterThan(-1);
+    expect(credentials[0]).toBeGreaterThan(lastCommand);
+    expect(logLines(cloud)).toContain('fake-arco deploy invoked');
+    expect(finishBody(cloud)).toMatchObject({ result: 'succeeded', error_code: null });
+  });
+
+  test('tests: failing suite stops the deploy', async () => {
+    const sha = await commitTests({ FailingTest: FAILING_TEST });
+    const job = await testsJob('tests-fail', sha);
+    await postJob(job);
+    const done = await untilDone(job);
+    const { cloud } = done;
+    expectSuspended(done);
+    expect(leakedSecrets(job, cloud)).toEqual([]);
+
+    expect(finishBody(cloud)).toMatchObject({ result: 'failed', error_code: 'build.tests_failed', error_message: '1 test failed' });
+    const warning = steps(cloud).find((s) => s.key === 'build.tests' && s.status === 'warning');
+    expect(warning?.params).toMatchObject({ report: 'junit', passed: 1, failed: 1 });
+    const failures = warning?.params?.failures as { class: string; name: string; message: string }[];
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.name).toBe('fails on purpose');
+    expect(failures[0]!.message).toContain('the assertion failed');
+    expect(statusesOf(cloud, 'build.command.1')).toEqual([]);
+    expect(cloud.filter(isCredentials)).toEqual([]);
+    expect(logLines(cloud)).not.toContain('fake-arco deploy invoked');
+    expect(cloud.filter(isCachePut)).toEqual([]);
+  });
+
+  test('tests: env has no build secret, AWS, token or clone token', async () => {
+    const sha = await commitTests({ EnvTest: ENV_TEST });
+    const testSecret = `test-secret-${randomBytes(8).toString('hex')}`;
+    const job = await testsJob('tests-env', sha, { env: { ARCO_TEST_VARIABLE: 'from-tests-env', TEST_SECRET: testSecret }, mask: [testSecret] });
+    await postJob(job);
+    const done = await untilDone(job);
+    const { cloud } = done;
+    expectSuspended(done);
+    expect(leakedSecrets(job, cloud)).toEqual([]);
+    expect(finishBody(cloud)).toMatchObject({ result: 'succeeded' });
+
+    const env = logLines(cloud).filter((l) => l.startsWith('ENV ')).map((l) => l.slice('ENV '.length));
+    expect(env).toContain('APP_ENV=testing');
+    expect(env).toContain('ARCO_TEST_VARIABLE=from-tests-env');
+    expect(env).toContain('CI=true');
+    expect(env.filter((l) => l.startsWith('APP_SECRET=') || l.startsWith('MULTI_LINE_SECRET='))).toEqual([]);
+    expect(env.filter((l) => l.startsWith('AWS_') || l.startsWith('ARCO_RUNNER_') && l !== 'ARCO_RUNNER=1')).toEqual([]);
+    expect(env.filter((l) => /^(GIT_|ARCO_PERMISSIONS)/.test(l))).toEqual([]);
+    // The only masked values are the ephemeral APP_KEY and the masked test variable: no token, nonce or ticket.
+    expect(env.filter((l) => l.includes('***')).sort()).toEqual(['APP_KEY=***', 'TEST_SECRET=***']);
+  });
+
+  test('tests: MySQL', async () => {
+    const sha = await commitTests({ MysqlTest: pdoTest('mysql', 'DB_') });
+    const job = await testsJob('tests-mysql', sha, { services: ['mysql'] });
+    await expectServicesPass(job, ['mysql']);
+  });
+
+  test('tests: PostgreSQL', async () => {
+    const sha = await commitTests({ PgsqlTest: pdoTest('pgsql', 'DB_') });
+    const job = await testsJob('tests-pgsql', sha, { services: ['pgsql'] });
+    await expectServicesPass(job, ['pgsql']);
+  });
+
+  test('tests: Redis', async () => {
+    const sha = await commitTests({ RedisTest: REDIS_TEST });
+    const job = await testsJob('tests-redis', sha, { services: ['redis'] });
+    await expectServicesPass(job, ['redis']);
+  });
+
+  test('tests: both databases, pgsql primary', async () => {
+    const sha = await commitTests({ PgsqlTest: pdoTest('pgsql', 'DB_'), MysqlTest: pdoTest('mysql', 'DB_MYSQL_') });
+    const job = await testsJob('tests-both', sha, { services: ['mysql', 'pgsql'], primary_database: 'pgsql' });
+    await expectServicesPass(job, ['mysql', 'pgsql']);
+  });
+
+  test('tests: --parallel databases are dropped', async () => {
+    const sha = await commitTests({ MysqlTest: pdoTest('mysql', 'DB_') });
+    const job = await testsJob('tests-parallel', sha, { command: 'php artisan test --parallel', services: ['mysql'] });
+    const cloud = await expectServicesPass(job, ['mysql']);
+    expect(logLines(cloud)).toContain('Dropped test databases: testing, testing_test_1, testing_test_2');
+  });
+
+  test('tests: timeout', async () => {
+    const sha = await commitTests({ SleepTest: SLEEP_TEST });
+    const job = await testsJob('tests-timeout', sha, { timeout_seconds: 3 });
+    const t0 = Date.now();
+    await postJob(job);
+    await waitFor('finish', async () => (await recorded(job)).cloud.some(isFinish), 45_000);
+    expect(Date.now() - t0).toBeLessThan(45_000);
+    const done = await untilDone(job);
+    const { cloud } = done;
+    expectSuspended(done);
+    expect(leakedSecrets(job, cloud)).toEqual([]);
+
+    expect(finishBody(cloud)).toMatchObject({
+      result: 'failed', error_code: 'build.tests_timeout', error_message: 'The tests did not finish within 3 seconds',
+    });
+    expect(statusesOf(cloud, 'build.tests')).toEqual(['started', 'warning']);
+    expect(cloud.filter(isCredentials)).toEqual([]);
+  });
+
+  test('tests: cancel during tests', async () => {
+    const sha = await commitTests({ PgsqlSleepTest: PGSQL_SLEEP_TEST });
+    const job = await testsJob('tests-cancel', sha, { services: ['pgsql'] });
+    await postJob(job);
+    await waitFor('the test to sleep in PostgreSQL', async () => logLines((await recorded(job)).cloud).includes('sleeping in PostgreSQL'), 120_000);
+
+    const r = await http('POST', `${CONTROL}/cancel`, { deployment_id: job.doc.deployment_id });
+    expect(r).toEqual({ status: 202, json: { state: 'cancelling' } });
+    const done = await untilDone(job);
+    const { cloud } = done;
+    expectSuspended(done);
+    expect(leakedSecrets(job, cloud)).toEqual([]);
+    expect(finishBody(cloud)).toMatchObject({ result: 'failed', error_code: 'build.cancelled' });
+    expect(cloud.filter(isCredentials)).toEqual([]);
+    expect(await healthz()).toBe('idle');
+  });
+
+  test('tests: nothing remains after the wipe', async () => {
+    const data = await execRunner('ls -A /var/lib/arco-services');
+    expect(data.code, data.stderr).toBe(0);
+    expect(data.stdout).toBe('');
+    const procs = await execRunner('pgrep -u mysql,postgres,redis');
+    expect(procs.stdout).toBe('');
+    expect(procs.code).toBe(1); // pgrep: no process matched
+    const report = await execRunner('test ! -e /tmp/arco-tests');
+    expect(report.code, report.stderr).toBe(0);
+    expect((await hook('suspend')).status).toBe(200);
+    expect((await hook('resume')).status).toBe(200);
     expect(await healthz()).toBe('idle');
   });
 

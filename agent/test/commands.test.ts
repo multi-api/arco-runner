@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Batcher } from '@multiapi/arco-cloud-client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { isJsCommand, runBuildCommands } from '../src/job/commands.js';
+import { BuildFailure } from '../src/job/errors.js';
+import { isJsCommand, runBuildCommands, runShell } from '../src/job/commands.js';
 import { Steps } from '../src/job/steps.js';
 
 const dirs: string[] = [];
@@ -124,4 +125,30 @@ describe('runBuildCommands', () => {
       await import('node:child_process').then((c) => c.spawnSync('pkill', ['-f', 'sleep 300']));
     }
   }, 10_000);
+});
+
+describe('reusable runner', () => {
+  it('uses the key prefix and failure code it is given', async () => {
+    const { ctx, events } = await setup();
+    await expect(
+      runBuildCommands(['echo hi', 'exit 2'], { ...ctx, keyPrefix: 'build.test_setup', failureCode: 'build.test_setup_failed' }),
+    ).rejects.toMatchObject({ code: 'build.test_setup_failed' });
+    expect(events.map((e) => e.key)).toEqual(['build.test_setup.1', 'build.test_setup.1', 'build.test_setup.2']);
+  });
+
+  it('runShell kills at its own deadline with the given failure', async () => {
+    const { ctx } = await setup();
+    const timeoutFailure = new BuildFailure('build.tests_timeout', 'too slow');
+    const started = Date.now();
+    await expect(runShell('sleep 30', ctx, { deadlineMs: Date.now() + 1000, timeoutFailure })).rejects.toBe(timeoutFailure);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('runShell honours pipefail', async () => {
+    const { ctx } = await setup();
+    const failure = new BuildFailure('build.timeout', 'x');
+    const o = { deadlineMs: Date.now() + 30_000, timeoutFailure: failure };
+    expect(await runShell('false | cat', ctx, o)).toBe(0);
+    expect(await runShell('false | cat', ctx, { ...o, pipefail: true })).toBe(1);
+  });
 });

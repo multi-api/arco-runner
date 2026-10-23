@@ -2,16 +2,19 @@ import { constants } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, redactValue, startRun, type RunSession,
+  CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, isRunLost, redactValue, type RunSession,
 } from '@multiapi/arco-cloud-client';
 import { registerJobSecrets, shortMaskValues } from '../mask.js';
+import type { ServicesManager } from '../services/manager.js';
 import { buildEnv, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
+import { runTestPhase } from '../tests/run-tests.js';
 import { killUserProcesses } from '../wipe.js';
 import { CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
 import { runBuildCommands } from './commands.js';
 import type { JobDocument, TicketPayload } from './document.js';
 import { BuildFailure } from './errors.js';
 import { claim, reportIdle } from './runner-api.js';
+import { completeSession, issueCredentials, openSession, type OpenSession } from './session.js';
 import { checkout, revokeGithubToken, type CheckoutContext } from './source.js';
 import { Steps } from './steps.js';
 
@@ -46,6 +49,11 @@ export interface JobDeps {
    * Defaults to killUserProcesses(identity.uid) when an identity is set, else nothing.
    */
   killBuildProcesses?: () => Promise<void>;
+  /**
+   * The test services (MySQL, PostgreSQL, Redis) of this image. Absent: a job that selects services fails
+   * build.test_service_failed.
+   */
+  services?: () => ServicesManager;
   /** Tests and offline validation only (file:// clones), and http:// clones under ARCO_RUNNER_ALLOW_HTTP=1. */
   checkoutOptions?: Pick<CheckoutContext, 'extraGitArgs' | 'allowFileUrl' | 'allowHttpUrl'>;
   /** Agent diagnostics (stdout). Every message is redacted first. */
@@ -98,7 +106,8 @@ const repoKeep = (rootDir: string): string[] =>
 
 /**
  * One job, from ticket to idle, in the order of spec §6.3: claim, mask, start, source, cache restore (only when
- * the VM knows no cache), build commands, deploy + finish, cache save, wipe (MicroVM only), idle.
+ * the VM knows no cache), tests (deploy mode, when the job has them), build commands, deploy + finish, cache save,
+ * wipe (MicroVM only), idle.
  */
 export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult> {
   const now = deps.now ?? Date.now;
@@ -120,23 +129,26 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
   // 2. Mask: before anything is logged
   registerJobSecrets(redactor, doc);
 
-  // 3. Start
+  // 3. Start: credentials are deferred to right before arco deploy (spec §4.1)
   const api = new CloudApi(p.api_base, doc.runner_token, doc.deployment_id);
-  let session: RunSession | null = null;
+  let opened: OpenSession | null = null;
   if (deps.signal.aborted) {
     log(`deployment ${doc.deployment_id} cancelled before start`);
   } else {
     try {
-      session = await startRun({
-        api, nonce: doc.nonce, token: doc.runner_token, redactor, warn: log, batcher: { keepAliveMs: KEEP_ALIVE_MS },
+      opened = await openSession({
+        apiBase: p.api_base, token: doc.runner_token, deploymentId: doc.deployment_id, nonce: doc.nonce,
+        defer: doc.defer_credentials || doc.tests !== null, redactor, warn: log, keepAliveMs: KEEP_ALIVE_MS,
+        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
       });
     } catch (e) {
       log(`start failed for deployment ${doc.deployment_id}: ${messageOf(e)}`);
     }
   }
 
-  if (session) {
-    const s = session;
+  if (opened) {
+    const open = opened;
+    const s = open.session;
     const runSignal = AbortSignal.any([deps.signal, s.signal]);
     const steps = new Steps(s.batcher);
     let restoreTransientFailure = false;
@@ -146,8 +158,8 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
     let finishRejected = false;
     const finishWarn = (m: string) => { finishRejected = true; log(m); };
     try {
-      restoreTransientFailure = await build(doc, deps, s, steps, runSignal, deadlineMs);
-      const exitCode = await deploy(doc, deps, { ...s, warn: finishWarn }, runSignal, now);
+      restoreTransientFailure = await build(doc, deps, s, steps, redactor, runSignal, deadlineMs);
+      const exitCode = await deploy(doc, deps, p.api_base, redactor, open, finishWarn, runSignal, now, sleep);
       saveBy = now() + SAVE_TIME_BOX_MS;
       result.finished = !finishRejected;
       result.buildOk = exitCode === 0;
@@ -196,9 +208,10 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
   return result;
 }
 
-/** Steps 4-6: source, cache restore, build commands. Returns whether the restore failed transiently (R23). */
+/** Steps 4-6: source, cache restore, tests, build commands. Returns whether the restore failed transiently (R23). */
 async function build(
-  doc: JobDocument, deps: JobDeps, s: RunSession, steps: Steps, signal: AbortSignal, deadlineMs: number,
+  doc: JobDocument, deps: JobDeps, s: OpenSession['session'], steps: Steps, redactor: Redactor, signal: AbortSignal,
+  deadlineMs: number,
 ): Promise<boolean> {
   const { paths, identity } = deps;
   const env = buildEnv(paths, doc.env);
@@ -220,7 +233,7 @@ async function build(
     await revokeGithubToken(doc.source.clone_url, doc.source.auth_header, deps.fetchImpl);
   }
   if (hasSubmodules) steps.note('build.clone', 'Submodules are not checked out');
-  const projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
+  let projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
   steps.done('build.clone');
   cancelled();
 
@@ -246,6 +259,18 @@ async function build(
   }
   cancelled();
 
+  // Tests (spec §4): without build secrets or credentials; a failure ends the run before the build commands.
+  if (doc.mode === 'deploy' && doc.tests) {
+    await runTestPhase({
+      doc, tests: doc.tests, projectDir, paths, identity, batcher: s.batcher, steps, redactor, signal,
+      buildDeadlineMs: deadlineMs, services: deps.services, killBuildProcesses: buildProcessKiller(deps),
+      ...(deps.now ? { now: deps.now } : {}),
+    });
+    cancelled();
+    // The tests ran in the tree: resolve root_dir again rather than trust the earlier answer.
+    projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
+  }
+
   // 6. Build commands
   await runBuildCommands(doc.commands, {
     projectDir, env, identity, batcher: s.batcher, steps, deadlineMs, signal, timeoutSeconds: doc.timeout_seconds,
@@ -265,16 +290,15 @@ function arcoJobEnv(env: Record<string, string>): Record<string, string> {
 }
 
 /**
- * Step 7: arco checks, then the shared deploy phase, which sends finish; returns its exit code (0 = success).
- * Re-resolves root_dir: the build may have swapped it.
+ * Step 7: arco checks, the kill, the credentials, then the shared deploy phase, which sends finish; returns its exit
+ * code (0 = success). Re-resolves root_dir: the build may have swapped it.
  */
-async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: AbortSignal, now: () => number): Promise<number> {
+async function deploy(
+  doc: JobDocument, deps: JobDeps, apiBase: string, redactor: Redactor, open: OpenSession,
+  finishWarn: (m: string) => void, signal: AbortSignal, now: () => number, sleep: (ms: number) => Promise<void>,
+): Promise<number> {
   const projectDir = await resolveProjectDir(deps.paths.repo, doc.source.root_dir);
   if (!(await arcoInstalled(projectDir, deps.identity))) throw new BuildFailure('arco.not_installed', ARCO_MISSING);
-  const expiresAt = Date.parse(s.started.credentials.expiration);
-  if (!Number.isFinite(expiresAt) || expiresAt - now() < MIN_CREDENTIAL_TTL_MS) {
-    throw new BuildFailure('runner_credentials_expiring', 'The deploy credentials expire in less than 20 minutes; arco deploy was not started');
-  }
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
   // M3: no background build process may live next to arco (it could read /proc/<arco>/environ). A failure is an
   // internal error (finish failed runner.internal_error, then the usual wipe).
@@ -286,6 +310,35 @@ async function deploy(doc: JobDocument, deps: JobDeps, s: RunSession, signal: Ab
       throw new Error(`build processes survived before arco deploy: ${messageOf(e)}`);
     }
   }
+  // The build's logs reach Cloud first; a run Cloud ended meanwhile is noticed before any credentials are issued.
+  await open.session.batcher.flush();
+  if (open.session.abortMessage() !== null) throw new Error(open.session.abortMessage()!);
+  // Credentials only now: the customer's role is assumed after the build has passed, right before arco deploy.
+  let issued = open.issued;
+  if (issued) {
+    // An older Cloud returned them at start: they may have aged during the build.
+    const expiresAt = Date.parse(issued.credentials.expiration);
+    if (!Number.isFinite(expiresAt) || expiresAt - now() < MIN_CREDENTIAL_TTL_MS) {
+      throw new BuildFailure('runner_credentials_expiring', 'The deploy credentials expire in less than 20 minutes; arco deploy was not started');
+    }
+  } else {
+    try {
+      issued = await issueCredentials({
+        apiBase, token: doc.runner_token, deploymentId: doc.deployment_id, sleep, signal,
+        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+      });
+    } catch (e) {
+      if (isRunLost(e)) {
+        // Cloud ended the run: runJob logs the abort message and sends no finish.
+        open.markRunLost(e);
+        throw e;
+      }
+      throw new Error(`Could not obtain the deploy credentials: ${messageOf(e)}`);
+    }
+  }
+  // A cancel during the credentials call (its retries included) never starts arco.
+  if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
+  const s: RunSession = { ...completeSession(open, issued, redactor), warn: finishWarn };
   // A cancel stops arco like a run Cloud ended; the RunAbortedError it causes is reported as build.cancelled.
   const view: RunSession = { ...s, signal, abortMessage: () => s.abortMessage() ?? (deps.signal.aborted ? 'Cancelled' : null) };
   return await deployAndFinish(view, {

@@ -68,6 +68,8 @@ interface RunOptions {
   env?: Record<string, string>;
   mask?: string[];
   cloud?: Partial<FakeCloudOptions>;
+  /** Extra job document fields (e.g. defer_credentials). */
+  job?: Record<string, unknown>;
   deps?: Partial<JobDeps>;
   signal?: AbortSignal;
 }
@@ -86,6 +88,7 @@ async function run(w: World, o: RunOptions = {}) {
       key: 'env-1',
     },
     timeout_seconds: 600,
+    ...o.job,
   };
   const ticket: TicketPayload = { ticket: TICKET, api_base: cloud.url, deployment_id: 'dep_1' };
   const sleeps: number[] = [];
@@ -271,10 +274,20 @@ describe('runJob: errors and refusals', () => {
   it('refuses arco deploy when the credentials expire in less than 20 minutes', async () => {
     const w = await world();
     const calls = join(w.out, 'arco-calls.txt');
-    const r = await run(w, { env: { FAKE_ARCO_CALLS: calls }, cloud: { credentialsTtlMs: 10 * 60_000 } });
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls }, job: { defer_credentials: true }, cloud: { credentialsTtlMs: 10 * 60_000, ignoreDefer: true },
+    });
     expect(r.finishes).toHaveLength(1);
     expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'runner_credentials_expiring' });
+    expect(r.cloud.calls('/credentials')).toHaveLength(0);
     expect(existsSync(calls)).toBe(false);
+  }, 30_000);
+
+  it('does not apply the 20-minute guard to credentials from /credentials', async () => {
+    const w = await world();
+    const r = await run(w, { job: { defer_credentials: true }, cloud: { credentialsTtlMs: 5 * 60_000 } });
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+    expect(r.result.buildOk).toBe(true);
   }, 30_000);
 
   it('fails with build.command_failed and saves no cache when a command fails', async () => {
@@ -567,5 +580,150 @@ describe('runJob: failure finish redaction', () => {
       error_message: '`exit 3` exited with code 3', arco_version: null,
     }]);
     expect(r.result).toMatchObject({ finished: true, idleReported: true });
+  }, 30_000);
+});
+
+describe('runJob: deferred credentials', () => {
+  it('asks for credentials after the build commands and the kill, right before arco deploy', async () => {
+    const w = await world();
+    let killedAt = 0;
+    const r = await run(w, {
+      job: { defer_credentials: true },
+      deps: { killBuildProcesses: async () => { if (killedAt === 0) killedAt = Date.now(); } },
+    });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true });
+    const creds = r.order.indexOf('credentials');
+    expect(r.order.slice(0, 2)).toEqual(['claim', 'start']);
+    expect(new Set(r.order.slice(2, creds))).toEqual(new Set(['logs']));
+    expect(creds).toBeGreaterThan(2);
+    expect(r.order.filter((x) => x === 'credentials')).toHaveLength(1);
+    expect(r.order.at(-2)).toBe('finish');
+    expect(r.order.at(-1)).toBe('idle');
+    expect(new Set(r.order.slice(creds + 1, -2))).toEqual(new Set(['logs']));
+    expect(r.order.slice(creds + 1, -2).length).toBeGreaterThan(0);
+    expect(killedAt).toBeGreaterThan(0);
+    expect(killedAt).toBeLessThanOrEqual(r.cloud.calls('/credentials')[0]!.at);
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: true, idleReported: true });
+  }, 30_000);
+
+  it('uses the deferred path when the job has tests', async () => {
+    const w = await world();
+    const r = await run(w, {
+      job: { tests: { command: 'true', services: [] } },
+    });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true });
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+  }, 30_000);
+
+  it('never asks for credentials when a build command fails', async () => {
+    const w = await world();
+    const r = await run(w, { job: { defer_credentials: true }, commands: ['exit 3'] });
+    expect(r.cloud.calls('/credentials')).toHaveLength(0);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'build.command_failed' });
+  }, 30_000);
+
+  it('ends quietly when credentials answer 409 finished', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls }, job: { defer_credentials: true },
+      cloud: { credentialsAnswer: { status: 409, body: { error: 'finished' } } },
+    });
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+    expect(r.cloud.calls('/finish')).toHaveLength(0);
+    expect(existsSync(calls)).toBe(false);
+    expect(r.wipes).toHaveLength(1);
+    expect(r.cloud.calls('/idle')).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: false, buildOk: false, idleReported: true });
+    expect(r.logs.some((l) => l.startsWith('Arco Cloud ended this run'))).toBe(true);
+  }, 30_000);
+
+  it('finishes runner.internal_error when credentials cannot be obtained', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls }, job: { defer_credentials: true },
+      cloud: { credentialsAnswer: { status: 403, body: { error: 'forbidden' } } },
+    });
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+    expect(existsSync(calls)).toBe(false);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'runner.internal_error' });
+    expect(r.finishes[0].error_message).toMatch(/^Could not obtain the deploy credentials/);
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+
+  it('finishes build.cancelled when cancelled during the credentials retry, and never runs arco', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const ac = new AbortController();
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls }, job: { defer_credentials: true }, signal: ac.signal,
+      cloud: { credentialsAnswer: { status: 503 } },
+      // The retry sleep never ends by itself: only the abort can cut it short.
+      deps: { sleep: async (ms) => { if (ms === 1000) { ac.abort(); await new Promise<void>(() => {}); } } },
+    });
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+    expect(existsSync(calls)).toBe(false);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'build.cancelled' });
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+});
+
+describe('runJob: tests before deploy', () => {
+  const eventsOf = (r: Awaited<ReturnType<typeof run>>) =>
+    r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).events as { key: string; status: string }[]);
+
+  it('runs the test phase between the cache restore and the build commands', async () => {
+    const w = await world();
+    const r = await run(w, { job: { tests: { command: 'echo testing', setup_commands: ['echo setup'], services: [] } } });
+    expect(r.result.buildOk).toBe(true);
+    const keys = [...new Set(eventsOf(r).map((e) => e.key))];
+    const at = (k: string) => keys.indexOf(k);
+    expect(keys.slice(0, 2)).toEqual(['build.clone', 'build.cache_restore']);
+    expect(at('build.test_setup.1')).toBe(2);
+    expect(at('build.tests')).toBeGreaterThan(at('build.test_setup.1'));
+    expect(at('build.command.1')).toBeGreaterThan(at('build.tests'));
+    expect(r.cloud.calls('/credentials')).toHaveLength(1);
+  }, 30_000);
+
+  it('a failed test run issues no credentials, deploys nothing and saves no cache', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const built = join(w.out, 'built');
+    const r = await run(w, {
+      commands: [`touch "${built}"`], env: { FAKE_ARCO_CALLS: calls },
+      job: { tests: { command: 'exit 1', services: [] } },
+    });
+    expect(r.cloud.calls('/credentials')).toHaveLength(0);
+    expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+    expect(existsSync(calls)).toBe(false);
+    expect(existsSync(built)).toBe(false);
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'build.tests_failed',
+      error_message: 'The test command exited with code 1', arco_version: null,
+    }]);
+    expect(r.wipes).toHaveLength(1);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+
+  it('skips the test phase in inventory mode', async () => {
+    const w = await world();
+    const r = await run(w, { job: { mode: 'inventory', tests: { command: 'exit 1', services: [] } } });
+    expect(eventsOf(r).some((e) => e.key.startsWith('build.test'))).toBe(false);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).not.toMatchObject({ error_code: 'build.tests_failed' });
+  }, 30_000);
+
+  it('fails build.test_service_failed when services are selected but the runner has none', async () => {
+    const w = await world();
+    const r = await run(w, { job: { tests: { command: 'true', services: ['redis'] } } });
+    expect(r.finishes[0]).toMatchObject({
+      result: 'failed', error_code: 'build.test_service_failed', error_message: 'Test services are not available on this runner',
+    });
   }, 30_000);
 });

@@ -1,9 +1,10 @@
 {
     "name": "arco-runner/fixture-app",
     "description": "Offline app built by the runner image's /validate",
-    "require-dev": { "multiapi/arco": "*" },
+    "require-dev": { "multiapi/arco": "*", "arco-runner/fake-phpunit": "*" },
     "repositories": [
         { "type": "path", "url": "../packages/fake-arco", "options": { "symlink": false } },
+        { "type": "path", "url": "../packages/fake-phpunit", "options": { "symlink": false } },
         { "packagist.org": false }
     ],
     "minimum-stability": "stable",

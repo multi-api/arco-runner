@@ -26,45 +26,59 @@ export interface BuildCommandsContext {
   signal: AbortSignal;
   /** Only used for the timeout message; defaults to the time left when the commands started. */
   timeoutSeconds?: number;
+  /** Step key prefix; defaults to `build.command`. */
+  keyPrefix?: string;
+  /** Failure code for a non-zero exit; defaults to `build.command_failed`. */
+  failureCode?: string;
+}
+
+export interface ShellOptions {
+  deadlineMs: number;
+  timeoutFailure: BuildFailure;
+  pipefail?: boolean;
 }
 
 /** Runs the build commands one by one as the build identity (spec §6.3 step 6). */
 export async function runBuildCommands(commands: string[], ctx: BuildCommandsContext): Promise<void> {
   const timeoutSeconds = ctx.timeoutSeconds ?? Math.max(0, Math.round((ctx.deadlineMs - Date.now()) / 1000));
   for (const [i, command] of commands.entries()) {
-    const key = `build.command.${i + 1}`;
+    const key = `${ctx.keyPrefix ?? 'build.command'}.${i + 1}`;
     if (isJsCommand(command) && !existsSync(join(ctx.projectDir, 'package.json'))) {
       ctx.steps.note(key, 'Skipped: no package.json', { command });
       continue;
     }
     ctx.steps.start(key, { command });
-    const exitCode = await runOne(command, ctx, timeoutSeconds);
-    if (exitCode !== 0) throw new BuildFailure('build.command_failed', `\`${command}\` exited with code ${exitCode}`);
+    const exitCode = await runShell(command, ctx, {
+      deadlineMs: ctx.deadlineMs,
+      timeoutFailure: new BuildFailure('build.timeout', `The build did not finish within ${timeoutSeconds} seconds`),
+    });
+    if (exitCode !== 0) throw new BuildFailure(ctx.failureCode ?? 'build.command_failed', `\`${command}\` exited with code ${exitCode}`);
     ctx.steps.done(key);
   }
 }
 
-async function runOne(command: string, ctx: BuildCommandsContext, timeoutSeconds: number): Promise<number> {
-  const timeout = new BuildFailure('build.timeout', `The build did not finish within ${timeoutSeconds} seconds`);
+/** Runs one shell command as the build identity, killed at `o.deadlineMs` or when `ctx.signal` aborts. */
+export async function runShell(command: string, ctx: BuildCommandsContext, o: ShellOptions): Promise<number> {
+  const timeout = o.timeoutFailure;
   if (ctx.signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
   const killer = new AbortController();
   let timedOut = false;
   const onAbort = () => killer.abort();
   ctx.signal.addEventListener('abort', onAbort, { once: true });
   const tick = setInterval(() => {
-    if (Date.now() >= ctx.deadlineMs) {
+    if (Date.now() >= o.deadlineMs) {
       timedOut = true;
       killer.abort();
     }
   }, 1000);
   tick.unref();
-  if (Date.now() >= ctx.deadlineMs) {
+  if (Date.now() >= o.deadlineMs) {
     timedOut = true;
     killer.abort();
   }
   const onLine = (line: string) => ctx.batcher.addLine(cutLine(line));
   try {
-    const { exitCode } = await runCommand('/bin/bash', ['-c', command], {
+    const { exitCode } = await runCommand('/bin/bash', [...(o.pipefail ? ['-o', 'pipefail'] : []), '-c', command], {
       cwd: ctx.projectDir,
       env: ctx.env,
       signal: killer.signal,

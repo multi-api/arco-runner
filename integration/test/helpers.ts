@@ -130,6 +130,8 @@ export interface JobOptions {
   cacheKey?: string;
   /** Whether the fake Cloud calls the runner's /suspend hook before answering /idle (default true; false for Fargate). */
   suspendOnIdle?: boolean;
+  /** The document's `tests` (absent when undefined). */
+  tests?: Record<string, unknown> | null;
 }
 
 /** Registers a fresh job (fresh ticket, tokens, secrets) with the fake Cloud and returns it. */
@@ -164,6 +166,9 @@ export async function newJob(name: string, o: JobOptions): Promise<Job> {
     mask: [buildSecret, multiLine],
     cache: { restore_url: signed(`restore${hex(16)}`), save_url: signed(`save${hex(16)}`), key: cacheKey },
     timeout_seconds: o.timeoutSeconds ?? 600,
+    // Credentials come from /credentials once the build passed (the current image always asks for that).
+    defer_credentials: true,
+    ...(o.tests !== undefined ? { tests: o.tests } : {}),
   };
   const before = await requests();
   const r = await http('POST', `${FAKE}/admin/job`, {
@@ -194,6 +199,25 @@ export const isFinish = (r: Recorded) => r.pathname.endsWith('/finish');
 export const isStart = (r: Recorded) => r.pathname.endsWith('/start');
 export const isClaim = (r: Recorded) => r.pathname === '/api/v1/runner/claim';
 export const isCachePut = (r: Recorded) => r.method === 'PUT' && r.pathname.startsWith('/s3/');
+export const isCredentials = (r: Recorded) => r.pathname.endsWith('/credentials');
+
+/**
+ * The canned test phase (ruling Q7): `php artisan test` runs the fixture's offline fake PHPUnit, installed by an
+ * offline `composer install` (the test phase runs before the build commands). `tests` overrides these fields;
+ * its `env` is added to the defaults.
+ */
+export function testsJob(name: string, sha: string, tests: Record<string, unknown> = {}): Promise<Job> {
+  const { env, ...rest } = tests;
+  return newJob(name, {
+    sha,
+    tests: {
+      command: 'php artisan test', setup_commands: ['composer install --no-interaction --prefer-dist'], services: [],
+      primary_database: null, timeout_seconds: 300, mask: [],
+      ...rest,
+      env: { COMPOSER_DISABLE_NETWORK: '1', ...(env as Record<string, string> | undefined) },
+    },
+  });
+}
 
 /** Waits until the runner reported idle for this job (or, with `idle: false`, until it is idle again) and returns the recording. */
 export async function untilDone(job: Job, o: { idleCall?: boolean; timeoutMs?: number } = {}) {
@@ -254,6 +278,7 @@ export function jobSecrets(job: Job): string[] {
     job.doc.cache.restore_url, job.doc.cache.save_url, sig(job.doc.cache.restore_url), sig(job.doc.cache.save_url),
     job.credentials.accessKeyId, job.credentials.secretAccessKey, job.credentials.sessionToken,
     ...job.doc.mask,
+    ...(((job.doc.tests as { mask?: string[] } | null | undefined)?.mask) ?? []),
   ];
 }
 
