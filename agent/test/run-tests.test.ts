@@ -84,7 +84,7 @@ async function world(o: WorldOptions = {}) {
   await mkdir(join(root, 'home/work'), { recursive: true });
   gitSync(join(root, 'home/work'), 'clone', '-q', origin, 'repo');
   const projectDir = await resolveProjectDir(paths.repo, o.rootDir ?? '');
-  return { root, origin, out, paths, projectDir, rootDir: o.rootDir ?? '' };
+  return { root, origin, out, paths, projectDir, rootDir: o.rootDir ?? '', sha: gitSync(origin, 'rev-parse', 'HEAD') };
 }
 type World = Awaited<ReturnType<typeof world>>;
 
@@ -110,7 +110,7 @@ async function run(w: World, o: RunOptions = {}) {
   };
   const doc: JobDocument = {
     deployment_id: 'dep_1', environment: 'production', mode: 'deploy', nonce: NONCE, runner_token: TOKEN,
-    source: { clone_url: 'file:///x', auth_header: 'basic eA==', sha: '0'.repeat(40), root_dir: w.rootDir },
+    source: { clone_url: 'file:///x', auth_header: 'basic eA==', sha: w.sha, root_dir: w.rootDir },
     php_version: '8.5', commands: ['echo build'], env: o.env ?? {}, mask: o.mask ?? [], timeout_seconds: o.timeoutSeconds ?? 600,
     cache: { restore_url: 'https://s3/x?X-Amz-Signature=a1', save_url: 'https://s3/y?X-Amz-Signature=b2', key: 'k' },
     defer_credentials: true, tests,
@@ -340,6 +340,53 @@ describe('runTestPhase: isolation', () => {
     }
   }, 30_000);
 
+  it('removes untracked nested repositories', async () => {
+    const w = await world();
+    const r = await run(w, { tests: { command: 'mkdir -p nested && git -C nested init -q && touch nested/file.txt' } });
+    expect(r.error).toBeNull();
+    expect(existsSync(join(w.projectDir, 'nested'))).toBe(false);
+  }, 30_000);
+
+  it('restores from the deployed commit: a staged change or a moved HEAD does not reach the build', async () => {
+    const w = await world();
+    const r = await run(w, {
+      tests: { command: 'echo staged >> composer.json && git add composer.json && echo x > other.txt && git add other.txt'
+        + ' && git -c user.email=a@b.c -c user.name=t commit -q -m moved' },
+    });
+    expect(r.error).toBeNull();
+    expect(readFileSync(join(w.projectDir, 'composer.json'), 'utf8')).toBe('{"name":"t/t"}\n');
+    expect(existsSync(join(w.projectDir, 'other.txt'))).toBe(false);
+    expect(gitSync(w.projectDir, 'rev-parse', 'HEAD')).toBe(w.sha);
+  }, 30_000);
+
+  it('cleans up after a setup failure: services stopped and removed, tree restored', async () => {
+    const w = await world({ files: { '.env.example': 'APP_NAME=x\n' } });
+    const trace: string[] = [];
+    const r = await run(w, {
+      tests: { setup_commands: ['echo changed >> composer.json; touch junk.txt; exit 5'], services: ['mysql'] },
+      services: fakeServices(trace),
+    });
+    expect(failure(r.error).code).toBe('build.test_setup_failed');
+    expect(trace).toEqual(['dropDatabases', 'stopAll', 'removeData']);
+    expect(readFileSync(join(w.projectDir, 'composer.json'), 'utf8')).toBe('{"name":"t/t"}\n');
+    expect(existsSync(join(w.projectDir, 'junk.txt'))).toBe(false);
+    expect(existsSync(join(w.projectDir, '.env'))).toBe(false);
+  }, 30_000);
+
+  it('cleans up after build.tests_timeout: services stopped and removed, tree restored', async () => {
+    const w = await world();
+    const trace: string[] = [];
+    const r = await run(w, {
+      tests: { command: 'echo changed >> composer.json; touch junk.txt; sleep 30', timeout_seconds: 1, services: ['redis'] },
+      services: fakeServices(trace),
+    });
+    expect(failure(r.error).code).toBe('build.tests_timeout');
+    expect(trace).toEqual(['start', 'dropDatabases', 'stopAll', 'removeData']);
+    expect(readFileSync(join(w.projectDir, 'composer.json'), 'utf8')).toBe('{"name":"t/t"}\n');
+    expect(existsSync(join(w.projectDir, 'junk.txt'))).toBe(false);
+    expect(existsSync(join(w.paths.tmpDirs[0]!, 'arco-tests'))).toBe(false);
+  }, 30_000);
+
   it('kills processes the tests left behind before git restore', async () => {
     const w = await world();
     const pidFile = join(w.out, 'pid');
@@ -354,10 +401,8 @@ describe('runTestPhase: isolation', () => {
       },
     });
     expect(r.error).toBeNull();
-    // Once after the setup (before services), at least once after the tests, while the tree is still unrestored.
-    expect(seen.length).toBeGreaterThanOrEqual(2);
-    expect(seen[0]).toBe('{"name":"t/t"}\n');
-    expect(seen.at(-1)).toBe('{"name":"t/t"}\nchanged\n');
+    // After the setup (before services), after the tests while the tree is still unrestored, and after the restore.
+    expect(seen).toEqual(['{"name":"t/t"}\n', '{"name":"t/t"}\nchanged\n', '{"name":"t/t"}\n']);
     expect(readFileSync(join(w.projectDir, 'composer.json'), 'utf8')).toBe('{"name":"t/t"}\n');
   }, 30_000);
 
@@ -428,7 +473,8 @@ describe('runTestPhase: services', () => {
       if (exitCode === 0) expect(r.error).toBeNull();
       else expect(failure(r.error).code).toBe('build.tests_failed');
       const order = trace.filter((t) => ['build.test_setup.1:done', 'kill', 'start', 'build.tests:started', 'dropDatabases', 'stopAll', 'removeData'].includes(t));
-      expect(order).toEqual(['build.test_setup.1:done', 'kill', 'start', 'build.tests:started', 'kill', 'dropDatabases', 'stopAll', 'removeData']);
+      // The last kill follows the git restore (nothing git spawned survives into the build commands).
+      expect(order).toEqual(['build.test_setup.1:done', 'kill', 'start', 'build.tests:started', 'kill', 'dropDatabases', 'stopAll', 'removeData', 'kill']);
       const env = await dumpOf(dump);
       expect(env).toMatchObject({ DB_CONNECTION: 'pgsql', DB_PORT: '5432', DB_DATABASE: 'testing', DB_USERNAME: 'arco', REDIS_CLIENT: 'predis' });
       expect(env.DB_PASSWORD).toBe(passwords[0]);
@@ -451,6 +497,7 @@ describe('runTestPhase: services', () => {
       services: fakeServices(trace, { startError: new ServiceStartError('mysql', 'MySQL did not become ready within 30 seconds') }),
     });
     expect(failure(r.error)).toEqual({ code: 'build.test_service_failed', message: 'MySQL did not become ready within 30 seconds' });
+    expect(step(r.events, 'build.test_services', 'warning')?.message).toBe('MySQL did not become ready within 30 seconds');
     expect(existsSync(ran)).toBe(false);
     expect(trace).toEqual(expect.arrayContaining(['stopAll', 'removeData']));
     expect(trace.indexOf('stopAll')).toBeLessThan(trace.indexOf('removeData'));
@@ -469,6 +516,20 @@ describe('runTestPhase: services', () => {
       services: () => { const m = svc(); return { ...m, start: (...a) => { setTimeout(() => ac.abort(), 100); return m.start(...a); } }; },
     });
     expect(failure(r.error)).toEqual({ code: 'build.cancelled', message: 'Cancelled' });
+    expect(step(r.events, 'build.test_services', 'warning')?.message).toBe('Cancelled');
     expect(trace).toEqual(['start', 'dropDatabases', 'stopAll', 'removeData']);
+  }, 30_000);
+
+  it('bounds the phpredis check: a cancel during it is build.cancelled, a failure is build.test_service_failed', async () => {
+    const trace: string[] = [];
+    const ac = new AbortController();
+    const hang = () => ({ ...fakeServices(trace)(), phpRedis: () => { setTimeout(() => ac.abort(), 100); return new Promise<boolean>(() => {}); } });
+    const r = await run(await world(), { tests: { services: ['redis'] }, signal: ac.signal, services: hang });
+    expect(failure(r.error)).toEqual({ code: 'build.cancelled', message: 'Cancelled' });
+    expect(trace).toEqual(['start', 'dropDatabases', 'stopAll', 'removeData']);
+
+    const broken = () => ({ ...fakeServices([])(), phpRedis: async () => { throw new Error('php: not found'); } });
+    const b = await run(await world(), { tests: { services: ['redis'] }, services: broken });
+    expect(failure(b.error)).toMatchObject({ code: 'build.test_service_failed', message: expect.stringContaining('php: not found') });
   }, 30_000);
 });

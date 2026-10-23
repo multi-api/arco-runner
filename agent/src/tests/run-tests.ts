@@ -14,6 +14,7 @@ import { parseJUnit, summarize, withJUnit, type JUnitCase } from './junit.js';
 
 const REPORT_MAX_BYTES = 64 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 120_000;
+const PHP_REDIS_TIMEOUT_MS = 10_000;
 const GIT_PATH = '/usr/local/bin:/usr/bin:/bin';
 const PARATEST_HINT = '`--parallel` needs brianium/paratest in composer.json (require-dev)';
 const NO_SERVICES = 'Test services are not available on this runner';
@@ -49,6 +50,22 @@ const messageOf = (e: unknown): string => {
   const m = (e as { message?: unknown } | null)?.message;
   return (typeof m === 'string' && m ? m : String(e)).split('\n')[0]!.slice(0, 1000);
 };
+
+/** `p`, unless `signal` aborts or `ms` pass first (then rejects; `p` is left to settle on its own). */
+async function untilAborted<T>(p: Promise<T>, signal: AbortSignal, ms: number): Promise<T> {
+  const bound = AbortSignal.any([signal, AbortSignal.timeout(ms)]);
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error(signal.aborted ? 'aborted' : `no answer within ${ms / 1000} seconds`));
+    if (bound.aborted) onAbort();
+    else bound.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([p, aborted]);
+  } finally {
+    bound.removeEventListener('abort', onAbort);
+  }
+}
 
 const exists = async (p: string): Promise<boolean> => {
   try { await lstat(p); return true; } catch { return false; }
@@ -103,9 +120,7 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     timeoutSeconds: doc.timeout_seconds,
   });
 
-  async function startServices(baseEnv: NodeJS.ProcessEnv): Promise<Record<string, string>> {
-    if (!ctx.services) throw new BuildFailure('build.test_service_failed', NO_SERVICES);
-    manager = ctx.services();
+  async function startServices(m: ServicesManager, baseEnv: NodeJS.ProcessEnv): Promise<Record<string, string>> {
     const password = generatePassword();
     redactor.add(password);
     steps.start('build.test_services', { services: tests.services });
@@ -113,19 +128,27 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), Math.min(2 ** 31 - 1, Math.max(0, ctx.buildDeadlineMs - Date.now())));
     timer.unref();
+    const signal = AbortSignal.any([ctx.signal, deadline.signal]);
     let startMs;
+    let redisClient: 'phpredis' | 'predis' = 'phpredis';
     try {
-      startMs = await manager.start(tests.services, password, AbortSignal.any([ctx.signal, deadline.signal]));
+      startMs = await m.start(tests.services, password, signal);
+      if (tests.services.includes('redis') && !(await untilAborted(m.phpRedis(baseEnv, identity), signal, PHP_REDIS_TIMEOUT_MS))) {
+        redisClient = 'predis';
+      }
     } catch (e) {
-      if (ctx.signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
-      if (deadline.signal.aborted) throw new BuildFailure('build.timeout', `The build did not finish within ${doc.timeout_seconds} seconds`);
-      if (e instanceof ServiceStartError) throw new BuildFailure('build.test_service_failed', e.message);
-      throw new BuildFailure('build.test_service_failed', `Test services could not be started: ${messageOf(e)}`);
+      const failure = ctx.signal.aborted
+        ? new BuildFailure('build.cancelled', 'Cancelled')
+        : deadline.signal.aborted
+          ? new BuildFailure('build.timeout', `The build did not finish within ${doc.timeout_seconds} seconds`)
+          : e instanceof ServiceStartError
+            ? new BuildFailure('build.test_service_failed', e.message)
+            : new BuildFailure('build.test_service_failed', `Test services could not be started: ${messageOf(e)}`);
+      steps.warning('build.test_services', failure.message);
+      throw failure;
     } finally {
       clearTimeout(timer);
     }
-    let redisClient: 'phpredis' | 'predis' = 'phpredis';
-    if (tests.services.includes('redis') && !(await manager.phpRedis(baseEnv, identity))) redisClient = 'predis';
     steps.done('build.test_services', undefined, { start_ms: startMs });
     if (redisClient === 'predis') steps.note('build.test_services', PREDIS_NOTE);
     return serviceVariables(tests.services, tests.primary_database, password, redisClient);
@@ -157,7 +180,7 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
   }
 
   async function git(args: string[], env: NodeJS.ProcessEnv): Promise<void> {
-    const { exitCode } = await runCommand('git', [...GIT_HARDENING, ...args], {
+    const { exitCode } = await runCommand('git', [...GIT_HARDENING, '-c', 'core.attributesFile=/dev/null', ...args], {
       cwd: paths.repo, env, signal: AbortSignal.timeout(GIT_TIMEOUT_MS),
       ...(identity ? { uid: identity.uid, gid: identity.gid } : {}),
     });
@@ -170,8 +193,10 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     try {
       if (identity) await lchown(emptyHome, identity.uid, identity.gid);
       const env: NodeJS.ProcessEnv = { PATH: GIT_PATH, LANG: 'C.UTF-8', HOME: emptyHome, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
-      await git(['checkout', '--', '.'], env);
-      await git(['clean', '-fdx', ...cleanExcludes(doc.source.root_dir)], env);
+      // From the deployed commit, not the index or HEAD: a test that staged a change or moved HEAD changes nothing.
+      await git(['reset', '-q', '--hard', doc.source.sha], env);
+      // -ff: untracked nested repositories too.
+      await git(['clean', '-ffdx', ...cleanExcludes(doc.source.root_dir)], env);
     } finally {
       await rm(emptyHome, { recursive: true, force: true });
     }
@@ -181,14 +206,23 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     // .env first: a .env just copied from .env.example is what Laravel reads during the tests, so its APP_KEY counts.
     copiedEnv = await copyEnvExample(projectDir, identity);
     const appKey = (await hasAppKey(projectDir, tests.env)) ? null : ephemeralAppKey();
-    if (appKey) redactor.add(appKey);
+    if (appKey) {
+      redactor.add(appKey);
+      redactor.add(appKey.slice('base64:'.length));
+    }
     const baseEnv = testEnv(paths, tests, {}, appKey);
+
+    // Created up front, so that cleanup also stops and removes leftovers when the setup fails.
+    if (tests.services.length > 0) {
+      if (!ctx.services) throw new BuildFailure('build.test_service_failed', NO_SERVICES);
+      manager = ctx.services();
+    }
 
     await runBuildCommands(tests.setup_commands, { ...shell(baseEnv), keyPrefix: 'build.test_setup', failureCode: 'build.test_setup_failed' });
     // A background process of the setup could squat a service port or the report directory.
     await kill();
 
-    const serviceVars = tests.services.length > 0 ? await startServices(baseEnv) : {};
+    const serviceVars = manager ? await startServices(manager, baseEnv) : {};
     const dir = await prepareTestsDir();
     const junit = withJUnit(tests.command, join(testsDir, 'junit.xml'));
 
@@ -255,6 +289,10 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
       try { await rm(join(projectDir, '.env'), { force: true }); } catch (e) { line(`Removing the copied .env failed: ${messageOf(e)}`); }
     }
     try { await restoreTree(); } catch (e) { isolation.push(`restoring the working tree failed: ${messageOf(e)}`); }
+    // git itself may have run something of the build user's (a filter in a .git/config the tests wrote): the build
+    // commands must start with no build process alive.
+    const why = await killFailure();
+    if (why) isolation.push(why);
     return isolation;
   }
 
