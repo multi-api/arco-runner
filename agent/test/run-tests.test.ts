@@ -359,6 +359,30 @@ describe('runTestPhase: isolation', () => {
     expect(gitSync(w.projectDir, 'rev-parse', 'HEAD')).toBe(w.sha);
   }, 30_000);
 
+  it('restores the real tree when the tests planted core.worktree in .git/config', async () => {
+    const w = await world();
+    const r = await run(w, {
+      tests: { command: 'mkdir -p ../decoy && touch ../decoy/keep.txt untracked.txt && echo changed >> composer.json'
+        + ' && git config core.worktree "$(cd ../decoy && pwd)"' },
+    });
+    expect(r.error).toBeNull();
+    expect(existsSync(join(w.projectDir, 'untracked.txt'))).toBe(false);
+    expect(readFileSync(join(w.projectDir, 'composer.json'), 'utf8')).toBe('{"name":"t/t"}\n');
+    const decoy = join(w.paths.repo, '../decoy');
+    expect(existsSync(join(decoy, 'keep.txt'))).toBe(true);
+    expect(existsSync(join(decoy, 'composer.json'))).toBe(false);
+  }, 30_000);
+
+  it('ignores replace refs the tests planted: the deployed commit is restored, not its replacement', async () => {
+    const w = await world();
+    const r = await run(w, {
+      tests: { command: 'echo evil > evil.txt && git add evil.txt && git -c user.email=a@b.c -c user.name=t commit -q -m evil'
+        + ` && git replace ${w.sha} HEAD && git reset -q --hard ${w.sha}` },
+    });
+    expect(r.error).toBeNull();
+    expect(existsSync(join(w.projectDir, 'evil.txt'))).toBe(false);
+  }, 30_000);
+
   it('cleans up after a setup failure: services stopped and removed, tree restored', async () => {
     const w = await world({ files: { '.env.example': 'APP_NAME=x\n' } });
     const trace: string[] = [];

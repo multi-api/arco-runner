@@ -180,7 +180,9 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
   }
 
   async function git(args: string[], env: NodeJS.ProcessEnv): Promise<void> {
-    const { exitCode } = await runCommand('git', [...GIT_HARDENING, '-c', 'core.attributesFile=/dev/null', ...args], {
+    // Explicit --git-dir/--work-tree: a core.worktree (or core.bare) the tests wrote into .git/config cannot redirect the restore.
+    const where = [`--git-dir=${join(paths.repo, '.git')}`, `--work-tree=${paths.repo}`];
+    const { exitCode } = await runCommand('git', [...GIT_HARDENING, '-c', 'core.attributesFile=/dev/null', ...where, ...args], {
       cwd: paths.repo, env, signal: AbortSignal.timeout(GIT_TIMEOUT_MS),
       ...(identity ? { uid: identity.uid, gid: identity.gid } : {}),
     });
@@ -192,7 +194,11 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     const emptyHome = await mkdtemp(join(paths.tmpDirs[0]!, 'arco-git-home-'));
     try {
       if (identity) await lchown(emptyHome, identity.uid, identity.gid);
-      const env: NodeJS.ProcessEnv = { PATH: GIT_PATH, LANG: 'C.UTF-8', HOME: emptyHome, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
+      const env: NodeJS.ProcessEnv = {
+        PATH: GIT_PATH, LANG: 'C.UTF-8', HOME: emptyHome, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
+        // refs/replace written by the tests cannot swap the deployed commit for another tree.
+        GIT_NO_REPLACE_OBJECTS: '1',
+      };
       // From the deployed commit, not the index or HEAD: a test that staged a change or moved HEAD changes nothing.
       await git(['reset', '-q', '--hard', doc.source.sha], env);
       // -ff: untracked nested repositories too.
