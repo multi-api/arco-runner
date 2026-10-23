@@ -41,13 +41,16 @@ function parseJson(text: string): unknown {
   }
 }
 
+// Every response closes its connection. Lambda's hook caller (and the MicroVM proxy) live outside
+// the VM and may keep a socket alive across a suspend; when the VM resumes, the agent's keep-alive
+// timer fires at once (suspended time counts) and resets that socket just as /resume arrives on it.
 const send = (res: ServerResponse, status: number, body?: unknown) => {
   if (body === undefined) {
-    res.writeHead(status, { 'Content-Length': 0 }).end();
+    res.writeHead(status, { 'Content-Length': 0, Connection: 'close' }).end();
     return;
   }
   const text = JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) }).end(text);
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text), Connection: 'close' }).end(text);
 };
 
 const listen = (server: Server, port: number) =>

@@ -41,6 +41,17 @@ async function boot(agent: Agent, o: Partial<Parameters<typeof startServers>[1]>
 }
 
 describe('hooks server', () => {
+  it('every hook and control response closes the connection (no keep-alive across a suspend)', async () => {
+    // Lambda's hook caller lives outside the VM; a socket kept alive from /suspend is closed by the
+    // agent's keep-alive timer the moment the VM resumes, and /resume on it fails (ECONNRESET).
+    const agent = fakeAgent();
+    const { hooks, ctl } = await boot(agent);
+    for (const p of ['suspend', 'resume', 'run', 'ready', 'terminate']) {
+      expect((await hooks(p, {})).headers.get('connection'), p).toBe('close');
+    }
+    expect((await ctl('GET', '/healthz')).headers.get('connection')).toBe('close');
+  });
+
   it('/run with {} or an empty body is a no-op 200', async () => {
     const agent = fakeAgent();
     const { hooks } = await boot(agent);
