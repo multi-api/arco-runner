@@ -42,7 +42,7 @@ They need Docker on arm64 (Apple silicon or an arm runner). `npm run test:integr
 npx tsx scripts/fetch-inputs.ts --minor 8.5 --out build/inputs   # needs the gh CLI to verify attestations
 node agent/build.mjs
 npx tsx scripts/package-image.ts --minor 8.5 --inputs build/inputs --out build/image.zip \
-  --agent agent/dist/arco-runner.mjs --fixture fixture
+  --agent agent/dist/arco-runner.mjs --fixture fixture --validate-cli agent/dist/validate-cli.mjs
 npm ci --prefix integration
 npm run test:integration                 # extra arguments go to vitest, e.g. -- -t 'warm'
 ```
