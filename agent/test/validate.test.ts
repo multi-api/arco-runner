@@ -1,10 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ValidationError, runValidation } from '../src/validate.js';
+import { ValidationError, prefetchRuntimeCache, runValidation } from '../src/validate.js';
 import type { Paths } from '../src/system.js';
 
 // The agent's build PATH (/usr/local/bin:/usr/bin:/bin) is the image's; a dev machine has php/composer elsewhere.
@@ -68,5 +68,32 @@ describe('runValidation', () => {
     const w = await world();
     await rm(join(w.fixtureDir, 'app.bundle'));
     await expect(runValidation({ ...w, identity: null })).rejects.toBeInstanceOf(ValidationError);
+  });
+});
+
+describe('prefetchRuntimeCache', () => {
+  it('reads every pre-seeded runtime binary in full, regular files only', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'prefetch-'));
+    try {
+      const dir = join(home, '.arco', 'cache', 'runtime', 'php8.5.12-fp1.13.1-r1');
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'frankenphp'), Buffer.alloc(3 * 1024 * 1024, 1));
+      await writeFile(join(dir, 'php'), Buffer.alloc(1024, 2));
+      const outside = join(home, 'outside.bin');
+      await writeFile(outside, Buffer.alloc(5000, 3));
+      await symlink(outside, join(dir, 'link'));
+      expect(await prefetchRuntimeCache(home)).toEqual({ files: 2, bytes: 3 * 1024 * 1024 + 1024 });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('reads nothing when there is no runtime cache', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'prefetch-'));
+    try {
+      expect(await prefetchRuntimeCache(home)).toEqual({ files: 0, bytes: 0 });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });

@@ -1,5 +1,7 @@
 import { execFile, spawnSync } from 'node:child_process';
-import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { access, lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -165,6 +167,40 @@ const archiveToolsPresent = (): boolean =>
   /GNU tar/.test(spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout ?? '') && spawnSync('zstd', ['--version']).status === 0;
 
 /**
+ * Reads every runtime binary the image pre-seeds under `.arco/cache/runtime/<build>/` in full, the way
+ * `arco deploy` does when it checks their sha256. Lambda prefetches on every new VM the snapshot pages read
+ * during /validate, so a cold deploy no longer pays ~30 s of demand paging for ~260 MB at `binary.using`.
+ * Regular files only (lstat); returns how many files and bytes were read.
+ */
+export async function prefetchRuntimeCache(home: string): Promise<{ files: number; bytes: number }> {
+  const root = join(home, '.arco', 'cache', 'runtime');
+  let builds: string[];
+  try {
+    builds = await readdir(root);
+  } catch {
+    return { files: 0, bytes: 0 };
+  }
+  let files = 0;
+  let bytes = 0;
+  for (const build of builds) {
+    const dir = join(root, build);
+    if (!(await lstat(dir)).isDirectory()) continue;
+    for (const name of await readdir(dir)) {
+      const file = join(dir, name);
+      if (!(await lstat(file)).isFile()) continue;
+      const hash = createHash('sha256');
+      for await (const chunk of createReadStream(file)) {
+        hash.update(chunk as Buffer);
+        bytes += (chunk as Buffer).length;
+      }
+      hash.digest();
+      files++;
+    }
+  }
+  return { files, bytes };
+}
+
+/**
  * The image's smoke test (spec §9.3): two canned jobs through the real pipeline against an in-process Cloud on
  * 127.0.0.1 and no network. The first builds and saves the cache, the second restores it. Throws ValidationError.
  */
@@ -174,6 +210,12 @@ export async function runValidation(o: { paths: Paths; identity: Identity | null
   // A dev machine may lack GNU tar or zstd; the image must have them, so with an identity the cache is required.
   const cache = identity !== null || archiveToolsPresent();
   const clouds: FakeCloud[] = [];
+
+  // In the image the runtime cache is always pre-seeded; finding none means the image is broken.
+  const prefetched = await prefetchRuntimeCache(paths.home);
+  if (identity !== null && prefetched.files === 0) {
+    throw new ValidationError(`no pre-seeded runtime binaries under ${join(paths.home, '.arco', 'cache', 'runtime')}`);
+  }
 
   const check = (pass: Pass, label: string): void => {
     const fail = (why: string): never => {
