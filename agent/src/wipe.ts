@@ -26,7 +26,7 @@ type Hooks = { killAllAs?: (uid: number) => Promise<void>; gapMs?: number };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function pidsOfUid(uid: number, procDir: string): Promise<number[]> {
+export async function pidsOfUid(uid: number, procDir: string): Promise<number[]> {
   const out: number[] = [];
   let names: string[];
   try {
@@ -209,6 +209,8 @@ export interface WipeOptions {
   uid?: number;
   /** Where step 5 searches; defaults to `/`. */
   findRoot?: string;
+  /** The test services: their uids are killed in step 1 and their data and socket dirs emptied in step 4b. */
+  services?: { uids: number[]; dataDir: string; runDir: string };
   /** Total time for step 1 (default 5000). */
   killTimeoutMs?: number;
   /** Other uid-owned state outside `-xdev` reach (R12); defaults to /dev/mqueue, /run/lock, /run/user. */
@@ -232,6 +234,8 @@ export async function wipe(paths: Paths, rootDir: string, o: WipeOptions = {}): 
     // 1. no build process survives
     if (o.uid !== undefined) await killUserProcesses(o.uid, o.killTimeoutMs ?? 5000, o.procDir, o.kill, o.killAllAs ? { killAllAs: o.killAllAs } : {});
 
+    for (const uid of o.services?.uids ?? []) await killUserProcesses(uid, o.killTimeoutMs ?? 5000, o.procDir, o.kill, o.killAllAs ? { killAllAs: o.killAllAs } : {});
+
     const homeExists = await lstat(home).then(() => true, () => false);
     if (homeExists && !(await isRealDir(home))) throw new WipeError('home is not a real directory');
     if (homeExists) {
@@ -246,6 +250,16 @@ export async function wipe(paths: Paths, rootDir: string, o: WipeOptions = {}): 
 
     // 4. scratch dirs
     for (const d of paths.tmpDirs) await emptyDir(d);
+
+    // 4b. test services: whatever they (or a service user) left in the data and socket dirs; links are unlinked, never followed
+    if (o.services) {
+      for (const d of [o.services.dataDir, o.services.runDir]) {
+        await emptyDir(d);
+        if ((await readdir(d).catch((e: NodeJS.ErrnoException) => (e.code === 'ENOENT' ? [] : Promise.reject(e)))).length > 0) {
+          throw new WipeError(`${d} is not empty after the wipe`);
+        }
+      }
+    }
 
     // 5. whatever else the build user owns
     if (o.uid !== undefined) {
