@@ -204,6 +204,48 @@ describe('runJob: secrets', () => {
   }, 30_000);
 });
 
+describe('runJob: external DNS', () => {
+  const DNS = {
+    profile: 'arco-cloud-dns',
+    credentials: {
+      accessKeyId: 'AKIADNSZONE00000001', secretAccessKey: 'dns/Secret/Key0123456789abcdefABCDEF',
+      sessionToken: 'DNSSESSIONTOKEN0123456789abcdef', expiration: '2030-01-01T00:00:00.000Z',
+    },
+  };
+  const CF = 'cf_token_0123456789abcdefABCDEF';
+  const secrets = [DNS.credentials.accessKeyId, DNS.credentials.secretAccessKey, DNS.credentials.sessionToken, CF];
+
+  it.each([['deferred', true], ['non-deferred', false]])('gives the deploy child the DNS profile, the credentials file and the token (%s)', async (_n, defer) => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const arcoDump = join(w.out, 'arco-env.json');
+    const dnsFile = join(w.out, 'dns-credentials');
+    const r = await run(w, {
+      // The leaky fake arco prints the Cloudflare token: it must be masked on its way to Cloud.
+      env: { FAKE_ARCO_CALLS: calls, FAKE_ARCO_ENVDUMP: arcoDump, FAKE_ARCO_DNSFILE: dnsFile },
+      job: { defer_credentials: defer },
+      cloud: { dns: DNS, cloudflareToken: CF, ignoreDefer: !defer },
+    });
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: true, idleReported: true });
+    const deploy = (await readFile(calls, 'utf8')).split('\n').find((l) => l.startsWith('deploy'))!;
+    expect(deploy).toContain('--dns-profile=arco-cloud-dns');
+    expect(await readFile(dnsFile, 'utf8')).toBe(
+      `[arco-cloud-dns]\naws_access_key_id = ${DNS.credentials.accessKeyId}\naws_secret_access_key = ${DNS.credentials.secretAccessKey}\naws_session_token = ${DNS.credentials.sessionToken}\n`,
+    );
+    const env = JSON.parse(await readFile(`${arcoDump}.deploy`, 'utf8')) as Record<string, string>;
+    expect(env.CLOUDFLARE_API_TOKEN).toBe(CF);
+    expect(env.AWS_SHARED_CREDENTIALS_FILE).toContain('arco-dns-');
+    expect(existsSync(env.AWS_SHARED_CREDENTIALS_FILE!)).toBe(false);
+    // The version and info calls do not get them.
+    const other = JSON.parse(await readFile(`${arcoDump}.info`, 'utf8')) as Record<string, string>;
+    expect(other.CLOUDFLARE_API_TOKEN).toBeUndefined();
+    const bodies = r.api.filter((q) => /\/(logs|finish|idle)$/.test(q.pathname)).map((q) => q.body.toString('utf8')).join('\n');
+    expect(bodies).toContain('debug CLOUDFLARE_API_TOKEN=***');
+    for (const s of secrets) for (const v of secretVariants(s)) expect(bodies, `variant of ${s}`).not.toContain(v);
+    expect(r.logs.join('\n')).not.toContain(CF);
+  }, 30_000);
+});
+
 describe('runJob: environments', () => {
   it('gives arco the AWS credentials and the build commands neither them nor the runner token', async () => {
     const w = await world();
@@ -240,6 +282,23 @@ describe('runJob: errors and refusals', () => {
     expect(r.idleCallsAtIdlePhase).toBe(0);
     expect(r.result).toEqual({ deploymentId: 'dep_1', finished: false, buildOk: false, idleReported: true });
     expect(existsSync(join(w.paths.repo, 'composer.json'))).toBe(false);
+  });
+
+  it('finishes runner.internal_error without a wipe when start answers a malformed dns, and still reports idle', async () => {
+    const w = await world();
+    const secret = 'LEAKY_SECRET_VALUE_123';
+    const r = await run(w, { cloud: { startAnswer: { status: 200, body: {
+      environment: 'production', mode: 'deploy', region: 'us-east-1',
+      credentials: { accessKeyId: 'AKIAX', secretAccessKey: 'secretx', sessionToken: 'tokenx', expiration: '2030-01-01T00:00:00.000Z' },
+      dns: { profile: 'arco-cloud-dns', credentials: secret },
+    } } } });
+    expect(r.order).toEqual(['claim', 'start', 'finish', 'idle']);
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'runner.internal_error' });
+    expect(r.finishes[0].error_message).toBe('Could not start the run: Arco Cloud start answer was malformed (dns.credentials)');
+    expect(JSON.stringify(r.finishes)).not.toContain(secret);
+    expect(r.wipes).toEqual([]);
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: false, idleReported: true });
   });
 
   it('skips the run without a wipe when cancelled before start', async () => {

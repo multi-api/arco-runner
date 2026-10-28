@@ -1,6 +1,6 @@
 import { CloudApiError, Redactor } from '@multiapi/arco-cloud-client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { completeSession, issueCredentials, openSession } from '../src/job/session.js';
+import { completeSession, issueCredentials, MalformedAnswer, openSession, RUNNER_CAPABILITIES } from '../src/job/session.js';
 import { startFakeCloud, type FakeCloud, type FakeCloudOptions } from '../src/loopback-cloud.js';
 
 const TOKEN = 'rt_runnertoken_0123456789abcdef';
@@ -22,6 +22,12 @@ async function cloud(o: Partial<FakeCloudOptions> = {}): Promise<FakeCloud> {
 
 const open = (c: FakeCloud, redactor: Redactor, defer = true) =>
   openSession({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1', nonce: NONCE, defer, redactor, warn: () => {}, keepAliveMs: 60_000 });
+
+describe('RUNNER_CAPABILITIES', () => {
+  it('is what start announces', () => {
+    expect(RUNNER_CAPABILITIES).toEqual(['external_dns']);
+  });
+});
 
 describe('openSession', () => {
   it('sends defer_credentials and returns no credentials', async () => {
@@ -83,6 +89,19 @@ describe('external DNS', () => {
     } finally {
       await o.session.batcher.close();
     }
+  });
+
+  it('rejects a malformed dns in a non-deferred start answer without quoting it', async () => {
+    const secret = 'LEAKY_SECRET_VALUE_123';
+    const c = await cloud({ startAnswer: { status: 200, body: {
+      environment: 'production', mode: 'deploy',
+      credentials: { accessKeyId: 'a', secretAccessKey: 'b', sessionToken: 'c', expiration: 'x' }, region: 'us-east-1',
+      dns: { profile: 'arco-dns', credentials: secret },
+    } } });
+    const err = await open(c, new Redactor(), false).catch((e) => e);
+    expect(err).toBeInstanceOf(MalformedAnswer);
+    expect(err.message).toBe('Arco Cloud start answer was malformed (dns.credentials)');
+    expect(err.message).not.toContain(secret);
   });
 
   it('masks them from an older Cloud start answer', async () => {
