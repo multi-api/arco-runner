@@ -1,7 +1,7 @@
 // The runner's own start and credentials calls (spec §4.1). The shared client's startRun always expects credentials
 // from start; the runner asks start to defer them and fetches them from /credentials right before arco deploy.
 import {
-  Batcher, CloudApi, CloudApiError, isRunLost, type Credentials, type Redactor, type RunSession, type StartResponse,
+  Batcher, CloudApi, CloudApiError, isRunLost, parseExternalDns, type Credentials, type ExternalDns, type Redactor, type RunSession, type StartResponse,
 } from '@multiapi/arco-cloud-client';
 
 /** The deploy credentials, from /credentials or from an older Cloud's start answer. */
@@ -9,11 +9,14 @@ export interface Issued {
   credentials: Credentials;
   region: string;
   permissionsBoundary: string | null;
+  /** Route 53 credentials for a zone in another account, when the deployment uses external DNS. */
+  dns: ExternalDns | null;
+  cloudflareToken: string | null;
 }
 
 export interface OpenSession {
   /** A run session without credentials yet: logs and finish work, arco cannot run. */
-  session: Omit<RunSession, 'started' | 'awsEnv'>;
+  session: Omit<RunSession, 'started' | 'awsEnv' | 'dns' | 'cloudflareToken'>;
   /** Non-null when start returned credentials (an older Cloud that ignored defer_credentials). */
   issued: Issued | null;
   environment: string;
@@ -116,10 +119,14 @@ function toIssued(a: unknown, path: string): Issued {
   ) {
     throw new MalformedAnswer(path);
   }
+  // Absent keys mean null (an older Cloud); a bad shape throws a message that names the field, never the value.
+  const { dns, cloudflareToken } = parseExternalDns(a, path);
   return {
     credentials: { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, sessionToken: c.sessionToken, expiration: c.expiration },
     region: x.region,
     permissionsBoundary: boundary,
+    dns,
+    cloudflareToken,
   };
 }
 
@@ -128,7 +135,8 @@ export async function openSession(o: {
   apiBase: string; token: string; deploymentId: string; nonce: string; defer: boolean; redactor: Redactor;
   warn: (m: string) => void; keepAliveMs: number; fetchImpl?: typeof fetch;
 }): Promise<OpenSession> {
-  const body = o.defer ? { nonce: o.nonce, defer_credentials: true } : { nonce: o.nonce };
+  const capabilities = ['external_dns'];
+  const body = o.defer ? { nonce: o.nonce, defer_credentials: true, capabilities } : { nonce: o.nonce, capabilities };
   const started = (await post(o.apiBase, o.token, o.deploymentId, 'start', body, o.fetchImpl ?? fetch)) as
     Omit<StartResponse, 'credentials'> & { credentials: Credentials | null };
   const { redactor } = o;
@@ -192,16 +200,21 @@ export async function issueCredentials(o: {
   }
 }
 
-const credentialValues = (i: Issued): string[] =>
-  [i.credentials.accessKeyId, i.credentials.secretAccessKey, i.credentials.sessionToken];
+const credentialValues = (i: Issued): string[] => [
+  i.credentials.accessKeyId, i.credentials.secretAccessKey, i.credentials.sessionToken,
+  ...(i.dns ? [i.dns.credentials.accessKeyId, i.dns.credentials.secretAccessKey, i.dns.credentials.sessionToken] : []),
+  ...(i.cloudflareToken ? [i.cloudflareToken] : []),
+];
 
 /** Masks the credentials, then returns the full run session arco deploys with. */
 export function completeSession(open: OpenSession, issued: Issued, redactor: Redactor): RunSession {
   for (const v of credentialValues(issued)) redactor.add(v);
-  const { credentials, region, permissionsBoundary } = issued;
+  const { credentials, region, permissionsBoundary, dns, cloudflareToken } = issued;
   return {
     ...open.session,
     secrets: [...redactor.secrets],
+    dns,
+    cloudflareToken,
     started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode },
     awsEnv: {
       AWS_ACCESS_KEY_ID: credentials.accessKeyId,

@@ -28,7 +28,7 @@ describe('openSession', () => {
     const c = await cloud();
     const o = await open(c, new Redactor());
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'] });
       expect(o.issued).toBeNull();
       expect(o.environment).toBe('production');
       expect(o.mode).toBe('deploy');
@@ -46,6 +46,84 @@ describe('openSession', () => {
     } finally {
       await o.session.batcher.close();
     }
+  });
+});
+
+const DNS = {
+  profile: 'arco-dns',
+  credentials: { accessKeyId: 'AKIADNSZONE00000001', secretAccessKey: 'dns/Secret/Key0123456789abcdefABCDEF', sessionToken: 'DNSSESSIONTOKEN0123456789abcdef', expiration: '2030-01-01T00:00:00.000Z' },
+};
+const CF = 'cf_token_0123456789abcdefABCDEF';
+
+describe('external DNS', () => {
+  it('sends the external_dns capability on a non-deferred start too', async () => {
+    const c = await cloud({ ignoreDefer: true });
+    const o = await open(c, new Redactor(), false);
+    try {
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns'] });
+    } finally {
+      await o.session.batcher.close();
+    }
+  });
+
+  it('carries dns and the Cloudflare token from /credentials into the session and the redactor', async () => {
+    const c = await cloud({ dns: DNS, cloudflareToken: CF });
+    const redactor = new Redactor();
+    const o = await open(c, redactor);
+    try {
+      const issued = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' });
+      expect(issued.dns).toEqual(DNS);
+      expect(issued.cloudflareToken).toBe(CF);
+      const session = completeSession(o, issued, redactor);
+      expect(session.dns).toEqual(DNS);
+      expect(session.cloudflareToken).toBe(CF);
+      for (const v of [DNS.credentials.accessKeyId, DNS.credentials.secretAccessKey, DNS.credentials.sessionToken, CF]) {
+        expect(redactor.redact(`x ${v} y`)).toBe('x *** y');
+      }
+    } finally {
+      await o.session.batcher.close();
+    }
+  });
+
+  it('masks them from an older Cloud start answer', async () => {
+    const c = await cloud({ ignoreDefer: true, dns: DNS, cloudflareToken: CF });
+    const redactor = new Redactor();
+    const o = await open(c, redactor, false);
+    try {
+      expect(o.issued?.dns).toEqual(DNS);
+      expect(o.issued?.cloudflareToken).toBe(CF);
+      expect(redactor.redact(CF)).toBe('***');
+      expect(redactor.redact(DNS.credentials.secretAccessKey)).toBe('***');
+    } finally {
+      await o.session.batcher.close();
+    }
+  });
+
+  it('works without them (older Cloud): both null', async () => {
+    const c = await cloud();
+    const redactor = new Redactor();
+    const o = await open(c, redactor);
+    try {
+      const issued = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' });
+      expect(issued).toMatchObject({ dns: null, cloudflareToken: null });
+      const session = completeSession(o, issued, redactor);
+      expect(session.dns).toBeNull();
+      expect(session.cloudflareToken).toBeNull();
+    } finally {
+      await o.session.batcher.close();
+    }
+  });
+
+  it('rejects a malformed dns answer without quoting it', async () => {
+    const secret = 'LEAKY_SECRET_VALUE_123';
+    const c = await cloud({ credentialsAnswer: { status: 200, body: {
+      credentials: { accessKeyId: 'a', secretAccessKey: 'b', sessionToken: 'c', expiration: 'x' }, region: 'us-east-1',
+      dns: { profile: 'arco-dns', credentials: secret },
+    } } });
+    const err = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain('malformed');
+    expect(err.message).not.toContain(secret);
   });
 });
 

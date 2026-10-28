@@ -2,7 +2,7 @@
 // Self-contained (node built-ins only): tests use it, and `/validate` runs it on 127.0.0.1 for its canned job.
 //
 //   POST /api/v1/runner/claim                 {ticket} -> 200 job | 409 ticket_invalid | 503 claim_unavailable
-//   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?} -> 200 credentials (null when deferred)
+//   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?, capabilities?} -> 200 credentials (null when deferred)
 //                                             | 409 runner_outdated (job has tests, flag missing)
 //   POST /api/v1/deployments/{id}/credentials {}       -> 200 {credentials, region, permissionsBoundary} once,
 //                                             then 409 credentials_already_issued | 409 finished
@@ -36,6 +36,9 @@ export interface FakeCloudOptions {
   /** The `start` answer's credentials (defaults are fixed example values). */
   credentials?: { accessKeyId: string; secretAccessKey: string; sessionToken: string };
   region?: string;
+  /** External DNS answered with the credentials (start without defer, and /credentials). Default null. */
+  dns?: { profile: string; credentials: { accessKeyId: string; secretAccessKey: string; sessionToken: string; expiration: string } } | null;
+  cloudflareToken?: string | null;
   permissionsBoundary?: string | null;
   /** When set, every start request gets this answer instead of the credentials. */
   startAnswer?: CannedAnswer;
@@ -146,6 +149,8 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
         credentials: { ...c, expiration: new Date(Date.now() + (options.credentialsTtlMs ?? 3_600_000)).toISOString() },
         region: options.region ?? 'us-east-1',
         permissionsBoundary: options.permissionsBoundary ?? null,
+        dns: options.dns ?? null,
+        cloudflareToken: options.cloudflareToken ?? null,
       };
     };
     if (action === 'start') {
