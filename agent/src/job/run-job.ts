@@ -14,7 +14,7 @@ import { runBuildCommands } from './commands.js';
 import type { JobDocument, TicketPayload } from './document.js';
 import { BuildFailure } from './errors.js';
 import { claim, reportIdle } from './runner-api.js';
-import { completeSession, issueCredentials, openSession, type OpenSession } from './session.js';
+import { completeSession, issueCredentials, MalformedAnswer, openSession, type OpenSession } from './session.js';
 import { checkout, revokeGithubToken, type CheckoutContext } from './source.js';
 import { Steps } from './steps.js';
 
@@ -143,6 +143,14 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
       });
     } catch (e) {
       log(`start failed for deployment ${doc.deployment_id}: ${messageOf(e)}`);
+      // Cloud answered start (the run is open) but the answer was unusable: close the run, or it would stay
+      // open until Cloud's own timeout. Any other failure (HTTP error, timeout) left no run to close.
+      if (e instanceof MalformedAnswer) {
+        let rejected = false;
+        const failure = buildFailure('runner.internal_error', `Could not start the run: ${messageOf(e)}`);
+        await finishWithRetry(api, { ...redactValue(failure, (t) => redactor.redact(t)), result: failure.result }, undefined, (m) => { rejected = true; log(m); });
+        result.finished = !rejected;
+      }
     }
   }
 

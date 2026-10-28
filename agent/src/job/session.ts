@@ -25,6 +25,9 @@ export interface OpenSession {
   markRunLost(e: unknown): void;
 }
 
+/** What this runner tells Cloud it can do, sent with every start. */
+export const RUNNER_CAPABILITIES = ['external_dns'];
+
 const TIMEOUT_MS = 30_000;
 const CREDENTIAL_RETRY_SLEEPS_MS = [1000, 2000];
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -38,9 +41,9 @@ class CallAborted extends Error {
 }
 
 /** A 2xx answer that is not JSON or lacks a field: never retried, and never quotes the body. */
-class MalformedAnswer extends Error {
-  constructor(path: string) {
-    super(`Arco Cloud ${path} answer was malformed`);
+export class MalformedAnswer extends Error {
+  constructor(path: string, message = `Arco Cloud ${path} answer was malformed`) {
+    super(message);
     this.name = 'MalformedAnswer';
   }
 }
@@ -120,7 +123,14 @@ function toIssued(a: unknown, path: string): Issued {
     throw new MalformedAnswer(path);
   }
   // Absent keys mean null (an older Cloud); a bad shape throws a message that names the field, never the value.
-  const { dns, cloudflareToken } = parseExternalDns(a, path);
+  let external: ReturnType<typeof parseExternalDns>;
+  try {
+    external = parseExternalDns(a, path);
+  } catch (e) {
+    // The client's message names the field, never the value; as a MalformedAnswer it is never retried.
+    throw new MalformedAnswer(path, (e as Error).message);
+  }
+  const { dns, cloudflareToken } = external;
   return {
     credentials: { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, sessionToken: c.sessionToken, expiration: c.expiration },
     region: x.region,
@@ -135,7 +145,7 @@ export async function openSession(o: {
   apiBase: string; token: string; deploymentId: string; nonce: string; defer: boolean; redactor: Redactor;
   warn: (m: string) => void; keepAliveMs: number; fetchImpl?: typeof fetch;
 }): Promise<OpenSession> {
-  const capabilities = ['external_dns'];
+  const capabilities = RUNNER_CAPABILITIES;
   const body = o.defer ? { nonce: o.nonce, defer_credentials: true, capabilities } : { nonce: o.nonce, capabilities };
   const started = (await post(o.apiBase, o.token, o.deploymentId, 'start', body, o.fetchImpl ?? fetch)) as
     Omit<StartResponse, 'credentials'> & { credentials: Credentials | null };
