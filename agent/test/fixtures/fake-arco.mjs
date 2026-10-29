@@ -6,6 +6,8 @@
 //   FAKE_ARCO_INFO     = ok (default) | bad | fail
 //   FAKE_ARCO_CALLS    = file to append each invocation's argv to
 //   FAKE_ARCO_DNSFILE  = file to copy AWS_SHARED_CREDENTIALS_FILE's content to (deploy only; the runner removes the original)
+//   FAKE_ARCO_LAYERFILE = file to copy ARCO_CONFIG_LAYER's content to (deploy only; the runner removes the original)
+//   FAKE_ARCO_VERSION  = the version `--version` prints (default 0.10.0)
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -17,7 +19,7 @@ const at = '2026-10-21T12:00:00Z';
 const emit = (o) => console.log(JSON.stringify({ schema: 1, at, ...o }));
 
 if (args[0] === '--version') {
-  console.log('Arco 0.10.0');
+  console.log(`Arco ${process.env.FAKE_ARCO_VERSION ?? '0.10.0'}`);
 } else if (args[0] === 'deploy' && scenario === 'opterror') {
   console.error('The "--bogus" option does not exist.');
   process.exit(1);
@@ -25,6 +27,9 @@ if (args[0] === '--version') {
   // Register before the first output so a stop can never race ahead of these.
   if (scenario === 'stubborn') process.on('SIGTERM', () => {});
   if (scenario === 'hang' || scenario === 'stubborn') appendFileSync(process.env.FAKE_ARCO_CALLS, `pid ${process.pid}\n`);
+  if (process.env.FAKE_ARCO_LAYERFILE && process.env.ARCO_CONFIG_LAYER) {
+    writeFileSync(process.env.FAKE_ARCO_LAYERFILE, readFileSync(process.env.ARCO_CONFIG_LAYER, 'utf8'));
+  }
   if (process.env.FAKE_ARCO_DNSFILE && process.env.AWS_SHARED_CREDENTIALS_FILE) {
     writeFileSync(process.env.FAKE_ARCO_DNSFILE, readFileSync(process.env.AWS_SHARED_CREDENTIALS_FILE, 'utf8'));
   }

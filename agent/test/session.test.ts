@@ -23,6 +23,23 @@ async function cloud(o: Partial<FakeCloudOptions> = {}): Promise<FakeCloud> {
 const open = (c: FakeCloud, redactor: Redactor, defer = true) =>
   openSession({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1', nonce: NONCE, defer, redactor, warn: () => {}, keepAliveMs: 60_000 });
 
+describe('config layer', () => {
+  it.each([[{ schema: 1 }], [null]])('carries config %j from start into the completed session', async (config) => {
+    const c = await cloud({ config });
+    const opened = await open(c, new Redactor());
+    expect(opened.config).toEqual(config);
+    const issued = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' });
+    expect(completeSession(opened, issued, new Redactor()).started.config).toEqual(config);
+  });
+
+  it('throws a MalformedAnswer naming the field when config is not an object', async () => {
+    const c = await cloud({ startAnswer: { status: 200, body: { environment: 'production', mode: 'deploy', credentials: null, config: [1] } } });
+    const e = await open(c, new Redactor()).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(MalformedAnswer);
+    expect((e as Error).message).toBe('Arco Cloud start answer was malformed (config)');
+  });
+});
+
 describe('RUNNER_CAPABILITIES', () => {
   it('is what start announces', () => {
     expect(RUNNER_CAPABILITIES).toEqual(['external_dns']);
@@ -34,7 +51,7 @@ describe('openSession', () => {
     const c = await cloud();
     const o = await open(c, new Redactor());
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'] });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'], supports_config_layer: true });
       expect(o.issued).toBeNull();
       expect(o.environment).toBe('production');
       expect(o.mode).toBe('deploy');
@@ -66,7 +83,7 @@ describe('external DNS', () => {
     const c = await cloud({ ignoreDefer: true });
     const o = await open(c, new Redactor(), false);
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns'] });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns'], supports_config_layer: true });
     } finally {
       await o.session.batcher.close();
     }

@@ -188,7 +188,7 @@ describe('runJob: secrets', () => {
     });
     expect(r.result.finished).toBe(true);
     const start = JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'));
-    expect(start).toEqual({ nonce: NONCE, capabilities: ['external_dns'] });
+    expect(start).toEqual({ nonce: NONCE, capabilities: ['external_dns'], supports_config_layer: true });
     const c = { accessKeyId: 'AKIAFAKECLOUD0000001', secretAccessKey: 'fake/Secret+Access+Key/0123456789abcdefABCD', sessionToken: 'FwoGZXIvYXdzEFAKESESSIONTOKEN0123456789' };
     const job = r.cloud.options.job as { cache: { restore_url: string; save_url: string } };
     const secrets = [
@@ -201,6 +201,36 @@ describe('runJob: secrets', () => {
     for (const s of secrets) for (const v of secretVariants(s)) expect(all, `variant of ${s}`).not.toContain(v);
     expect(all).toContain('***');
     expect(r.logs.join('\n')).not.toContain(MASKED);
+  }, 30_000);
+});
+
+describe('runJob: config layer', () => {
+  const LAYER = { schema: 1, app: 'shop', environments: { production: { queues: { emails: { timeout: 60 } } } } };
+
+  it.each([['deferred', true], ['non-deferred', false]])('hands the deploy child the layer as ARCO_CONFIG_LAYER and removes it (%s)', async (_n, defer) => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const arcoDump = join(w.out, 'arco-env.json');
+    const layerFile = join(w.out, 'layer.json');
+    const r = await run(w, {
+      env: { FAKE_ARCO_CALLS: calls, FAKE_ARCO_ENVDUMP: arcoDump, FAKE_ARCO_LAYERFILE: layerFile, FAKE_ARCO_VERSION: '0.13.0' },
+      job: { defer_credentials: defer },
+      cloud: { config: LAYER, ignoreDefer: !defer },
+    });
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: true, idleReported: true });
+    expect(JSON.parse(await readFile(layerFile, 'utf8'))).toEqual(LAYER);
+    const env = JSON.parse(await readFile(`${arcoDump}.deploy`, 'utf8')) as Record<string, string>;
+    expect(env.ARCO_CONFIG_LAYER).toContain('arco-layer-');
+    expect(existsSync(env.ARCO_CONFIG_LAYER!)).toBe(false);
+    expect(r.finishes[0]).toMatchObject({ result: 'succeeded', arco_version: '0.13.0' });
+  }, 30_000);
+
+  it('finishes config.arco_outdated without deploying when the project has Arco 0.12', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, { env: { FAKE_ARCO_CALLS: calls, FAKE_ARCO_VERSION: '0.12.1' }, job: { defer_credentials: true }, cloud: { config: LAYER } });
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'config.arco_outdated', arco_version: '0.12.1' });
+    expect(await readFile(calls, 'utf8')).not.toMatch(/^deploy/m);
   }, 30_000);
 });
 
@@ -282,6 +312,17 @@ describe('runJob: errors and refusals', () => {
     expect(r.idleCallsAtIdlePhase).toBe(0);
     expect(r.result).toEqual({ deploymentId: 'dep_1', finished: false, buildOk: false, idleReported: true });
     expect(existsSync(join(w.paths.repo, 'composer.json'))).toBe(false);
+  });
+
+  it('finishes runner.internal_error without a wipe when start answers a malformed config', async () => {
+    const w = await world();
+    const r = await run(w, { cloud: { startAnswer: { status: 200, body: {
+      environment: 'production', mode: 'deploy', region: 'us-east-1', credentials: null, config: 'not-an-object',
+    } } } });
+    expect(r.order).toEqual(['claim', 'start', 'finish', 'idle']);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'runner.internal_error' });
+    expect(r.finishes[0].error_message).toBe('Could not start the run: Arco Cloud start answer was malformed (config)');
+    expect(r.wipes).toEqual([]);
   });
 
   it('finishes runner.internal_error without a wipe when start answers a malformed dns, and still reports idle', async () => {
@@ -650,7 +691,7 @@ describe('runJob: deferred credentials', () => {
       job: { defer_credentials: true },
       deps: { killBuildProcesses: async () => { if (killedAt === 0) killedAt = Date.now(); } },
     });
-    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'] });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'], supports_config_layer: true });
     const creds = r.order.indexOf('credentials');
     expect(r.order.slice(0, 2)).toEqual(['claim', 'start']);
     expect(new Set(r.order.slice(2, creds))).toEqual(new Set(['logs']));
@@ -670,7 +711,7 @@ describe('runJob: deferred credentials', () => {
     const r = await run(w, {
       job: { tests: { command: 'true', services: [] } },
     });
-    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'] });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'], supports_config_layer: true });
     expect(r.cloud.calls('/credentials')).toHaveLength(1);
   }, 30_000);
 

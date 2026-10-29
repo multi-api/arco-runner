@@ -2,7 +2,8 @@
 // Self-contained (node built-ins only): tests use it, and `/validate` runs it on 127.0.0.1 for its canned job.
 //
 //   POST /api/v1/runner/claim                 {ticket} -> 200 job | 409 ticket_invalid | 503 claim_unavailable
-//   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?, capabilities?} -> 200 credentials (null when deferred)
+//   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?, capabilities?, supports_config_layer?}
+//                                             -> 200 credentials (null when deferred) and `config`
 //                                             | 409 runner_outdated (job has tests, flag missing)
 //   POST /api/v1/deployments/{id}/credentials {}       -> 200 {credentials, region, permissionsBoundary} once,
 //                                             then 409 credentials_already_issued | 409 finished
@@ -40,6 +41,8 @@ export interface FakeCloudOptions {
   dns?: { profile: string; credentials: { accessKeyId: string; secretAccessKey: string; sessionToken: string; expiration: string } } | null;
   cloudflareToken?: string | null;
   permissionsBoundary?: string | null;
+  /** The config layer every start answer carries. Default null. */
+  config?: Record<string, unknown> | null;
   /** When set, every start request gets this answer instead of the credentials. */
   startAnswer?: CannedAnswer;
   /** An older Cloud: start ignores defer_credentials (and the tests rule) and always returns credentials. */
@@ -155,7 +158,7 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
     };
     if (action === 'start') {
       if (options.startAnswer) return json(res, options.startAnswer.status, options.startAnswer.body);
-      const answer = { environment: options.job.environment, mode: options.job.mode };
+      const answer = { environment: options.job.environment, mode: options.job.mode, config: options.config ?? null };
       if (!options.ignoreDefer) {
         const defer = parse(body)?.defer_credentials === true;
         const tests = options.job.tests;
