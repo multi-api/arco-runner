@@ -1,7 +1,8 @@
 // The runner's own start and credentials calls (spec §4.1). The shared client's startRun always expects credentials
 // from start; the runner asks start to defer them and fetches them from /credentials right before arco deploy.
 import {
-  Batcher, CloudApi, CloudApiError, isRunLost, parseExternalDns, type Credentials, type ExternalDns, type Redactor, type RunSession, type StartResponse,
+  Batcher, CloudApi, CloudApiError, isRunLost, parseConfigLayer, parseExternalDns, type ConfigLayer, type Credentials, type ExternalDns,
+  type Redactor, type RunSession, type StartResponse,
 } from '@multiapi/arco-cloud-client';
 
 /** The deploy credentials, from /credentials or from an older Cloud's start answer. */
@@ -21,12 +22,17 @@ export interface OpenSession {
   issued: Issued | null;
   environment: string;
   mode: string;
+  /** The Arco Cloud config layer from start (null without managed resources); deployAndFinish hands it to Arco. */
+  config: ConfigLayer | null;
   /** Ends the run like a fatal logs answer does: sets the abort message and aborts session.signal. */
   markRunLost(e: unknown): void;
 }
 
 /** What this runner tells Cloud it can do, sent with every start. */
 export const RUNNER_CAPABILITIES = ['external_dns'];
+
+/** Sent with every start: this runner writes `config` to a file and sets ARCO_CONFIG_LAYER (through deployAndFinish). */
+export const SUPPORTS_CONFIG_LAYER = true;
 
 const TIMEOUT_MS = 30_000;
 const CREDENTIAL_RETRY_SLEEPS_MS = [1000, 2000];
@@ -146,13 +152,21 @@ export async function openSession(o: {
   warn: (m: string) => void; keepAliveMs: number; fetchImpl?: typeof fetch;
 }): Promise<OpenSession> {
   const capabilities = RUNNER_CAPABILITIES;
-  const body = o.defer ? { nonce: o.nonce, defer_credentials: true, capabilities } : { nonce: o.nonce, capabilities };
+  const common = { nonce: o.nonce, capabilities, supports_config_layer: SUPPORTS_CONFIG_LAYER };
+  const body = o.defer ? { ...common, defer_credentials: true } : common;
   const started = (await post(o.apiBase, o.token, o.deploymentId, 'start', body, o.fetchImpl ?? fetch)) as
     Omit<StartResponse, 'credentials'> & { credentials: Credentials | null };
   const { redactor } = o;
   redactor.add(o.token);
   redactor.add(o.nonce);
   const issued = started.credentials ? toIssued(started, 'start') : null;
+  let config: ConfigLayer | null;
+  try {
+    config = parseConfigLayer(started, 'start');
+  } catch (e) {
+    // The client's message names the field, never the value; as a MalformedAnswer it closes the run.
+    throw new MalformedAnswer('start', (e as Error).message);
+  }
   if (issued) for (const v of credentialValues(issued)) redactor.add(v);
 
   const api = new CloudApi(o.apiBase, o.token, o.deploymentId);
@@ -181,6 +195,7 @@ export async function openSession(o: {
     issued,
     environment: started.environment,
     mode: started.mode,
+    config,
     markRunLost,
   };
 }
@@ -225,7 +240,7 @@ export function completeSession(open: OpenSession, issued: Issued, redactor: Red
     secrets: [...redactor.secrets],
     dns,
     cloudflareToken,
-    started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode },
+    started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode, config: open.config },
     awsEnv: {
       AWS_ACCESS_KEY_ID: credentials.accessKeyId,
       AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,
