@@ -40,9 +40,34 @@ describe('config layer', () => {
   });
 });
 
+describe('extensions', () => {
+  const ext = { version: '1.0.1', url: 'https://example.test/xray.tar.gz', sha256: 'a'.repeat(64), config: { token: 't' } };
+  const answer = (extensions: unknown) => ({ status: 200, body: { environment: 'production', mode: 'deploy', credentials: null, extensions } });
+
+  it('carries extensions from start into the completed session', async () => {
+    const c = await cloud({ startAnswer: answer({ xray: ext }) });
+    const opened = await open(c, new Redactor());
+    expect(opened.extensions).toEqual({ xray: ext });
+    const issued = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' });
+    expect(completeSession(opened, issued, new Redactor()).started.extensions).toEqual({ xray: ext });
+  });
+
+  it.each([[null], [undefined]])('has none when start sends %j', async (extensions) => {
+    const c = await cloud({ startAnswer: answer(extensions) });
+    expect((await open(c, new Redactor())).extensions).toEqual({});
+  });
+
+  it('throws a MalformedAnswer naming the field when extensions are malformed', async () => {
+    const c = await cloud({ startAnswer: answer([1]) });
+    const e = await open(c, new Redactor()).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(MalformedAnswer);
+    expect((e as Error).message).toBe('Arco Cloud start answer was malformed (extensions)');
+  });
+});
+
 describe('RUNNER_CAPABILITIES', () => {
   it('is what start announces', () => {
-    expect(RUNNER_CAPABILITIES).toEqual(['external_dns']);
+    expect(RUNNER_CAPABILITIES).toEqual(['external_dns', 'extensions']);
   });
 });
 
@@ -51,7 +76,7 @@ describe('openSession', () => {
     const c = await cloud();
     const o = await open(c, new Redactor());
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'], supports_config_layer: true });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
       expect(o.issued).toBeNull();
       expect(o.environment).toBe('production');
       expect(o.mode).toBe('deploy');
@@ -83,7 +108,7 @@ describe('external DNS', () => {
     const c = await cloud({ ignoreDefer: true });
     const o = await open(c, new Redactor(), false);
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns'], supports_config_layer: true });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
     } finally {
       await o.session.batcher.close();
     }
