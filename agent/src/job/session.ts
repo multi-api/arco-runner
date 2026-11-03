@@ -1,7 +1,8 @@
 // The runner's own start and credentials calls (spec §4.1). The shared client's startRun always expects credentials
 // from start; the runner asks start to defer them and fetches them from /credentials right before arco deploy.
 import {
-  Batcher, CloudApi, CloudApiError, isRunLost, parseConfigLayer, parseExternalDns, type ConfigLayer, type Credentials, type ExternalDns,
+  Batcher, CloudApi, CloudApiError, isRunLost, parseConfigLayer, parseExtensions, parseExternalDns, type ConfigLayer, type Credentials,
+  type Extension, type ExternalDns,
   type Redactor, type RunSession, type StartResponse,
 } from '@multiapi/arco-cloud-client';
 
@@ -24,12 +25,14 @@ export interface OpenSession {
   mode: string;
   /** The Arco Cloud config layer from start (null without managed resources); deployAndFinish hands it to Arco. */
   config: ConfigLayer | null;
+  /** The Arco Cloud extensions from start (empty without any); deployAndFinish places them under `.arco-cloud/`. */
+  extensions: Record<string, Extension>;
   /** Ends the run like a fatal logs answer does: sets the abort message and aborts session.signal. */
   markRunLost(e: unknown): void;
 }
 
 /** What this runner tells Cloud it can do, sent with every start. */
-export const RUNNER_CAPABILITIES = ['external_dns'];
+export const RUNNER_CAPABILITIES = ['external_dns', 'extensions'];
 
 /** Sent with every start: this runner writes `config` to a file and sets ARCO_CONFIG_LAYER (through deployAndFinish). */
 export const SUPPORTS_CONFIG_LAYER = true;
@@ -161,8 +164,10 @@ export async function openSession(o: {
   redactor.add(o.nonce);
   const issued = started.credentials ? toIssued(started, 'start') : null;
   let config: ConfigLayer | null;
+  let extensions: Record<string, Extension>;
   try {
     config = parseConfigLayer(started, 'start');
+    extensions = parseExtensions(started);
   } catch (e) {
     // The client's message names the field, never the value; as a MalformedAnswer it closes the run.
     throw new MalformedAnswer('start', (e as Error).message);
@@ -196,6 +201,7 @@ export async function openSession(o: {
     environment: started.environment,
     mode: started.mode,
     config,
+    extensions,
     markRunLost,
   };
 }
@@ -240,7 +246,8 @@ export function completeSession(open: OpenSession, issued: Issued, redactor: Red
     secrets: [...redactor.secrets],
     dns,
     cloudflareToken,
-    started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode, config: open.config },
+    started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode, config: open.config,
+      extensions: open.extensions },
     awsEnv: {
       AWS_ACCESS_KEY_ID: credentials.accessKeyId,
       AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,

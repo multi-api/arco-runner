@@ -188,7 +188,7 @@ describe('runJob: secrets', () => {
     });
     expect(r.result.finished).toBe(true);
     const start = JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'));
-    expect(start).toEqual({ nonce: NONCE, capabilities: ['external_dns'], supports_config_layer: true });
+    expect(start).toEqual({ nonce: NONCE, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
     const c = { accessKeyId: 'AKIAFAKECLOUD0000001', secretAccessKey: 'fake/Secret+Access+Key/0123456789abcdefABCD', sessionToken: 'FwoGZXIvYXdzEFAKESESSIONTOKEN0123456789' };
     const job = r.cloud.options.job as { cache: { restore_url: string; save_url: string } };
     const secrets = [
@@ -691,7 +691,7 @@ describe('runJob: deferred credentials', () => {
       job: { defer_credentials: true },
       deps: { killBuildProcesses: async () => { if (killedAt === 0) killedAt = Date.now(); } },
     });
-    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'], supports_config_layer: true });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
     const creds = r.order.indexOf('credentials');
     expect(r.order.slice(0, 2)).toEqual(['claim', 'start']);
     expect(new Set(r.order.slice(2, creds))).toEqual(new Set(['logs']));
@@ -711,7 +711,7 @@ describe('runJob: deferred credentials', () => {
     const r = await run(w, {
       job: { tests: { command: 'true', services: [] } },
     });
-    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns'], supports_config_layer: true });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
     expect(r.cloud.calls('/credentials')).toHaveLength(1);
   }, 30_000);
 
