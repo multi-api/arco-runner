@@ -1,4 +1,5 @@
 // Packages the runner image build context as a zip (Dockerfile at the root) for CreateMicrovmImage.
+//   --minor 8.5 (or --image php85) | --image go; the go image ships go.tar.gz instead of FrankenPHP.
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,8 @@ import { dirname, join, relative, resolve } from 'node:path';
 import yazl from 'yazl';
 import { renderDockerfile } from './lib/dockerfile.ts';
 import { bundleFixture } from './lib/fixture-bundle.ts';
-import { checkFile, defaultVersionsPath, parseArgs, phpEntry, readVersions, repoRoot } from './lib/versions.ts';
+import { imageSpec } from './lib/images.ts';
+import { checkFile, defaultVersionsPath, parseArgs, readVersions, repoRoot } from './lib/versions.ts';
 
 const MTIME = new Date('2026-01-01T00:00:00Z'); // fixed, so the same inputs give the same zip
 
@@ -19,16 +21,18 @@ function* walk(dir: string): Generator<string> {
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2), ['minor', 'inputs', 'out', 'agent', 'fixture']);
-  const minor = args.minor!;
+  const args = parseArgs(process.argv.slice(2), ['inputs', 'out', 'agent', 'fixture']);
   const versions = readVersions(process.env.ARCO_VERSIONS_FILE ?? defaultVersionsPath);
-  const php = phpEntry(versions, minor);
+  const image = imageSpec(versions, args);
+  const minor = image.phpMinor;
+  const php = image.php;
   const revision = args.revision ?? execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
 
   // Re-check the inputs: they may have sat on disk since fetch-inputs verified them.
   const inputs = resolve(args.inputs!);
   await checkFile(join(inputs, 'php'), 'php', php.php_cli_sha256, php.php_cli_size);
-  await checkFile(join(inputs, 'frankenphp'), 'frankenphp', php.frankenphp_sha256, php.frankenphp_size);
+  if (image.go) await checkFile(join(inputs, 'go.tar.gz'), 'go.tar.gz', image.go.sha256, image.go.size);
+  else await checkFile(join(inputs, 'frankenphp'), 'frankenphp', php.frankenphp_sha256, php.frankenphp_size);
   await checkFile(join(inputs, 'composer.phar'), 'composer.phar', versions.composer.sha256);
   await checkFile(join(inputs, 'tini'), 'tini', versions.tini.sha256, versions.tini.size);
   await checkFile(join(inputs, 'mysql.tar.xz'), 'mysql.tar.xz', versions.services.mysql.sha256, versions.services.mysql.size);
@@ -47,6 +51,8 @@ async function main(): Promise<void> {
     corepack: versions.corepack.version,
     mysqlVersion: versions.services.mysql.version,
     redisPackage: versions.services.redis.package,
+    image: { id: image.id, kind: image.kind },
+    ...(image.go ? { goVersion: image.go.version } : {}),
   });
   addBuffer(Buffer.from(dockerfile), 'Dockerfile', 0o644);
 
@@ -54,7 +60,8 @@ async function main(): Promise<void> {
   for (const f of walk(rootfs)) add(f, `rootfs/${relative(rootfs, f)}`, 0o644);
 
   add(join(inputs, 'php'), 'inputs/php', 0o755);
-  add(join(inputs, 'frankenphp'), 'inputs/frankenphp', 0o755);
+  if (image.go) add(join(inputs, 'go.tar.gz'), 'inputs/go.tar.gz', 0o644);
+  else add(join(inputs, 'frankenphp'), 'inputs/frankenphp', 0o755);
   add(join(inputs, 'composer.phar'), 'inputs/composer.phar', 0o755);
   add(join(inputs, 'tini'), 'inputs/tini', 0o755);
   add(join(inputs, 'mysql.tar.xz'), 'inputs/mysql.tar.xz', 0o644);

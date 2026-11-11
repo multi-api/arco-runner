@@ -56,3 +56,31 @@ jobs:
           npm ci --prefix integration
           npm --prefix integration run typecheck
           npm run test:integration
+
+  # The go image (Go apps): build it and run /validate in it (the Laravel fixture through the real pipeline, the
+  # test services, and a Go build as the build user, offline). The integration suite runs on php85 only.
+  image-go:
+    runs-on: ubuntu-24.04-arm
+    needs: unit
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node agent/build.mjs
+      - name: Fetch inputs
+        run: npx tsx scripts/fetch-inputs.ts --image go --out build/inputs
+      - name: Package
+        run: >
+          npx tsx scripts/package-image.ts --image go --inputs build/inputs --out build/image.zip
+          --agent agent/dist/arco-runner.mjs --fixture fixture --validate-cli agent/dist/validate-cli.mjs
+      - name: Build image
+        run: |
+          mkdir build/context && unzip -q build/image.zip -d build/context
+          docker build --platform linux/arm64 -t arco-runner:go-ci build/context
+      - name: Validate
+        run: docker run --rm --network none --user 0 arco-runner:go-ci /usr/bin/node /opt/arco-runner/validate-cli.mjs

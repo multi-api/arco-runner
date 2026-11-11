@@ -1,6 +1,6 @@
 # Arco Runner
 
-The runner is what builds and deploys a customer's Laravel app for [Arco Cloud](https://github.com/multi-api). It is a small Node agent (`agent/`) plus an Amazon Linux 2023 image (`image/`) that runs either as a Lambda MicroVM (image `arco-runner-php85`) or as a Fargate task. Cloud hands the runner a one-time ticket; the runner claims the job, clones the repository, restores the dependency cache, runs the build commands, runs `arco deploy`, saves the cache, wipes itself and reports `idle`.
+The runner is what builds and deploys a customer's Laravel or Go app for [Arco Cloud](https://github.com/multi-api). It is a small Node agent (`agent/`) plus Amazon Linux 2023 images (`image/`) that run either as a Lambda MicroVM (images `arco-runner-php85` and `arco-runner-go`) or as a Fargate task. Cloud hands the runner a one-time ticket; the runner claims the job, clones the repository, restores the dependency cache, runs the build commands, runs `arco deploy`, saves the cache, wipes itself and reports `idle`.
 
 This repository is public and MIT licensed so customers can audit what runs their builds. Nothing secret lives in it.
 
@@ -17,7 +17,7 @@ This repository is public and MIT licensed so customers can audit what runs thei
 | Path | What |
 | --- | --- |
 | `agent/` | The agent (TypeScript, esbuild bundle `agent/dist/arco-runner.mjs`) |
-| `image/` | `Dockerfile`, `versions.json` (pinned PHP, Composer, corepack, base digest, test services), `rootfs/` |
+| `image/` | `Dockerfile` (one template for both images), `versions.json` (pinned PHP, Go, Composer, corepack, base digest, test services), `rootfs/` |
 | `scripts/` | Image tooling: `fetch-inputs`, `package-image`, `bump-php`, `publish-microvm-image`, `prune-microvm-images` |
 | `fixture/` | Canned app used by `/validate` and the integration tests |
 | `integration/` | Docker integration suite with a fake Cloud |
@@ -64,6 +64,38 @@ ARCO_SMOKE_TICKET=<ticket> npm run smoke:herd -- --deployment <id>
 ```
 
 It runs the image with `ARCO_RUNNER_ALLOW_HTTP=1` and `--add-host arco-cloud.test:host-gateway`, trusts Herd's CA in the agent (`NODE_EXTRA_CA_CERTS`), waits for the control port, posts the ticket to `/job`, follows `/healthz` until the runner is idle again, prints the agent's output and removes the container. If the site is not secured in Herd, pass `--api-base http://arco-cloud.test`. The project's own `vendor/bin/arco` runs for real, so use a deployment whose app and AWS account you are happy to deploy to. It is manual and not part of CI.
+
+## The go image
+
+Go apps (Cloud's `CLOUD_LANGUAGES_GO`) build on one image for every Go version, `go`, next to `php85`. Both come from the same `image/Dockerfile`: `package-image` keeps the `# @go-begin`…`# @go-end` blocks for the go image and the `# @php-begin`…`# @php-end` blocks (the FrankenPHP runtime pre-seed) for the PHP images.
+
+| What | In the go image |
+| --- | --- |
+| Go | The official `go<version>.linux-arm64.tar.gz` pinned in `versions.json` (`go.version`, `sha256`, `size`; verified by `fetch-inputs` and `package-image`), extracted in its own stage to `/usr/local/go`, `go` and `gofmt` linked into `/usr/local/bin` |
+| Other Go versions | The agent's build env sets `GOTOOLCHAIN=auto`: a `go.mod` whose `go` or `toolchain` line asks for a newer Go downloads that toolchain into the module cache |
+| Module cache | `GOMODCACHE=/home/build/.cache/go-mod` (with `GOFLAGS=-modcacherw`), a cache root: the wipe keeps it on a warm VM and the S3 cache archives it; `go.sum` is one of the lock hashes that decide when the cache is saved again. `GOCACHE=/home/build/.cache/go-build` and `GOPATH=/home/build/go` are wiped after every build |
+| PHP and Composer | The PHP CLI of `versions.go.php_minor` (8.5, which must match Cloud's `RunnerJobs::GO_PHP_VERSION` and its `arco-deploy-go.yml` stub) and Composer, only to run Arco |
+| Arco | Not baked in. Cloud's first build command is `composer global require multiapi/arco:<pinned version> --no-interaction` and its job env has `ARCO_BIN=arco`. The agent's build PATH ends with Composer's global bin dir (`/home/build/.config/composer/vendor/bin`, last so nothing there shadows a system tool), and the agent checks and runs `$ARCO_BIN` there instead of `vendor/bin/arco`. The global install itself is wiped after each build; the downloaded packages stay in the Composer cache (`~/.cache/composer`, a cache root) |
+| Node, test services, tini | As in `php85`. JS build commands (`npm`, `npx`, `yarn`, `pnpm`, `corepack`) are still skipped when the app has no `package.json` |
+| `ARCO_RUNNER_IMAGE` | `go`: `/validate` then skips the FrankenPHP runtime pre-seed check (no Go app uses it) and builds and runs a Go program as the build user, offline, besides the usual fixture jobs and service smoke |
+
+`ARCO_BIN` defaults to `vendor/bin/arco`, so Laravel builds behave as before. A value with a slash resolves against the app directory; a bare name is looked up on the build PATH. If it is missing, the run fails `arco.not_installed` naming it.
+
+To move the go image to a newer Go, take the `linux-arm64` `archive` entry from `https://go.dev/dl/?mode=json` and update `go.version`, `go.sha256` and `go.size` in `versions.json`. Projects keep working either way: `GOTOOLCHAIN=auto` fetches what their `go.mod` asks for.
+
+### Building the go image locally
+
+```sh
+npx tsx scripts/fetch-inputs.ts --image go --out build/inputs-go   # needs the gh CLI to verify the PHP CLI attestation
+node agent/build.mjs
+npx tsx scripts/package-image.ts --image go --inputs build/inputs-go --out build/image-go.zip \
+  --agent agent/dist/arco-runner.mjs --fixture fixture --validate-cli agent/dist/validate-cli.mjs
+mkdir -p build/context-go && unzip -q -o build/image-go.zip -d build/context-go
+docker build --platform linux/arm64 -t arco-runner:go-dev build/context-go
+docker run --rm --network none --user 0 arco-runner:go-dev /usr/bin/node /opt/arco-runner/validate-cli.mjs
+```
+
+`--minor 8.5` (or `--image php85`) still selects the PHP image in every script.
 
 ## Image
 
@@ -115,12 +147,12 @@ The whole `/validate` (service smoke plus both canned jobs) took 9.9–10.3 s. S
 
 ## Publishing
 
-`.github/workflows/publish.yml` runs on every push to `main` (stage `staging`), monthly (`0 6 1 * *`, staging) and by `workflow_dispatch` with `stage` (`staging` or `prod`) and `os_capabilities_all`. `prod` runs in the GitHub environment `prod`, where the owner sets a required reviewer. Per stage it:
+`.github/workflows/publish.yml` runs on every push to `main` (stage `staging`), monthly (`0 6 1 * *`, staging) and by `workflow_dispatch` with `stage` (`staging` or `prod`) and `os_capabilities_all`. `prod` runs in the GitHub environment `prod`, where the owner sets a required reviewer. It publishes both images, `php85` and `go`, as a matrix (one failing does not cancel the other). Per stage and image (`<image>` below) it:
 
 1. assumes the publisher role through GitHub OIDC (`vars.PUBLISHER_ROLE_ARN`, `vars.AWS_REGION`);
-2. downloads and verifies the PHP CLI, FrankenPHP, Composer, tini and the MySQL tarball, bundles the agent and packages `build/image.zip`;
-3. runs `scripts/publish-microvm-image.ts`: uploads the zip to `s3://$ARTIFACT_BUCKET/images/arco-runner-php85/<sha>.zip`, creates or updates the MicroVM image `arco-runner-php85` on the newest managed `al2023` base, and waits (up to 60 minutes) for the new version to reach `SUCCESSFUL`, which includes the `/validate` fixture build. A `FAILED` version fails the job and prints its `stateReason`;
-4. builds and pushes `$ECR_REPO:php85-<sha>-<run id>-<run attempt>` (ECR tags are immutable, so every run, including the monthly rebuild of an unchanged `main` and re-runs, gets its own tag) and registers a new revision of the Fargate task definition `arco-runner-php85` (2 vCPU / 4 GB, ARM64, 30 GiB ephemeral storage, no task role);
+2. downloads and verifies the PHP CLI, FrankenPHP (`php85`) or Go (`go`), Composer, tini and the MySQL tarball, bundles the agent and packages `build/image.zip`;
+3. runs `scripts/publish-microvm-image.ts`: uploads the zip to `s3://$ARTIFACT_BUCKET/images/arco-runner-<image>/<sha>.zip`, creates or updates the MicroVM image `arco-runner-<image>` on the newest managed `al2023` base, and waits (up to 60 minutes) for the new version to reach `SUCCESSFUL`, which includes the `/validate` fixture build. A `FAILED` version fails the job and prints its `stateReason`;
+4. builds and pushes `$ECR_REPO:<image>-<sha>-<run id>-<run attempt>` (`php85-…` or `go-…`; ECR tags are immutable, so every run, including the monthly rebuild of an unchanged `main` and re-runs, gets its own tag) and registers a new revision of the Fargate task definition `arco-runner-<image>` (2 vCPU / 4 GB, ARM64, 30 GiB ephemeral storage, no task role, log stream prefix `<image>` in `/ecs/arco-runner`);
 5. writes the three values below to the job summary.
 
 **First staging publish:** `publish-microvm-image.ts` picks the managed base whose ARN contains `al2023` (the newest match). Before trusting it, confirm in the publish log (or `ListManagedMicrovmImages`) that the chosen base is the same `al2023-minimal` flavour the Dockerfile builds on (`public.ecr.aws/lambda/microvms:al2023-minimal`); if a non-minimal al2023 base is picked, tighten the match in the script before the image is used.
@@ -137,13 +169,25 @@ CLOUD_RUNNERS_IMAGE_VERSION_85=...
 CLOUD_RUNNERS_TASK_DEFINITION_85=...
 ```
 
+and, from the `go` matrix job (Cloud's `runners.go_image`):
+
+```
+CLOUD_RUNNERS_IMAGE_ARN_GO=arn:aws:lambda:<region>:<runners account>:microvm-image:arco-runner-go
+CLOUD_RUNNERS_IMAGE_VERSION_GO=<the version the publish waited for>
+CLOUD_RUNNERS_TASK_DEFINITION_GO=arn:aws:ecs:<region>:<runners account>:task-definition/arco-runner-go:<revision>
+```
+
+The task definition is only read with `CLOUD_RUNNERS_BACKEND=fargate`. Go builds also need Cloud's `CLOUD_PROCESS_ARCO_VERSION` (and optionally `CLOUD_PROCESS_ARCO_VERSIONS`), the Arco versions Cloud pins in `composer global require`; nothing in this repository depends on them.
+
+**First `go` publish, per stage:** the publisher role creates a new MicroVM image (`arco-runner-go`), its log group `/aws/lambda-microvms/arco-runner-go`, and a new task definition family `arco-runner-go`. If the role's policy scopes those by name (`arco-runner-php85`), widen it to `arco-runner-*` before the first run; the S3 key prefix `images/*` and the ECR repository are shared.
+
 One-time setup: create the repository, the `staging` and `prod` environments and their variables, and the runners accounts with the publisher permissions the Cloud plan lists (`ecs:RegisterTaskDefinition`, `iam:PassRole` on the execution role, `GetMicrovmImage`, `ListMicrovmImageVersions`, `DeleteMicrovmImageVersion`, `ListManagedMicrovmImages`, ECR push, `s3:PutObject` on `images/*`).
 
 Restrict the `prod` environment to deployments from the `main` branch, and limit the publisher role's trust policy to the subjects `repo:multi-api/arco-runner:environment:<stage>` (one per stage account), so only that environment can assume it.
 
 ### Pruning
 
-`prune.yml` (`workflow_dispatch`, inputs `stage` and `in_use_version`) deletes `arco-runner-php85` versions older than the version just before `in_use_version`. Only `SUCCESSFUL` versions count when choosing the previous version and when checking that at least 2 remain; it never deletes the in-use version, and refuses if the version is not a successful one. Pass the value currently set in `CLOUD_RUNNERS_IMAGE_VERSION_85`. ECR keeps its own last 10 images through a lifecycle rule.
+`prune.yml` (`workflow_dispatch`, inputs `stage`, `image` (`php85` or `go`) and `in_use_version`) deletes `arco-runner-<image>` versions older than the version just before `in_use_version`. Only `SUCCESSFUL` versions count when choosing the previous version and when checking that at least 2 remain; it never deletes the in-use version, and refuses if the version is not a successful one. Pass the value currently set in `CLOUD_RUNNERS_IMAGE_VERSION_85` (or `_GO` for the go image). ECR keeps its own last 10 images through a lifecycle rule.
 
 ## If `/validate` fails with `capabilities:`
 
