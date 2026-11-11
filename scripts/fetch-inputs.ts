@@ -1,16 +1,21 @@
-// Downloads the PHP CLI, FrankenPHP, Composer, tini and the MySQL tarball for one PHP minor and verifies them
-// against image/versions.json: size, sha256 and the arco-runtime build attestation. Any mismatch exits 1.
+// Downloads the inputs of one runner image and verifies them against image/versions.json: size, sha256 and, for
+// the arco-runtime builds, the build attestation. Any mismatch exits 1.
+//   --minor 8.5 (or --image php85): PHP CLI, FrankenPHP, Composer, tini, MySQL
+//   --image go:                     PHP CLI (versions.go.php_minor), Go, Composer, tini, MySQL
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream } from 'node:stream/web';
-import { checkFile, defaultVersionsPath, parseArgs, phpEntry, readVersions } from './lib/versions.ts';
+import { imageSpec } from './lib/images.ts';
+import { checkFile, defaultVersionsPath, parseArgs, readVersions } from './lib/versions.ts';
 
 const RELEASE_BASE = process.env.ARCO_RUNTIME_RELEASE_BASE ?? 'https://github.com/multi-api/arco-runtime/releases/download';
 const COMPOSER_BASE = process.env.COMPOSER_DOWNLOAD_BASE ?? 'https://getcomposer.org/download';
 const TINI_BASE = process.env.TINI_DOWNLOAD_BASE ?? 'https://github.com/krallin/tini/releases/download';
+// go.dev/dl redirects to dl.google.com; both are tried. The pinned sha256 is the one go.dev/dl/?mode=json lists.
+const GO_BASES = process.env.GO_DOWNLOAD_BASE ? [process.env.GO_DOWNLOAD_BASE] : ['https://go.dev/dl', 'https://dl.google.com/go'];
 const ATTEST_REPO = 'multi-api/arco-runtime';
 const ATTEST_SIGNER = 'multi-api/arco-runtime/.github/workflows/publish.yml';
 
@@ -46,9 +51,10 @@ async function verify(input: Input, path: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2), ['minor', 'out']);
+  const args = parseArgs(process.argv.slice(2), ['out']);
   const versions = readVersions(process.env.ARCO_VERSIONS_FILE ?? defaultVersionsPath);
-  const php = phpEntry(versions, args.minor!);
+  const image = imageSpec(versions, args);
+  const php = image.php;
   const out = args.out!;
   mkdirSync(out, { recursive: true });
 
@@ -61,14 +67,24 @@ async function main(): Promise<void> {
       size: php.php_cli_size,
       attest: true,
     },
-    {
-      asset: 'frankenphp-linux-aarch64',
-      urls: [`${RELEASE_BASE}/${php.release}/frankenphp-linux-aarch64`],
-      dest: join(out, 'frankenphp'),
-      sha256: php.frankenphp_sha256,
-      size: php.frankenphp_size,
-      attest: true,
-    },
+    image.go
+      ? {
+          // Go publishes sha256 sums, no attestation: the pinned size and sha256 are the check.
+          asset: `go${image.go.version}.linux-arm64.tar.gz`,
+          urls: GO_BASES.map((b) => `${b}/go${image.go!.version}.linux-arm64.tar.gz`),
+          dest: join(out, 'go.tar.gz'),
+          sha256: image.go.sha256,
+          size: image.go.size,
+          attest: false,
+        }
+      : {
+          asset: 'frankenphp-linux-aarch64',
+          urls: [`${RELEASE_BASE}/${php.release}/frankenphp-linux-aarch64`],
+          dest: join(out, 'frankenphp'),
+          sha256: php.frankenphp_sha256,
+          size: php.frankenphp_size,
+          attest: true,
+        },
     {
       asset: 'composer.phar',
       urls: [`${COMPOSER_BASE}/${versions.composer.version}/composer.phar`],

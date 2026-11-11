@@ -1,7 +1,7 @@
 // Publishes the packaged image zip as a Lambda MicroVM image: upload to S3, create or update
-// `arco-runner-php85` on the newest managed al2023 base, wait for the new version to build and
-// pass /validate, then print the ARN and version the owner sets in Cloud (spec A4).
-//   publish-microvm-image.ts --stage <s> --zip <path> --minor 8.5 [--os-capabilities-all]
+// `arco-runner-php85` (or `arco-runner-go`) on the newest managed al2023 base, wait for the new version to build
+// and pass /validate, then print the ARN and version the owner sets in Cloud (spec A4).
+//   publish-microvm-image.ts --stage <s> --zip <path> (--minor 8.5 | --image go) [--os-capabilities-all]
 // Env: ARTIFACT_BUCKET, BUILD_ROLE_ARN, AWS_REGION (+ AWS credentials); GITHUB_SHA (else git HEAD).
 import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
@@ -16,6 +16,7 @@ import {
 import { S3Client } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { createReadStream } from 'node:fs';
+import { imageId } from './lib/images.ts';
 
 export const POLL_INTERVAL_MS = 15_000;
 export const POLL_TIMEOUT_MS = 60 * 60_000;
@@ -32,6 +33,7 @@ export interface PublishDeps {
 export interface PublishOptions {
   stage: string;
   zip: string;
+  /** A PHP minor (`8.5`, the image `php85`) or an image id (`php85`, `go`). */
   minor: string;
   osCapabilitiesAll: boolean;
   sha: string;
@@ -44,8 +46,9 @@ export class PublishFailed extends Error {}
 
 const isNotFound = (e: unknown): boolean => (e as { name?: string })?.name === 'ResourceNotFoundException';
 
-export function imageName(minor: string): string {
-  return `arco-runner-php${minor.replace('.', '')}`;
+/** `8.5` or `php85` → `arco-runner-php85`; `go` → `arco-runner-go`. */
+export function imageName(minorOrImage: string): string {
+  return `arco-runner-${imageId(minorOrImage)}`;
 }
 
 /** The account id of an IAM role ARN (`arn:aws:iam::<account>:role/...`). */
@@ -150,6 +153,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, deps: Publish
       stage: { type: 'string' },
       zip: { type: 'string' },
       minor: { type: 'string' },
+      image: { type: 'string' },
       'os-capabilities-all': { type: 'boolean', default: false },
     },
   });
@@ -161,7 +165,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, deps: Publish
     const opts: PublishOptions = {
       stage: need(values.stage, '--stage'),
       zip: need(values.zip, '--zip'),
-      minor: need(values.minor, '--minor'),
+      minor: need(values.image ?? values.minor, '--minor or --image'),
       osCapabilitiesAll: values['os-capabilities-all'] ?? false,
       sha: need(env.GITHUB_SHA ?? gitSha(), 'GITHUB_SHA'),
       bucket: need(env.ARTIFACT_BUCKET, 'ARTIFACT_BUCKET'),

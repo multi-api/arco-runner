@@ -1,6 +1,6 @@
 // Deletes old versions of a MicroVM image: everything older than the version just before
 // `--in-use-version`. Refuses when that would leave fewer than 2 versions or the version is unknown.
-//   prune-microvm-images.ts --minor 8.5 --in-use-version <v> [--dry-run]
+//   prune-microvm-images.ts (--minor 8.5 | --image go) --in-use-version <v> [--dry-run]
 import { parseArgs } from 'node:util';
 import { DeleteMicrovmImageVersionCommand, LambdaMicrovmsClient, ListMicrovmImageVersionsCommand } from '@aws-sdk/client-lambda-microvms';
 import { accountOfRoleArn, imageArnFor, imageName } from './publish-microvm-image.ts';
@@ -22,14 +22,15 @@ export function planPrune(versions: VersionInfo[], inUse: string): string[] {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { values } = parseArgs({ options: { minor: { type: 'string' }, 'in-use-version': { type: 'string' }, 'dry-run': { type: 'boolean', default: false } } });
-  if (!values.minor || !values['in-use-version']) throw new Error('--minor and --in-use-version are required');
-  const name = imageName(values.minor);
+  const { values } = parseArgs({ options: { minor: { type: 'string' }, image: { type: 'string' }, 'in-use-version': { type: 'string' }, 'dry-run': { type: 'boolean', default: false } } });
+  const target = values.image ?? values.minor;
+  if (!target || !values['in-use-version']) throw new Error('--minor (or --image) and --in-use-version are required');
+  const name = imageName(target);
   const region = process.env.AWS_REGION;
   const roleArn = process.env.PUBLISHER_ROLE_ARN;
   if (!region || !roleArn) throw new Error('AWS_REGION and PUBLISHER_ROLE_ARN are required');
   // The MicroVM APIs want the image ARN as imageIdentifier, not the name.
-  const identifier = imageArnFor(region, accountOfRoleArn(roleArn), values.minor);
+  const identifier = imageArnFor(region, accountOfRoleArn(roleArn), target);
   const client = new LambdaMicrovmsClient({ region: process.env.AWS_REGION });
   const all: VersionInfo[] = [];
   let nextToken: string | undefined;

@@ -95,7 +95,7 @@ async function runMicroVm(): Promise<void> {
   }));
 
   const servers = await startServers(agent, {
-    hooksPort: HOOKS_PORT, controlPort: CONTROL_PORT, ready, allowHttp, validate: () => runValidation({ paths, identity, fixtureDir: FIXTURE_DIR }), log,
+    hooksPort: HOOKS_PORT, controlPort: CONTROL_PORT, ready, allowHttp, validate: () => runValidation({ paths, identity, fixtureDir: FIXTURE_DIR, image: process.env.ARCO_RUNNER_IMAGE }), log,
     onTerminate: () => { void agent.terminate().finally(() => process.exit(0)); },
   });
   log(`listening: hooks ${servers.hooksPort}, control ${servers.controlPort}`);

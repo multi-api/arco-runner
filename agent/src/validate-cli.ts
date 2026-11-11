@@ -6,7 +6,7 @@ import { runValidation } from './validate.js';
 
 const paths = defaultPaths();
 const started = Date.now();
-runValidation({ paths, identity: buildIdentity(), fixtureDir: join(paths.agentDir, 'fixture') }).then(
+runValidation({ paths, identity: buildIdentity(), fixtureDir: join(paths.agentDir, 'fixture'), image: process.env.ARCO_RUNNER_IMAGE }).then(
   () => console.log(`validation passed in ${((Date.now() - started) / 1000).toFixed(1)}s`),
   (e) => {
     console.error(`validation failed: ${e instanceof Error ? e.message : String(e)}`);

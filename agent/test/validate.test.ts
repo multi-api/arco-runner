@@ -1,10 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ValidationError, prefetchRuntimeCache, runValidation, smokeServices } from '../src/validate.js';
+import { ValidationError, prefetchRuntimeCache, runValidation, smokeGo, smokeServices } from '../src/validate.js';
 import type { ServicesManager } from '../src/services/manager.js';
 import type { ServiceName } from '../src/job/document.js';
 import type { Paths } from '../src/system.js';
@@ -159,5 +159,43 @@ describe('prefetchRuntimeCache', () => {
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe('smokeGo', () => {
+  const goHere = have('go', 'version');
+  async function goWorld() {
+    const root = await mkdtemp(join(tmpdir(), 'arco-validate-go-'));
+    roots.push(root);
+    const paths: Paths = { home: join(root, 'home'), repo: join(root, 'home/work/repo'), tmpDirs: [join(root, 'tmp')], agentDir: join(root, 'a'), varDir: join(root, 'v') };
+    await mkdir(paths.tmpDirs[0]!);
+    return paths;
+  }
+
+  it.skipIf(!goHere)('builds and runs a program offline and leaves nothing behind', async () => {
+    const paths = await goWorld();
+    const logs: string[] = [];
+    await smokeGo({ identity: null, paths, log: (m) => logs.push(m) });
+    expect(logs.join('\n')).toMatch(/^go ready \(go version go1\./);
+    expect(await readdir(paths.tmpDirs[0]!)).toEqual([]);
+    expect(existsSync(paths.home)).toBe(false);
+  }, 120_000);
+
+  it('fails with a ValidationError when Go does not work', async () => {
+    const paths = await goWorld();
+    const bin = join(paths.tmpDirs[0]!, '..', 'fakebin');
+    await mkdir(bin);
+    await writeFile(join(bin, 'go'), '#!/bin/sh\necho "go: broken" >&2\nexit 2\n');
+    await chmod(join(bin, 'go'), 0o755);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:/usr/bin:/bin`;
+    try {
+      const err = await smokeGo({ identity: null, paths, log: () => {} }).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(ValidationError);
+      expect((err as Error).message).toMatch(/^go: go version failed: go: broken/);
+    } finally {
+      process.env.PATH = saved;
+    }
+    expect(await readdir(paths.tmpDirs[0]!)).toEqual([]);
   });
 });

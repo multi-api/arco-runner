@@ -1,10 +1,15 @@
 # The ARG defaults, the base digest and ARCO_RUNNER_IMAGE below are rewritten from image/versions.json
 # by scripts/package-image.ts. Build from the zip it produces, not from this directory.
+#
+# One template, two kinds of image: `php85` (Laravel) and `go` (Go apps). package-image keeps the lines between
+# `# @php-begin`/`# @php-end` only for a PHP image and those between `# @go-begin`/`# @go-end` only for the go
+# image, and drops the marker lines.
 
 # MySQL is extracted in its own stage so the tarball (inputs/mysql.tar.xz, verified by fetch-inputs and
 # package-image) never lands in a layer of the runner image; only the trimmed /opt/mysql is copied over.
 # Global so both stages see the same pinned version (each stage re-declares it).
 ARG MYSQL_VERSION=8.4.13
+ARG GO_VERSION=1.27.4
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108 AS mysql
 ARG MYSQL_VERSION
 COPY inputs/mysql.tar.xz /tmp/mysql.tar.xz
@@ -24,6 +29,19 @@ RUN dnf install -y tar xz binutils findutils \
  && find /opt/mysql -name '*.a' -type f -delete \
  && find /opt/mysql -type f -exec sh -c 'for f; do if [ "$(head -c 4 "$f" | tr -d "\0")" = "$(printf "\177ELF")" ]; then strip --strip-unneeded "$f" || exit 1; fi; done' sh {} +
 
+# @go-begin
+# Go, also in its own stage: only /usr/local/go reaches the runner image (inputs/go.tar.gz is the official
+# go<version>.linux-arm64.tar.gz, verified by fetch-inputs and package-image). The distribution's go.env already
+# sets GOTOOLCHAIN=auto; the check keeps it that way.
+FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108 AS go
+ARG GO_VERSION
+COPY inputs/go.tar.gz /tmp/go.tar.gz
+RUN dnf install -y tar gzip \
+ && tar -xzf /tmp/go.tar.gz -C /usr/local --no-same-owner \
+ && HOME=/tmp GOTOOLCHAIN=local /usr/local/go/bin/go version | grep -qx "go version go${GO_VERSION} linux/arm64" \
+ && grep -qx 'GOTOOLCHAIN=auto' /usr/local/go/go.env
+
+# @go-end
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108
 
 ARG PHP_MINOR=8.5
@@ -67,16 +85,31 @@ RUN mysqld --no-defaults --version | grep -q "Ver ${MYSQL_VERSION} " \
  && rm -f /opt/arco-services/templates/mysql/*.pid /opt/arco-services/templates/pgsql/postmaster.pid \
  && rm -f /opt/arco-services/templates/mysql/*.pem /opt/arco-services/templates/mysql/auto.cnf
 
+# @go-begin
+# One image for every Go version: the agent's build env sets GOTOOLCHAIN=auto, so a go.mod asking for a newer Go
+# (its `go` or `toolchain` line) downloads it into the module cache (~/.cache/go-mod), which the build cache keeps.
+ARG GO_VERSION
+COPY --from=go /usr/local/go /usr/local/go
+RUN chown -R root:root /usr/local/go && chmod -R u=rwX,go=rX /usr/local/go \
+ && for b in go gofmt; do ln -s /usr/local/go/bin/$b /usr/local/bin/$b; done \
+ && install -d -o build -g build -m 0700 /tmp/go-check \
+ && runuser -u build -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp/go-check GOTOOLCHAIN=local go version | grep -qx "go version go${GO_VERSION} linux/arm64" \
+ && rm -rf /tmp/go-check
+
+# @go-end
 COPY inputs/php /usr/local/bin/php
 COPY inputs/composer.phar /usr/local/bin/composer
 COPY inputs/tini /usr/local/bin/tini
 COPY rootfs/ /
 RUN chmod 0755 /usr/local/bin/php /usr/local/bin/composer /usr/local/bin/tini
 
-# Arco re-checks size and sha256 before using a cached runtime binary.
+# @php-begin
+# Arco re-checks size and sha256 before using a cached runtime binary. Laravel only: Go apps run on Arco's process
+# runtime and never use FrankenPHP.
 COPY --chown=build:build inputs/frankenphp inputs/php /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/
-RUN chmod 0755 /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/frankenphp /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/php \
- && install -d -o build -g build -m 0755 /home/build/work
+RUN chmod 0755 /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/frankenphp /home/build/.arco/cache/runtime/${RUNTIME_BUILD}/php
+# @php-end
+RUN install -d -o build -g build -m 0755 /home/build/work
 
 # Owned by root so the build user cannot modify the agent or the fixture.
 COPY agent/ /opt/arco-runner/

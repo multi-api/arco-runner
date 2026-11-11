@@ -33,9 +33,15 @@ concurrency:
 
 jobs:
   publish:
+    # php85: Laravel apps. go: Go apps (one image for every Go version; Cloud's CLOUD_RUNNERS_*_GO settings).
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [php85, go]
     runs-on: ubuntu-24.04-arm
     environment: ${{ inputs.stage || 'staging' }}
     env:
+      IMAGE: ${{ matrix.image }}
       GH_TOKEN: ${{ github.token }}
       ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
       BUILD_ROLE_ARN: ${{ vars.BUILD_ROLE_ARN }}
@@ -55,11 +61,11 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Fetch inputs
-        run: npx tsx scripts/fetch-inputs.ts --minor 8.5 --out build/inputs
+        run: npx tsx scripts/fetch-inputs.ts --image "$IMAGE" --out build/inputs
       - run: node agent/build.mjs
       - name: Package
         run: >
-          npx tsx scripts/package-image.ts --minor 8.5 --inputs build/inputs --out build/image.zip
+          npx tsx scripts/package-image.ts --image "$IMAGE" --inputs build/inputs --out build/image.zip
           --agent agent/dist/arco-runner.mjs --fixture fixture
       - name: Publish MicroVM image
         id: microvm
@@ -67,7 +73,7 @@ jobs:
           OS_CAPABILITIES_ALL: ${{ inputs.os_capabilities_all && '--os-capabilities-all' || '' }}
         run: |
           # shellcheck disable=SC2086
-          npx tsx scripts/publish-microvm-image.ts --stage "$STAGE" --zip build/image.zip --minor 8.5 $OS_CAPABILITIES_ALL | tee build/publish.log
+          npx tsx scripts/publish-microvm-image.ts --stage "$STAGE" --zip build/image.zip --image "$IMAGE" $OS_CAPABILITIES_ALL | tee build/publish.log
           echo "image_arn=$(sed -n 's/^image_arn=//p' build/publish.log)" >> "$GITHUB_OUTPUT"
           echo "image_version=$(sed -n 's/^image_version=//p' build/publish.log)" >> "$GITHUB_OUTPUT"
 
@@ -75,7 +81,7 @@ jobs:
         id: fargate
         run: |
           # ECR tags are immutable: the run id and attempt keep a scheduled rebuild of an unchanged main (or a re-run) unique.
-          image="$ECR_REPO:php85-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image="$ECR_REPO:${IMAGE}-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           registry="${ECR_REPO%%/*}"
           aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
           mkdir build/context && unzip -q build/image.zip -d build/context
@@ -87,13 +93,16 @@ jobs:
         id: taskdef
         env:
           EXECUTION_ROLE_ARN: ${{ vars.FARGATE_EXECUTION_ROLE_ARN }}
+          RUNNER_IMAGE: ${{ matrix.image }}
           IMAGE: ${{ steps.fargate.outputs.image }}
         run: |
           jq -n \
+            --arg family "arco-runner-$RUNNER_IMAGE" \
+            --arg prefix "$RUNNER_IMAGE" \
             --arg image "$IMAGE" \
             --arg role "$EXECUTION_ROLE_ARN" \
             --arg region "$AWS_REGION" '{
-              family: "arco-runner-php85",
+              family: $family,
               requiresCompatibilities: ["FARGATE"],
               networkMode: "awsvpc",
               cpu: "2048",
@@ -108,7 +117,7 @@ jobs:
                 stopTimeout: 30,
                 logConfiguration: {
                   logDriver: "awslogs",
-                  options: {"awslogs-group": "/ecs/arco-runner", "awslogs-region": $region, "awslogs-stream-prefix": "php85"}
+                  options: {"awslogs-group": "/ecs/arco-runner", "awslogs-region": $region, "awslogs-stream-prefix": $prefix}
                 }
               }]
             }' > build/taskdef.json
@@ -122,15 +131,17 @@ jobs:
           TASK_DEFINITION_ARN: ${{ steps.taskdef.outputs.task_definition_arn }}
           FARGATE_IMAGE: ${{ steps.fargate.outputs.image }}
         run: |
+          # Cloud's suffix: php85 -> 85 (runners.php_versions), go -> GO (runners.go_image).
+          if [ "$IMAGE" = go ]; then suffix=GO; else suffix="${IMAGE#php}"; fi
           {
-            echo "### Arco runner image published to $STAGE"
+            echo "### Arco runner image \`$IMAGE\` published to $STAGE"
             echo
             echo "Set these in Arco Cloud and redeploy:"
             echo
             echo '```'
-            echo "CLOUD_RUNNERS_IMAGE_ARN_85=$IMAGE_ARN"
-            echo "CLOUD_RUNNERS_IMAGE_VERSION_85=$IMAGE_VERSION"
-            echo "CLOUD_RUNNERS_TASK_DEFINITION_85=$TASK_DEFINITION_ARN"
+            echo "CLOUD_RUNNERS_IMAGE_ARN_${suffix}=$IMAGE_ARN"
+            echo "CLOUD_RUNNERS_IMAGE_VERSION_${suffix}=$IMAGE_VERSION"
+            echo "CLOUD_RUNNERS_TASK_DEFINITION_${suffix}=$TASK_DEFINITION_ARN"
             echo '```'
             echo
             echo "Fargate image: \`$FARGATE_IMAGE\`"

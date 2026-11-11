@@ -134,6 +134,16 @@ describe('publish-microvm-image', () => {
     expect(imageArnFor('us-east-1', '844222058302', '8.5')).toBe(IMAGE_ARN);
   });
 
+  it('publishes the go image as arco-runner-go with --image go', async () => {
+    const f = fake({ exists: false, versionStates: ['SUCCESSFUL'] });
+    expect(await main(['--stage', 'staging', '--zip', '/tmp/x.zip', '--image', 'go'], ENV, f.deps)).toBe(0);
+    expect(f.uploads).toEqual([['bkt', 'images/arco-runner-go/abc123.zip', '/tmp/x.zip']]);
+    const create = f.calls.find((c) => c.name === 'CreateMicrovmImageCommand')!;
+    expect(create.input).toMatchObject({ name: 'arco-runner-go', logging: { cloudWatch: { logGroup: '/aws/lambda-microvms/arco-runner-go' } } });
+    expect(f.calls.find((c) => c.name === 'GetMicrovmImageCommand')!.input.imageIdentifier)
+      .toBe('arn:aws:lambda:us-east-1:844222058302:microvm-image:arco-runner-go');
+  });
+
   it('fails without AWS_REGION', async () => {
     const f = fake({ exists: false, versionStates: ['SUCCESSFUL'] });
     const { AWS_REGION: _r, ...env } = ENV;

@@ -16,6 +16,7 @@ const files: Record<string, Buffer> = {
   '/composer/2.10.3/composer.phar': Buffer.from('fake composer'),
   '/tini/v0.19.0/tini-static-arm64': Buffer.from('fake tini'),
   '/mysql/mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz': Buffer.from('fake mysql tarball'),
+  '/go/go1.27.4.linux-arm64.tar.gz': Buffer.from('fake go tarball'),
 };
 const mysqlAsset = 'mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz';
 
@@ -25,7 +26,7 @@ let work: string;
 let fakeBin: string;
 let ghLog: string;
 
-function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string; mysqlUrls?: string[] } = {}): string {
+function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string; mysqlUrls?: string[]; goSha?: string } = {}): string {
   const path = join(work, `versions-${Math.random().toString(36).slice(2)}.json`);
   const php = files['/frankenphp-1.13.1-r1/php-linux-aarch64']!;
   const fp = files['/frankenphp-1.13.1-r1/frankenphp-linux-aarch64']!;
@@ -42,6 +43,10 @@ function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: 
           frankenphp_sha256: sha(fp),
           frankenphp_size: fp.length,
         },
+      },
+      go: {
+        version: '1.27.4', sha256: overrides.goSha ?? sha(files['/go/go1.27.4.linux-arm64.tar.gz']!),
+        size: files['/go/go1.27.4.linux-arm64.tar.gz']!.length, php_minor: '8.5',
       },
       composer: { version: '2.10.3', sha256: sha(files['/composer/2.10.3/composer.phar']!) },
       tini: { version: '0.19.0', sha256: overrides.tiniSha ?? sha(files['/tini/v0.19.0/tini-static-arm64']!), size: files['/tini/v0.19.0/tini-static-arm64']!.length },
@@ -63,8 +68,10 @@ function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: 
 }
 
 // Async spawn: the test's own HTTP server must keep serving while the script runs.
-function run(versions: string, out: string, extraEnv: Record<string, string> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
-  const child = spawn(process.execPath, ['--import', 'tsx', script, '--minor', '8.5', '--out', out], {
+function run(
+  versions: string, out: string, extraEnv: Record<string, string> = {}, image: string[] = ['--minor', '8.5'],
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, ['--import', 'tsx', script, ...image, '--out', out], {
     env: {
       ...process.env,
       PATH: `${fakeBin}:${process.env.PATH}`,
@@ -72,6 +79,7 @@ function run(versions: string, out: string, extraEnv: Record<string, string> = {
       ARCO_RUNTIME_RELEASE_BASE: base,
       COMPOSER_DOWNLOAD_BASE: `${base}/composer`,
       TINI_DOWNLOAD_BASE: `${base}/tini`,
+      GO_DOWNLOAD_BASE: `${base}/go`,
       FAKE_GH_LOG: ghLog,
       ...extraEnv,
     },
@@ -200,5 +208,27 @@ describe('fetch-inputs', () => {
       expect(c).toContain('--repo multi-api/arco-runtime');
       expect(c).toContain('--signer-workflow multi-api/arco-runtime/.github/workflows/publish.yml');
     }
+  });
+});
+
+describe('fetch-inputs --image go', () => {
+  it('fetches Go instead of FrankenPHP, with the PHP CLI of versions.go.php_minor', async () => {
+    const out = join(work, 'out-go');
+    const r = await run(versionsFile(), out, {}, ['--image', 'go']);
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ok go1.27.4.linux-arm64.tar.gz');
+    expect(readFileSync(join(out, 'go.tar.gz'), 'utf8')).toBe('fake go tarball');
+    expect(readFileSync(join(out, 'php'), 'utf8')).toBe('fake php cli');
+    expect(existsSync(join(out, 'frankenphp'))).toBe(false);
+  });
+
+  it('exits 1 naming the Go tarball when its sha256 does not match', async () => {
+    const out = join(work, 'out-go-bad');
+    const r = await run(versionsFile({ goSha: 'c'.repeat(64) }), out, {}, ['--image', 'go']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('go1.27.4.linux-arm64.tar.gz');
+    expect(r.stderr).toContain('sha256');
+    expect(existsSync(join(out, 'go.tar.gz'))).toBe(false);
   });
 });

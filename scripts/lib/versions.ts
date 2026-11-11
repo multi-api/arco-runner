@@ -13,8 +13,18 @@ export interface PhpEntry {
   frankenphp_size: number;
 }
 
+/** The go image's Go (official linux-arm64 tarball from go.dev/dl) and the PHP minor it runs Arco on. */
+export interface GoEntry {
+  version: string;
+  sha256: string;
+  size: number;
+  /** Must match Cloud's RunnerJobs::GO_PHP_VERSION and the php-version of its arco-deploy-go.yml stub. */
+  php_minor: string;
+}
+
 export interface Versions {
   php: Record<string, PhpEntry>;
+  go?: GoEntry;
   composer: { version: string; sha256: string };
   tini: { version: string; sha256: string; size: number };
   corepack: { version: string };

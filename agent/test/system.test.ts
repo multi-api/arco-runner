@@ -10,13 +10,22 @@ describe('buildEnv', () => {
     process.env.LEAK_CHECK = '1';
     const env = buildEnv(defaultPaths(), { PATH: 'x', HOME: '/root', USER: 'root', FOO: 'bar', CI: 'false' });
     delete process.env.LEAK_CHECK;
-    expect(env.PATH).toBe('/usr/local/bin:/usr/bin:/bin');
+    // Composer's global bin dir comes last: what a build installs there never shadows a system tool.
+    expect(env.PATH).toBe('/usr/local/bin:/usr/bin:/bin:/home/build/.config/composer/vendor/bin');
     expect(env.HOME).toBe('/home/build');
     expect(env.USER).toBe('build');
     expect(env.FOO).toBe('bar');
     expect(env.CI).toBe('false');
     expect(env.COMPOSER_CACHE_DIR).toBe('/home/build/.cache/composer');
     expect(env.LEAK_CHECK).toBeUndefined();
+  });
+  it('sets the Go toolchain and caches under the build home; the job may override them', () => {
+    const env = buildEnv(defaultPaths(), {});
+    expect(env).toMatchObject({
+      GOTOOLCHAIN: 'auto', GOPATH: '/home/build/go', GOMODCACHE: '/home/build/.cache/go-mod',
+      GOCACHE: '/home/build/.cache/go-build', GOFLAGS: '-modcacherw',
+    });
+    expect(buildEnv(defaultPaths(), { GOTOOLCHAIN: 'local', GOFLAGS: '-mod=vendor' })).toMatchObject({ GOTOOLCHAIN: 'local', GOFLAGS: '-mod=vendor' });
   });
 });
 

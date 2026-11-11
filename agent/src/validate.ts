@@ -1,7 +1,7 @@
 import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { access, lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { access, lstat, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -321,13 +321,58 @@ export async function smokeServices(o: {
   }
 }
 
+const GO_SMOKE_MAIN = 'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("ok") }\n';
+
+/**
+ * The Go image only: builds and runs a program without dependencies as the build user with the build
+ * environment, offline (GOPROXY=off, GOTOOLCHAIN=local), with HOME and every Go cache in a throwaway directory
+ * that is removed afterwards, so nothing reaches the snapshot. Throws ValidationError.
+ */
+export async function smokeGo(o: { identity: Identity | null; paths: Paths; log: (m: string) => void }): Promise<void> {
+  const dir = await mkdtemp(join(o.paths.tmpDirs[0]!, 'arco-validate-go-'));
+  try {
+    await writeFile(join(dir, 'go.mod'), 'module validate\n\ngo 1.22\n');
+    await writeFile(join(dir, 'main.go'), GO_SMOKE_MAIN);
+    if (o.identity) await execFileP('chown', ['-R', `${o.identity.uid}:${o.identity.gid}`, dir]);
+    const env: NodeJS.ProcessEnv = {
+      ...buildEnv(o.paths, { GOPROXY: 'off', GOTOOLCHAIN: 'local' }),
+      HOME: dir, GOPATH: join(dir, 'gopath'), GOMODCACHE: join(dir, 'gomod'), GOCACHE: join(dir, 'gocache'),
+    };
+    const output: string[] = [];
+    const run = async (file: string, args: string[]): Promise<number> => {
+      try {
+        return (await runCommand(file, args, {
+          cwd: dir, env, onStdoutLine: (l) => output.push(l), onStderrLine: (l) => output.push(l), signal: AbortSignal.timeout(120_000),
+          ...(o.identity ? { uid: o.identity.uid, gid: o.identity.gid } : {}),
+        })).exitCode;
+      } catch (e) {
+        throw new ValidationError(`go: cannot run ${file}${o.identity ? ` as uid ${o.identity.uid}` : ''}: ${(e as Error).message}`);
+      }
+    };
+    const started = Date.now();
+    if ((await run('go', ['version'])) !== 0) throw new ValidationError(`go: go version failed: ${output.join(' ').slice(0, 1000)}`);
+    const version = output.at(-1) ?? '';
+    if ((await run('go', ['build', '-o', 'smoke', '.'])) !== 0 || (await run(join(dir, 'smoke'), [])) !== 0 || output.at(-1) !== 'ok') {
+      throw new ValidationError(`go: building and running a program failed: ${output.join(' ').slice(0, 1000)}`);
+    }
+    o.log(`go ready (${version}) in ${Date.now() - started} ms`);
+  } finally {
+    await removeTree(dir);
+  }
+}
+
 /**
  * The image's smoke test (spec §9.3): in the image, each test service is started once (smokeServices); then two
  * canned jobs run through the real pipeline against an in-process Cloud on 127.0.0.1 and no network. The first runs
  * a test phase, builds and saves the cache, the second restores it. Throws ValidationError.
  */
-export async function runValidation(o: { paths: Paths; identity: Identity | null; fixtureDir: string }): Promise<void> {
+export async function runValidation(o: {
+  paths: Paths; identity: Identity | null; fixtureDir: string;
+  /** ARCO_RUNNER_IMAGE: `go` checks Go instead of the FrankenPHP runtime cache, which only the PHP images pre-seed. */
+  image?: string;
+}): Promise<void> {
   const { paths, identity } = o;
+  const goImage = o.image === 'go';
   const bundle = join(o.fixtureDir, 'app.bundle');
   // A dev machine may lack GNU tar or zstd; the image must have them, so with an identity the cache is required.
   const cache = identity !== null || archiveToolsPresent();
@@ -335,7 +380,7 @@ export async function runValidation(o: { paths: Paths; identity: Identity | null
 
   // In the image the runtime cache is always pre-seeded; finding none means the image is broken.
   const prefetched = await prefetchRuntimeCache(paths.home);
-  if (identity !== null && prefetched.files === 0) {
+  if (identity !== null && !goImage && prefetched.files === 0) {
     throw new ValidationError(`no pre-seeded runtime binaries under ${join(paths.home, '.arco', 'cache', 'runtime')}`);
   }
 
@@ -350,6 +395,8 @@ export async function runValidation(o: { paths: Paths; identity: Identity | null
     if (!pass.result.buildOk || !pass.result.finished) return fail(`job result ${JSON.stringify(pass.result)}`);
     if (!pass.result.idleReported) return fail('idle was not reported');
   };
+
+  if (goImage) await smokeGo({ identity, paths, log: (m) => console.log(`[validate] ${m}`) });
 
   // The test services, each started once with nothing left behind; only in the image (as root, with the users).
   if (identity !== null) {

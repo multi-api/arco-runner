@@ -43,7 +43,7 @@ describe('testEnv', () => {
     const env = testEnv(paths, tests({ DB_HOST: 'x', APP_ENV: 'local', PATH: '/evil' }), svc, null);
     expect(env.DB_HOST).toBe('127.0.0.1');
     expect(env.APP_ENV).toBe('local');
-    expect(env.PATH).toBe('/usr/local/bin:/usr/bin:/bin');
+    expect(env.PATH).toBe('/usr/local/bin:/usr/bin:/bin:/home/build/.config/composer/vendor/bin');
     expect(testEnv(paths, tests(), {}, null).APP_ENV).toBe('testing');
     expect(testEnv(paths, tests(), {}, 'base64:k').APP_KEY).toBe('base64:k');
   });

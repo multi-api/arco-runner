@@ -7,9 +7,9 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { runCommand } from '@multiapi/arco-cloud-client';
 import { readPlainFile } from '../fsutil.js';
-import type { Identity, Paths } from '../system.js';
+import { GO_MODCACHE, type Identity, type Paths } from '../system.js';
 
-export type Locks = { composer: string | null; npm: string | null; yarn: string | null; pnpm: string | null };
+export type Locks = { composer: string | null; npm: string | null; yarn: string | null; pnpm: string | null; go: string | null };
 export type CacheManifest = { version: 1; key: string; lock: Locks; created_at: string };
 export type CacheCtx = {
   paths: Paths;
@@ -74,16 +74,16 @@ export function cacheRoots(rootDir: string): string[] {
     const base = `work/repo/${segs.join('/')}`;
     roots.push(`${base}/vendor`, `${base}/node_modules`);
   }
-  roots.push('.cache/composer', '.npm');
+  roots.push('.cache/composer', '.npm', GO_MODCACHE);
   return [...new Set(roots)];
 }
 
 const LOCK_FILES: Record<keyof Locks, string> = {
-  composer: 'composer.lock', npm: 'package-lock.json', yarn: 'yarn.lock', pnpm: 'pnpm-lock.yaml',
+  composer: 'composer.lock', npm: 'package-lock.json', yarn: 'yarn.lock', pnpm: 'pnpm-lock.yaml', go: 'go.sum',
 };
 
 export async function lockHashes(projectDir: string): Promise<Locks> {
-  const out: Locks = { composer: null, npm: null, yarn: null, pnpm: null };
+  const out: Locks = { composer: null, npm: null, yarn: null, pnpm: null, go: null };
   for (const k of Object.keys(LOCK_FILES) as (keyof Locks)[]) {
     const data = await readPlainFile(join(projectDir, LOCK_FILES[k]), 256 * 1024 * 1024);
     if (data) out[k] = createHash('sha256').update(data).digest('hex');
@@ -224,12 +224,13 @@ function parseManifest(buf: Buffer | null): CacheManifest | null {
   try {
     const j = JSON.parse(buf.toString('utf8')) as Record<string, unknown>;
     const lock = j.lock as Record<string, unknown> | undefined;
+    // `go` is absent from manifests written before the Go image: read as null.
     const lockOk = !!lock && (['composer', 'npm', 'yarn', 'pnpm'] as const).every(
       (k) => lock[k] === null || typeof lock[k] === 'string',
-    );
+    ) && (lock.go === undefined || lock.go === null || typeof lock.go === 'string');
     if (j.version !== 1 || typeof j.key !== 'string' || typeof j.created_at !== 'string' || !lockOk) return null;
     const l = lock as Locks;
-    return { version: 1, key: j.key, lock: { composer: l.composer, npm: l.npm, yarn: l.yarn, pnpm: l.pnpm }, created_at: j.created_at };
+    return { version: 1, key: j.key, lock: { composer: l.composer, npm: l.npm, yarn: l.yarn, pnpm: l.pnpm, go: l.go ?? null }, created_at: j.created_at };
   } catch {
     return null;
   }
