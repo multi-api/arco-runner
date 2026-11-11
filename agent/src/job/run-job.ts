@@ -1,8 +1,9 @@
 import { constants } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import {
-  CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, isRunLost, redactValue, type RunSession,
+  ARCO_BIN, CloudApi, Redactor, buildFailure, deployAndFinish, finishWithRetry, isRunLost, redactValue, resolveArcoBin,
+  type RunSession,
 } from '@multiapi/arco-cloud-client';
 import { registerJobSecrets, shortMaskValues } from '../mask.js';
 import type { ServicesManager } from '../services/manager.js';
@@ -72,7 +73,6 @@ export interface JobResult {
 const KEEP_ALIVE_MS = 60_000;
 const SAVE_TIME_BOX_MS = 8 * 60_000;
 const MIN_CREDENTIAL_TTL_MS = 20 * 60_000;
-const ARCO_BIN = 'vendor/bin/arco';
 const ARCO_MISSING =
   'vendor/bin/arco not found: add multiapi/arco to composer.json and install it in your build commands (dev dependencies included)';
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -83,9 +83,31 @@ const messageOf = (e: unknown): string => {
   return m.split('\n')[0]!.slice(0, 1000);
 };
 
-/** `vendor/bin/arco` exists, is a file, and the identity that runs it may execute it. */
-async function arcoInstalled(projectDir: string, identity: Identity | null): Promise<boolean> {
-  const bin = join(projectDir, ARCO_BIN);
+/** Why the Arco binary `bin` (as resolveArcoBin returned it) could not be found. */
+export function arcoMissingMessage(bin: string): string {
+  if (bin === ARCO_BIN) return ARCO_MISSING;
+  if (!bin.includes('/')) {
+    return `${bin} not found on the build PATH (ARCO_BIN=${bin}): install Arco in your build commands, e.g. composer global require multiapi/arco`;
+  }
+  return `${bin} not found or not executable (ARCO_BIN=${bin}): install Arco in your build commands`;
+}
+
+/**
+ * The Arco binary exists, is a file, and the identity that runs it may execute it. A `bin` with a slash resolves
+ * against the project directory (an absolute one stays as is); a bare name is looked up in the build PATH, the
+ * way the deploy child's spawn finds it.
+ */
+export async function arcoInstalled(
+  projectDir: string, identity: Identity | null, bin: string = ARCO_BIN, path = '',
+): Promise<boolean> {
+  if (bin.includes('/')) return executableFile(isAbsolute(bin) ? bin : join(projectDir, bin), identity);
+  for (const dir of path.split(':')) {
+    if (isAbsolute(dir) && (await executableFile(join(dir, bin), identity))) return true;
+  }
+  return false;
+}
+
+async function executableFile(bin: string, identity: Identity | null): Promise<boolean> {
   try {
     const st = await stat(bin);
     if (!st.isFile()) return false;
@@ -306,7 +328,12 @@ async function deploy(
   finishWarn: (m: string) => void, signal: AbortSignal, now: () => number, sleep: (ms: number) => Promise<void>,
 ): Promise<number> {
   const projectDir = await resolveProjectDir(deps.paths.repo, doc.source.root_dir);
-  if (!(await arcoInstalled(projectDir, deps.identity))) throw new BuildFailure('arco.not_installed', ARCO_MISSING);
+  const env = buildEnv(deps.paths, arcoJobEnv(doc.env));
+  // Cloud sends ARCO_BIN=arco for apps without vendor/ (Go): a global `composer global require multiapi/arco`.
+  const arcoBin = resolveArcoBin(undefined, env);
+  if (!(await arcoInstalled(projectDir, deps.identity, arcoBin, env.PATH ?? ''))) {
+    throw new BuildFailure('arco.not_installed', arcoMissingMessage(arcoBin));
+  }
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
   // M3: no background build process may live next to arco (it could read /proc/<arco>/environ). A failure is an
   // internal error (finish failed runner.internal_error, then the usual wipe).
@@ -350,7 +377,7 @@ async function deploy(
   // A cancel stops arco like a run Cloud ended; the RunAbortedError it causes is reported as build.cancelled.
   const view: RunSession = { ...s, signal, abortMessage: () => s.abortMessage() ?? (deps.signal.aborted ? 'Cancelled' : null) };
   return await deployAndFinish(view, {
-    mode: doc.mode, environment: doc.environment, cwd: projectDir, env: buildEnv(deps.paths, arcoJobEnv(doc.env)),
+    mode: doc.mode, environment: doc.environment, cwd: projectDir, env, arcoBin,
     ...(deps.identity ? { uid: deps.identity.uid, gid: deps.identity.gid } : {}),
   });
 }

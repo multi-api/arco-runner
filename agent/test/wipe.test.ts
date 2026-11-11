@@ -53,7 +53,7 @@ async function populate(f: Awaited<ReturnType<typeof fixture>>) {
 
 describe('keptPaths', () => {
   it('is the cache roots without the manifest plus the Arco runtime cache', () => {
-    expect(keptPaths('')).toEqual(['work/repo/vendor', 'work/repo/node_modules', '.cache/composer', '.npm', '.arco/cache/runtime']);
+    expect(keptPaths('')).toEqual(['work/repo/vendor', 'work/repo/node_modules', '.cache/composer', '.npm', '.cache/go-mod', '.arco/cache/runtime']);
     expect(keptPaths('app')).toContain('work/repo/app/vendor');
     expect(keptPaths('app').some((k) => k.includes('.arco-cache.json'))).toBe(false);
   });

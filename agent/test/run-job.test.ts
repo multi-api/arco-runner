@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { CacheManifest } from '../src/job/cache.js';
 import type { TicketPayload } from '../src/job/document.js';
 import { cloneToken } from '../src/mask.js';
-import { runJob, type JobDeps, type JobPhase } from '../src/job/run-job.js';
+import { arcoInstalled, arcoMissingMessage, runJob, type JobDeps, type JobPhase } from '../src/job/run-job.js';
 import { claim, reportIdle } from '../src/job/runner-api.js';
 import type { Paths } from '../src/system.js';
 import { wipe } from '../src/wipe.js';
@@ -369,6 +369,38 @@ describe('runJob: errors and refusals', () => {
     }]);
     expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
     expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(0);
+  }, 30_000);
+
+  it('runs a global arco from the build PATH when the job sets ARCO_BIN=arco (Go apps, no vendor/)', async () => {
+    const w = await world({ withArco: false });
+    const calls = join(w.out, 'arco-calls.txt');
+    const src = join(w.out, 'arco');
+    await writeFile(src, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_ARCO}" "$@"\n`);
+    await chmod(src, 0o755);
+    // Stands in for Cloud's `composer global require multiapi/arco:<version>` (COMPOSER_HOME/vendor/bin).
+    const install = `mkdir -p "$COMPOSER_HOME/vendor/bin" && cp "${src}" "$COMPOSER_HOME/vendor/bin/arco" && chmod 755 "$COMPOSER_HOME/vendor/bin/arco"`;
+    const r = await run(w, { commands: [install], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls } });
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'succeeded' });
+    expect(await readFile(calls, 'utf8')).toMatch(/^deploy /m);
+  }, 30_000);
+
+  it('fails with arco.not_installed, naming the PATH, when ARCO_BIN=arco is not installed', async () => {
+    const w = await world({ withArco: false });
+    const r = await run(w, { env: { ARCO_BIN: 'arco' } });
+    expect(r.finishes).toHaveLength(1);
+    expect(r.finishes[0]).toMatchObject({ result: 'failed', error_code: 'arco.not_installed' });
+    expect(r.finishes[0].error_message).toMatch(/^arco not found on the build PATH \(ARCO_BIN=arco\)/);
+  }, 30_000);
+
+  it('keeps vendor/bin/arco when ARCO_BIN is unset, even if a global arco exists', async () => {
+    const w = await world({ withArco: false });
+    const src = join(w.out, 'arco');
+    await writeFile(src, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_ARCO}" "$@"\n`);
+    await chmod(src, 0o755);
+    const install = `mkdir -p "$COMPOSER_HOME/vendor/bin" && cp "${src}" "$COMPOSER_HOME/vendor/bin/arco"`;
+    const r = await run(w, { commands: [install] });
+    expect(r.finishes).toEqual([expect.objectContaining({ error_code: 'arco.not_installed', error_message: ARCO_MISSING })]);
   }, 30_000);
 
   it('refuses arco deploy when the credentials expire in less than 20 minutes', async () => {
@@ -826,4 +858,29 @@ describe('runJob: tests before deploy', () => {
       result: 'failed', error_code: 'build.test_service_failed', error_message: 'Test services are not available on this runner',
     });
   }, 30_000);
+});
+
+describe('arcoInstalled', () => {
+  it('resolves a path against the project, an absolute path as is, and a bare name through PATH', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'arco-bin-'));
+    const project = join(root, 'p');
+    const bin = join(root, 'bin');
+    await mkdir(join(project, 'tools'), { recursive: true });
+    await mkdir(bin);
+    for (const f of [join(project, 'tools/arco'), join(bin, 'arco')]) { await writeFile(f, '#!/bin/sh\n'); await chmod(f, 0o755); }
+    await writeFile(join(bin, 'noexec'), '');
+    expect(await arcoInstalled(project, null, 'tools/arco')).toBe(true);
+    expect(await arcoInstalled(project, null, join(bin, 'arco'))).toBe(true);
+    expect(await arcoInstalled(project, null, 'arco', `/nonexistent:relative:${bin}`)).toBe(true);
+    expect(await arcoInstalled(project, null, 'arco', '/nonexistent')).toBe(false);
+    // A relative PATH entry is never searched (it would resolve against the agent's cwd).
+    expect(await arcoInstalled(project, null, 'arco', 'p/tools')).toBe(false);
+    expect(await arcoInstalled(project, null, 'noexec', bin)).toBe(false);
+    expect(await arcoInstalled(project, null)).toBe(false);
+  });
+  it('names the binary in the missing message', () => {
+    expect(arcoMissingMessage('vendor/bin/arco')).toBe(ARCO_MISSING);
+    expect(arcoMissingMessage('arco')).toMatch(/build PATH/);
+    expect(arcoMissingMessage('bin/arco')).toMatch(/^bin\/arco not found or not executable/);
+  });
 });

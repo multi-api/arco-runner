@@ -21,10 +21,21 @@ export function buildIdentity(): Identity | null {
 
 const PROTECTED_ENV = new Set(['PATH', 'HOME', 'USER']);
 
-/** The build environment (spec §6.5). Nothing is inherited from the agent's own environment. */
+/** Where `composer global require` puts binaries (COMPOSER_HOME/vendor/bin). */
+export const composerGlobalBin = (paths: Paths): string => `${paths.home}/.config/composer/vendor/bin`;
+
+/** The Go module cache: a cache root (cache.ts), so modules and GOTOOLCHAIN=auto toolchains survive between builds. */
+export const GO_MODCACHE = '.cache/go-mod';
+
+/**
+ * The build environment (spec §6.5). Nothing is inherited from the agent's own environment.
+ * PATH ends with Composer's global bin dir (a Go build runs `composer global require multiapi/arco` and Cloud sends
+ * `ARCO_BIN=arco`); it comes last, so nothing a build installs there can shadow a system tool.
+ * The Go variables are harmless where there is no Go (the PHP images) and job env may override them.
+ */
 export function buildEnv(paths: Paths, jobEnv: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    PATH: '/usr/local/bin:/usr/bin:/bin',
+    PATH: `/usr/local/bin:/usr/bin:/bin:${composerGlobalBin(paths)}`,
     HOME: paths.home,
     USER: 'build',
     LANG: 'C.UTF-8',
@@ -35,6 +46,13 @@ export function buildEnv(paths: Paths, jobEnv: Record<string, string>): NodeJS.P
     npm_config_cache: `${paths.home}/.npm`,
     COMPOSER_NO_INTERACTION: '1',
     TMPDIR: '/tmp',
+    // go.mod's `go`/`toolchain` line picks the Go version; the image's Go fetches it when it is newer.
+    GOTOOLCHAIN: 'auto',
+    GOPATH: `${paths.home}/go`,
+    GOMODCACHE: `${paths.home}/${GO_MODCACHE}`,
+    GOCACHE: `${paths.home}/.cache/go-build`,
+    // Writable module cache: the cache archive, its restore and the wipe never meet read-only directories.
+    GOFLAGS: '-modcacherw',
   };
   for (const [k, v] of Object.entries(jobEnv)) if (!PROTECTED_ENV.has(k)) env[k] = v;
   return env;

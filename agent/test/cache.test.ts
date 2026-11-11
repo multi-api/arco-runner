@@ -56,27 +56,28 @@ async function env() {
 }
 
 const manifest: CacheManifest = {
-  version: 1, key: 'k1', lock: { composer: 'aa', npm: null, yarn: null, pnpm: 'bb' }, created_at: '2026-10-22T00:00:00Z',
+  version: 1, key: 'k1', lock: { composer: 'aa', npm: null, yarn: null, pnpm: 'bb', go: null }, created_at: '2026-10-22T00:00:00Z',
 };
 
 describe('cacheRoots', () => {
   it('lists the global roots and adds the root_dir ones', () => {
     expect(cacheRoots('')).toEqual([
-      'work/repo/vendor', 'work/repo/node_modules', '.cache/composer', '.npm',
+      'work/repo/vendor', 'work/repo/node_modules', '.cache/composer', '.npm', '.cache/go-mod',
     ]);
     expect(cacheRoots('app')).toEqual([
       'work/repo/vendor', 'work/repo/node_modules', 'work/repo/app/vendor', 'work/repo/app/node_modules',
-      '.cache/composer', '.npm',
+      '.cache/composer', '.npm', '.cache/go-mod',
     ]);
   });
 });
 
 describe('shouldSave', () => {
-  const locks = { composer: 'a', npm: 'b', yarn: null, pnpm: null };
+  const locks = { composer: 'a', npm: 'b', yarn: null, pnpm: null, go: null };
   it('saves when nothing is known or any lock differs, else not', () => {
     expect(shouldSave(locks, null)).toBe(true);
     expect(shouldSave({ ...locks, composer: 'z' }, { ...manifest, lock: locks })).toBe(true);
     expect(shouldSave({ ...locks, yarn: 'y' }, { ...manifest, lock: locks })).toBe(true);
+    expect(shouldSave({ ...locks, go: 'g' }, { ...manifest, lock: locks })).toBe(true);
     expect(shouldSave(locks, { ...manifest, lock: { ...locks } })).toBe(false);
   });
 });
@@ -91,7 +92,14 @@ describe('lockHashes', () => {
     await symlink(join(root, 'secret'), join(dir, 'yarn.lock'));
     const l = await lockHashes(dir);
     expect(l.composer).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-    expect(l).toMatchObject({ npm: null, yarn: null, pnpm: null });
+    expect(l).toMatchObject({ npm: null, yarn: null, pnpm: null, go: null });
+  });
+  it('hashes go.sum for Go apps', async () => {
+    const { root } = await env();
+    const dir = join(root, 'goproj');
+    await mkdir(dir);
+    await writeFile(join(dir, 'go.sum'), 'abc');
+    expect((await lockHashes(dir)).go).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
   });
 });
 
