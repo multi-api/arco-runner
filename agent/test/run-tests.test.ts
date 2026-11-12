@@ -101,6 +101,7 @@ interface RunOptions {
   timeoutSeconds?: number;
   /** Shared trace: step events are recorded as `<key>:<status>`. */
   trace?: string[];
+  language?: 'php' | 'go';
 }
 
 async function run(w: World, o: RunOptions = {}) {
@@ -130,6 +131,7 @@ async function run(w: World, o: RunOptions = {}) {
     doc, tests, projectDir: w.projectDir, paths: w.paths, identity: null, batcher, steps: new Steps(recording), redactor,
     signal: o.signal ?? new AbortController().signal, buildDeadlineMs: o.buildDeadlineMs ?? Date.now() + 600_000,
     services: o.services, killBuildProcesses: o.kill === undefined ? null : o.kill,
+    ...(o.language ? { language: o.language } : {}),
   };
   let error: unknown = null;
   try {
@@ -555,5 +557,36 @@ describe('runTestPhase: services', () => {
     const broken = () => ({ ...fakeServices([])(), phpRedis: async () => { throw new Error('php: not found'); } });
     const b = await run(await world(), { tests: { services: ['redis'] }, services: broken });
     expect(failure(b.error)).toMatchObject({ code: 'build.test_service_failed', message: expect.stringContaining('php: not found') });
+  }, 30_000);
+});
+
+describe('runTestPhase: Go', () => {
+  it('skips the Laravel extras: no .env copied, no APP_KEY, no APP_ENV', async () => {
+    const w = await world({ files: { '.env.example': 'APP_NAME=example\n' } });
+    const dump = join(w.out, 'env.txt');
+    const r = await run(w, { language: 'go', tests: { command: `env > "${dump}"; test ! -e .env` } });
+    expect(r.error).toBeNull();
+    const env = await dumpOf(dump);
+    expect(env.APP_KEY).toBeUndefined();
+    expect(env.APP_ENV).toBeUndefined();
+    expect(env.CI).toBe('true');
+    expect(env.GOTOOLCHAIN).toBe('auto');
+    expect(step(r.events, 'build.tests_hint', 'note')).toBeUndefined();
+  }, 30_000);
+
+  it('injects DATABASE_URL and REDIS_URL and never runs the phpredis check', async () => {
+    const w = await world();
+    const trace: string[] = [];
+    const passwords: string[] = [];
+    const dump = join(w.out, 'env.txt');
+    const broken = () => ({ ...fakeServices(trace, { passwords })(), phpRedis: async (): Promise<boolean> => { throw new Error('phpredis check ran'); } });
+    const r = await run(w, { language: 'go', tests: { command: `env > "${dump}"`, services: ['pgsql', 'redis'] }, services: broken });
+    expect(r.error).toBeNull();
+    const env = await dumpOf(dump);
+    expect(env.DATABASE_URL).toBe(`postgres://arco:${passwords[0]}@127.0.0.1:5432/testing?sslmode=disable`);
+    expect(env.REDIS_URL).toBe('redis://127.0.0.1:6379/0');
+    expect(env.REDIS_CLIENT).toBeUndefined();
+    expect(r.sent).not.toContain(passwords[0]);
+    expect(step(r.events, 'build.test_services', 'note')).toBeUndefined();
   }, 30_000);
 });

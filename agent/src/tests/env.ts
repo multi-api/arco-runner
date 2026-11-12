@@ -8,12 +8,20 @@ import { buildEnv, type Identity, type Paths } from '../system.js';
 const MAX_FILE_BYTES = 1024 * 1024;
 const DB = { mysql: { connection: 'mysql', port: '3306' }, pgsql: { connection: 'pgsql', port: '5432' } } as const;
 
-/** Variables injected for the selected services (spec §5.3). The primary database gets DB_*, the other DB_<NAME>_*. */
+/** The language of the code under test: decides Laravel's extras (PHP) or the URL variables Go libraries read (Go). */
+export type TestLanguage = 'php' | 'go';
+
+/**
+ * Variables injected for the selected services (spec §5.3). The primary database gets DB_*, the other DB_<NAME>_*.
+ * Go also gets URLs: DATABASE_URL for the primary database (DATABASE_<NAME>_URL for the other) and REDIS_URL. Redis has no
+ * password, so a Go app gets no REDIS_PASSWORD (Laravel reads the string "null" as none) and no REDIS_CLIENT.
+ */
 export function serviceVariables(
   services: ServiceName[],
   primary: 'mysql' | 'pgsql' | null,
   password: string,
-  redisClient: 'phpredis' | 'predis',
+  redisClient: 'phpredis' | 'predis' | null,
+  language: TestLanguage = 'php',
 ): Record<string, string> {
   const out: Record<string, string> = {};
   const dbs = (['mysql', 'pgsql'] as const).filter((d) => services.includes(d));
@@ -26,19 +34,32 @@ export function serviceVariables(
     out[`${prefix}DATABASE`] = 'testing';
     out[`${prefix}USERNAME`] = 'arco';
     out[`${prefix}PASSWORD`] = password;
+    if (language === 'go') out[d === main ? 'DATABASE_URL' : `DATABASE_${d.toUpperCase()}_URL`] = databaseUrl(d, password);
   }
   if (services.includes('redis')) {
     out.REDIS_HOST = '127.0.0.1';
     out.REDIS_PORT = '6379';
-    out.REDIS_PASSWORD = 'null';
-    out.REDIS_CLIENT = redisClient;
+    if (language === 'go') {
+      out.REDIS_URL = 'redis://127.0.0.1:6379/0';
+    } else {
+      out.REDIS_PASSWORD = 'null';
+      out.REDIS_CLIENT = redisClient ?? 'phpredis';
+    }
   }
   return out;
 }
 
-/** Precedence: services > tests.env > build defaults. Never AWS credentials nor the permissions boundary. */
-export function testEnv(paths: Paths, tests: TestsSpec, serviceVars: Record<string, string>, appKey: string | null): NodeJS.ProcessEnv {
-  const env = buildEnv(paths, { APP_ENV: 'testing', ...tests.env, ...serviceVars, ...(appKey ? { APP_KEY: appKey } : {}) });
+/** The password is hex (generatePassword), so it needs no escaping. The local server has no TLS, hence sslmode=disable. */
+const databaseUrl = (d: 'mysql' | 'pgsql', password: string): string => d === 'mysql'
+  ? `mysql://arco:${password}@127.0.0.1:3306/testing`
+  : `postgres://arco:${password}@127.0.0.1:5432/testing?sslmode=disable`;
+
+/** Precedence: services > tests.env > build defaults (APP_ENV=testing for PHP). Never AWS credentials nor the permissions boundary. */
+export function testEnv(
+  paths: Paths, tests: TestsSpec, serviceVars: Record<string, string>, appKey: string | null, language: TestLanguage = 'php',
+): NodeJS.ProcessEnv {
+  const defaults: Record<string, string> = language === 'php' ? { APP_ENV: 'testing' } : {};
+  const env = buildEnv(paths, { ...defaults, ...tests.env, ...serviceVars, ...(appKey ? { APP_KEY: appKey } : {}) });
   for (const k of Object.keys(env)) if (/^aws_/i.test(k) || k.toUpperCase() === 'ARCO_PERMISSIONS_BOUNDARY') delete env[k];
   return env;
 }

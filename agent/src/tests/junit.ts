@@ -26,7 +26,7 @@ const MAX_LABEL_BYTES = 512;
 const MAX_NODE_TEXT = 64 * 1024;
 
 /** Splits on top-level `&&`, `||` and `;` outside single and double quotes. */
-function splitChain(command: string): string[] {
+export function splitChain(command: string): string[] {
   const out: string[] = [];
   let cur = '';
   let quote: '"' | "'" | null = null;
@@ -51,11 +51,16 @@ function splitChain(command: string): string[] {
 
 const RUNNER = /^(?:php\s+artisan\s+test|(?:\.\/)?vendor\/bin\/(?:pest|phpunit))(?:\s|$)/;
 
-function startsWithRunner(segment: string): boolean {
-  const words = segment.trim().split(/\s+/);
+/** How many leading words are VAR=value assignments. */
+export function leadingAssignments(words: string[]): number {
   let i = 0;
   while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
-  return RUNNER.test(words.slice(i).join(' '));
+  return i;
+}
+
+function startsWithRunner(segment: string): boolean {
+  const words = segment.trim().split(/\s+/);
+  return RUNNER.test(words.slice(leadingAssignments(words)).join(' '));
 }
 
 /** Appends `--log-junit=<reportPath>` to the last command of the chain when it is a PHP test runner. */

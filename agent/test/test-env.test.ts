@@ -35,9 +35,25 @@ describe('serviceVariables', () => {
   it('uses predis when phpredis is missing', () => {
     expect(serviceVariables(['redis'], null, 'pw', 'predis').REDIS_CLIENT).toBe('predis');
   });
+  it('gives Go the DB_* variables plus DATABASE_URL and REDIS_URL, without the Laravel Redis extras', () => {
+    expect(serviceVariables(['pgsql', 'redis'], 'pgsql', 'pw', null, 'go')).toEqual({
+      DB_CONNECTION: 'pgsql', DB_HOST: '127.0.0.1', DB_PORT: '5432', DB_DATABASE: 'testing', DB_USERNAME: 'arco', DB_PASSWORD: 'pw',
+      DATABASE_URL: 'postgres://arco:pw@127.0.0.1:5432/testing?sslmode=disable',
+      REDIS_HOST: '127.0.0.1', REDIS_PORT: '6379', REDIS_URL: 'redis://127.0.0.1:6379/0',
+    });
+    const both = serviceVariables(['mysql', 'pgsql'], 'mysql', 'pw', null, 'go');
+    expect(both.DATABASE_URL).toBe('mysql://arco:pw@127.0.0.1:3306/testing');
+    expect(both.DATABASE_PGSQL_URL).toBe('postgres://arco:pw@127.0.0.1:5432/testing?sslmode=disable');
+    expect(serviceVariables(['mysql'], 'mysql', 'pw', 'phpredis').DATABASE_URL).toBeUndefined();
+  });
 });
 
 describe('testEnv', () => {
+  it('sets APP_ENV=testing for PHP only', () => {
+    expect(testEnv(paths, tests(), {}, null).APP_ENV).toBe('testing');
+    expect(testEnv(paths, tests(), {}, null, 'go').APP_ENV).toBeUndefined();
+    expect(testEnv(paths, tests({ APP_ENV: 'ci' }), {}, null, 'go').APP_ENV).toBe('ci');
+  });
   it('applies precedence: services > test variables > defaults; PATH/HOME/USER fixed', () => {
     const svc = serviceVariables(['mysql'], 'mysql', 'pw', 'phpredis');
     const env = testEnv(paths, tests({ DB_HOST: 'x', APP_ENV: 'local', PATH: '/evil' }), svc, null);
