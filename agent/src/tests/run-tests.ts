@@ -9,10 +9,12 @@ import { GIT_HARDENING } from '../job/source.js';
 import type { Steps } from '../job/steps.js';
 import { ServiceStartError, type ServicesManager } from '../services/manager.js';
 import { cutLine, type Identity, type Paths } from '../system.js';
-import { copyEnvExample, ephemeralAppKey, generatePassword, hasAppKey, serviceVariables, testEnv } from './env.js';
+import { copyEnvExample, ephemeralAppKey, generatePassword, hasAppKey, serviceVariables, testEnv, type TestLanguage } from './env.js';
+import { parseGoTestJson, withGoJson } from './gotest.js';
 import { parseJUnit, summarize, withJUnit, type JUnitCase } from './junit.js';
 
 const REPORT_MAX_BYTES = 64 * 1024 * 1024;
+const REPORT_FILE = { junit: 'junit.xml', go: 'go-test.json' } as const;
 const GIT_TIMEOUT_MS = 120_000;
 const PHP_REDIS_TIMEOUT_MS = 10_000;
 const GIT_PATH = '/usr/local/bin:/usr/bin:/bin';
@@ -36,6 +38,11 @@ export interface TestPhaseContext {
   services: (() => ServicesManager) | undefined;
   /** Kills every build-user process; null when there is no build user (tests without identity). */
   killBuildProcesses: (() => Promise<void>) | null;
+  /**
+   * The language of the image (`go` on the go image, else `php`). Go skips Laravel's extras (.env from .env.example,
+   * APP_KEY, APP_ENV=testing, the phpredis check), gets DATABASE_URL/REDIS_URL and its results from `go test -json`.
+   */
+  language?: TestLanguage;
   now?: () => number;
 }
 
@@ -92,6 +99,7 @@ export function cleanExcludes(rootDir: string): string[] {
  */
 export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
   const { doc, tests, projectDir, paths, identity, steps, redactor } = ctx;
+  const language: TestLanguage = ctx.language ?? 'php';
   const now = ctx.now ?? Date.now;
   const line = (m: string) => ctx.batcher.addLine(cutLine(m));
   const testsDir = join(paths.tmpDirs[0]!, 'arco-tests');
@@ -130,10 +138,10 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     timer.unref();
     const signal = AbortSignal.any([ctx.signal, deadline.signal]);
     let startMs;
-    let redisClient: 'phpredis' | 'predis' = 'phpredis';
+    let redisClient: 'phpredis' | 'predis' | null = language === 'php' ? 'phpredis' : null;
     try {
       startMs = await m.start(tests.services, password, signal);
-      if (tests.services.includes('redis') && !(await untilAborted(m.phpRedis(baseEnv, identity), signal, PHP_REDIS_TIMEOUT_MS))) {
+      if (language === 'php' && tests.services.includes('redis') && !(await untilAborted(m.phpRedis(baseEnv, identity), signal, PHP_REDIS_TIMEOUT_MS))) {
         redisClient = 'predis';
       }
     } catch (e) {
@@ -151,7 +159,7 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     }
     steps.done('build.test_services', undefined, { start_ms: startMs });
     if (redisClient === 'predis') steps.note('build.test_services', PREDIS_NOTE);
-    return serviceVariables(tests.services, tests.primary_database, password, redisClient);
+    return serviceVariables(tests.services, tests.primary_database, password, redisClient, language);
   }
 
   /** A fresh real directory for the report, owned by the build user, 0700; returns its identity. */
@@ -166,14 +174,14 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
   }
 
   /** The parsed report, or why there is none. Only called once no build process is alive (nothing can swap the dir). */
-  async function readReport(dir: { dev: number; ino: number }): Promise<{ cases: JUnitCase[] } | { reason: string }> {
+  async function readReport(dir: { dev: number; ino: number }, kind: 'junit' | 'go'): Promise<{ cases: JUnitCase[] } | { reason: string }> {
     let st;
     try { st = await lstat(testsDir); } catch { return { reason: `${testsDir} was removed` }; }
     if (!st.isDirectory() || st.dev !== dir.dev || st.ino !== dir.ino) return { reason: `${testsDir} was replaced` };
-    const buf = await readPlainFile(join(testsDir, 'junit.xml'), REPORT_MAX_BYTES);
+    const buf = await readPlainFile(join(testsDir, REPORT_FILE[kind]), REPORT_MAX_BYTES);
     if (!buf) return { reason: 'missing, not a regular file or larger than 64 MiB' };
     try {
-      return { cases: parseJUnit(buf.toString('utf8')) };
+      return { cases: kind === 'go' ? parseGoTestJson(buf.toString('utf8')) : parseJUnit(buf.toString('utf8')) };
     } catch (e) {
       return { reason: messageOf(e) };
     }
@@ -210,13 +218,14 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
 
   async function body(): Promise<void> {
     // .env first: a .env just copied from .env.example is what Laravel reads during the tests, so its APP_KEY counts.
-    copiedEnv = await copyEnvExample(projectDir, identity);
-    const appKey = (await hasAppKey(projectDir, tests.env)) ? null : ephemeralAppKey();
+    // Laravel only: a Go app's .env (if it reads one) stays the repository's own.
+    copiedEnv = language === 'php' && await copyEnvExample(projectDir, identity);
+    const appKey = language !== 'php' || (await hasAppKey(projectDir, tests.env)) ? null : ephemeralAppKey();
     if (appKey) {
       redactor.add(appKey);
       redactor.add(appKey.slice('base64:'.length));
     }
-    const baseEnv = testEnv(paths, tests, {}, appKey);
+    const baseEnv = testEnv(paths, tests, {}, appKey, language);
 
     // Created up front, so that cleanup also stops and removes leftovers when the setup fails.
     if (tests.services.length > 0) {
@@ -230,7 +239,10 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
 
     const serviceVars = manager ? await startServices(manager, baseEnv) : {};
     const dir = await prepareTestsDir();
-    const junit = withJUnit(tests.command, join(testsDir, 'junit.xml'));
+    // Go's results come from `go test -json`; PHP's from PHPUnit's or Pest's JUnit report.
+    const junit = language === 'go'
+      ? withGoJson(tests.command, join(testsDir, REPORT_FILE.go))
+      : withJUnit(tests.command, join(testsDir, REPORT_FILE.junit));
 
     steps.start('build.tests', { command: tests.command });
     const testsDeadline = now() + tests.timeout_seconds * 1000;
@@ -240,7 +252,7 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     const t0 = now();
     let exitCode: number;
     try {
-      exitCode = await runShell(junit.command, shell(testEnv(paths, tests, serviceVars, appKey)), {
+      exitCode = await runShell(junit.command, shell(testEnv(paths, tests, serviceVars, appKey, language)), {
         deadlineMs: Math.min(testsDeadline, ctx.buildDeadlineMs), timeoutFailure, pipefail: true,
       });
     } catch (e) {
@@ -252,10 +264,10 @@ export async function runTestPhase(ctx: TestPhaseContext): Promise<void> {
     killedAfterTests = true;
 
     let cases: JUnitCase[] | null = null;
-    if (junit.report === 'junit') {
-      const r = await readReport(dir);
+    if (junit.report !== 'none') {
+      const r = await readReport(dir, junit.report);
       if ('cases' in r) cases = r.cases;
-      else steps.note('build.tests_hint', `No usable JUnit report (${r.reason}); the result comes from the exit code`);
+      else steps.note('build.tests_hint', `No usable ${junit.report === 'go' ? 'go test -json' : 'JUnit'} report (${r.reason}); the result comes from the exit code`);
     }
     const params = summarize(cases, durationMs, redactor);
     if (exitCode === 0) {

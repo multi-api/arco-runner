@@ -55,6 +55,8 @@ export interface JobDeps {
    * build.test_service_failed.
    */
   services?: () => ServicesManager;
+  /** The language this image builds (ARCO_RUNNER_IMAGE `go`, else PHP): the test phase's steps depend on it. */
+  language?: 'php' | 'go';
   /** Tests and offline validation only (file:// clones), and http:// clones under ARCO_RUNNER_ALLOW_HTTP=1. */
   checkoutOptions?: Pick<CheckoutContext, 'extraGitArgs' | 'allowFileUrl' | 'allowHttpUrl'>;
   /** Agent diagnostics (stdout). Every message is redacted first. */
@@ -294,6 +296,7 @@ async function build(
     await runTestPhase({
       doc, tests: doc.tests, projectDir, paths, identity, batcher: s.batcher, steps, redactor, signal,
       buildDeadlineMs: deadlineMs, services: deps.services, killBuildProcesses: buildProcessKiller(deps),
+      ...(deps.language ? { language: deps.language } : {}),
       ...(deps.now ? { now: deps.now } : {}),
     });
     cancelled();
