@@ -165,7 +165,7 @@ describe('runJob: happy path', () => {
     const w = await world();
     const r = await run(w);
     expect(r.cloud.calls('/s3/cache', 'PUT')).toHaveLength(1);
-    expect(w.knownCache.get()).toMatchObject({ version: 1, key: 'env-1', lock: { composer: expect.stringMatching(/^[0-9a-f]{64}$/) } });
+    expect(w.knownCache.get()).toMatchObject({ version: 1, key: 'env-1', layout: 2, lock: { composer: expect.stringMatching(/^[0-9a-f]{64}$/) } });
     // The save happens after finish: nothing reaches Cloud's logs after it.
     const finishAt = r.cloud.calls('/finish')[0]!.at;
     const put = r.cloud.calls('/s3/cache', 'PUT')[0]!;
