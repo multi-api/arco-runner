@@ -10,7 +10,7 @@ import type { ServicesManager } from '../services/manager.js';
 import { buildEnv, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
 import { runTestPhase } from '../tests/run-tests.js';
 import { killUserProcesses } from '../wipe.js';
-import { CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
+import { CACHE_LAYOUT, CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
 import { runBuildCommands } from './commands.js';
 import type { JobDocument, TicketPayload } from './document.js';
 import { BuildFailure } from './errors.js';
@@ -402,7 +402,9 @@ async function save(doc: JobDocument, deps: JobDeps, now: () => number, log: (m:
     const lock = await lockHashes(projectDir);
     const known = deps.knownCache.get();
     if (!shouldSave(lock, known && known.key === doc.cache.key ? known : null)) return;
-    const manifest: CacheManifest = { version: 1, key: doc.cache.key, lock, created_at: new Date(now()).toISOString() };
+    const manifest: CacheManifest = {
+      version: 1, key: doc.cache.key, lock, created_at: new Date(now()).toISOString(), layout: CACHE_LAYOUT,
+    };
     const outcome = await saveCache(doc.cache.save_url, manifest, {
       paths: deps.paths, identity: deps.identity, rootDir: doc.source.root_dir, signal: deps.signal,
       ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),

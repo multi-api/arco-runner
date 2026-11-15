@@ -28,6 +28,12 @@ export const composerGlobalBin = (paths: Paths): string => `${paths.home}/.confi
 export const GO_MODCACHE = '.cache/go-mod';
 
 /**
+ * Go's build cache: a cache root too, so a fresh machine (Standard) does not recompile every dependency on each
+ * build. Go keys each entry by a hash of its inputs and trims entries unused for five days on its own.
+ */
+export const GO_BUILDCACHE = '.cache/go-build';
+
+/**
  * The build environment (spec §6.5). Nothing is inherited from the agent's own environment.
  * PATH ends with Composer's global bin dir (a Go build runs `composer global require multiapi/arco` and Cloud sends
  * `ARCO_BIN=arco`); it comes last, so nothing a build installs there can shadow a system tool.
@@ -50,7 +56,7 @@ export function buildEnv(paths: Paths, jobEnv: Record<string, string>): NodeJS.P
     GOTOOLCHAIN: 'auto',
     GOPATH: `${paths.home}/go`,
     GOMODCACHE: `${paths.home}/${GO_MODCACHE}`,
-    GOCACHE: `${paths.home}/.cache/go-build`,
+    GOCACHE: `${paths.home}/${GO_BUILDCACHE}`,
     // Writable module cache: the cache archive, its restore and the wipe never meet read-only directories.
     GOFLAGS: '-modcacherw',
   };

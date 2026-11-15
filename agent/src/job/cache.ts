@@ -7,10 +7,17 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { runCommand } from '@multiapi/arco-cloud-client';
 import { readPlainFile } from '../fsutil.js';
-import { GO_MODCACHE, type Identity, type Paths } from '../system.js';
+import { GO_BUILDCACHE, GO_MODCACHE, type Identity, type Paths } from '../system.js';
 
 export type Locks = { composer: string | null; npm: string | null; yarn: string | null; pnpm: string | null; go: string | null };
-export type CacheManifest = { version: 1; key: string; lock: Locks; created_at: string };
+/**
+ * `layout`: which set of cache roots the archive holds (absent in archives written before it, read as 1).
+ * An archive of an older layout is saved again even when no lock changed, so a new root gets archived.
+ */
+export type CacheManifest = { version: 1; key: string; lock: Locks; created_at: string; layout?: number };
+
+/** Bump when cacheRoots gains a root. 2: Go's build cache (GO_BUILDCACHE). */
+export const CACHE_LAYOUT = 2;
 export type CacheCtx = {
   paths: Paths;
   identity: Identity | null;
@@ -74,7 +81,7 @@ export function cacheRoots(rootDir: string): string[] {
     const base = `work/repo/${segs.join('/')}`;
     roots.push(`${base}/vendor`, `${base}/node_modules`);
   }
-  roots.push('.cache/composer', '.npm', GO_MODCACHE);
+  roots.push('.cache/composer', '.npm', GO_MODCACHE, GO_BUILDCACHE);
   return [...new Set(roots)];
 }
 
@@ -93,6 +100,7 @@ export async function lockHashes(projectDir: string): Promise<Locks> {
 
 export function shouldSave(current: Locks, known: CacheManifest | null): boolean {
   if (!known) return true;
+  if ((known.layout ?? 1) < CACHE_LAYOUT) return true;
   return (Object.keys(LOCK_FILES) as (keyof Locks)[]).some((k) => current[k] !== known.lock[k]);
 }
 
@@ -228,9 +236,13 @@ function parseManifest(buf: Buffer | null): CacheManifest | null {
     const lockOk = !!lock && (['composer', 'npm', 'yarn', 'pnpm'] as const).every(
       (k) => lock[k] === null || typeof lock[k] === 'string',
     ) && (lock.go === undefined || lock.go === null || typeof lock.go === 'string');
-    if (j.version !== 1 || typeof j.key !== 'string' || typeof j.created_at !== 'string' || !lockOk) return null;
+    const layoutOk = j.layout === undefined || (Number.isSafeInteger(j.layout) && (j.layout as number) >= 1);
+    if (j.version !== 1 || typeof j.key !== 'string' || typeof j.created_at !== 'string' || !lockOk || !layoutOk) return null;
     const l = lock as Locks;
-    return { version: 1, key: j.key, lock: { composer: l.composer, npm: l.npm, yarn: l.yarn, pnpm: l.pnpm, go: l.go ?? null }, created_at: j.created_at };
+    return {
+      version: 1, key: j.key, lock: { composer: l.composer, npm: l.npm, yarn: l.yarn, pnpm: l.pnpm, go: l.go ?? null },
+      created_at: j.created_at, ...(j.layout === undefined ? {} : { layout: j.layout as number }),
+    };
   } catch {
     return null;
   }

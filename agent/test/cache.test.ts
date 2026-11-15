@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   type CacheCtx, type CacheManifest, CacheError, UnsafeArchive, cacheRoots, createEntryChecker, checkArchiveEntries, lockHashes,
-  parseListLine, restoreCache, saveCache, shouldSave,
+  CACHE_LAYOUT, parseListLine, restoreCache, saveCache, shouldSave,
 } from '../src/job/cache.js';
 import type { Paths } from '../src/system.js';
 
@@ -62,11 +62,11 @@ const manifest: CacheManifest = {
 describe('cacheRoots', () => {
   it('lists the global roots and adds the root_dir ones', () => {
     expect(cacheRoots('')).toEqual([
-      'work/repo/vendor', 'work/repo/node_modules', '.cache/composer', '.npm', '.cache/go-mod',
+      'work/repo/vendor', 'work/repo/node_modules', '.cache/composer', '.npm', '.cache/go-mod', '.cache/go-build',
     ]);
     expect(cacheRoots('app')).toEqual([
       'work/repo/vendor', 'work/repo/node_modules', 'work/repo/app/vendor', 'work/repo/app/node_modules',
-      '.cache/composer', '.npm', '.cache/go-mod',
+      '.cache/composer', '.npm', '.cache/go-mod', '.cache/go-build',
     ]);
   });
 });
@@ -78,7 +78,11 @@ describe('shouldSave', () => {
     expect(shouldSave({ ...locks, composer: 'z' }, { ...manifest, lock: locks })).toBe(true);
     expect(shouldSave({ ...locks, yarn: 'y' }, { ...manifest, lock: locks })).toBe(true);
     expect(shouldSave({ ...locks, go: 'g' }, { ...manifest, lock: locks })).toBe(true);
-    expect(shouldSave(locks, { ...manifest, lock: { ...locks } })).toBe(false);
+    expect(shouldSave(locks, { ...manifest, lock: { ...locks }, layout: CACHE_LAYOUT })).toBe(false);
+  });
+  it('saves again an archive of an older layout (a new cache root) even with the same locks', () => {
+    expect(shouldSave(locks, { ...manifest, lock: { ...locks } })).toBe(true);
+    expect(shouldSave(locks, { ...manifest, lock: { ...locks }, layout: 1 })).toBe(true);
   });
 });
 
