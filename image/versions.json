@@ -1,13 +1,13 @@
 {
   "php": {
     "8.5": {
-      "release": "frankenphp-1.13.1-r1",
-      "runtime_build": "1.13.1-r1",
-      "arco_build_id": "php8.5.12-fp1.13.1-r1",
-      "php_cli_sha256": "5a0fb99033ecf48b07f368b11b5fad7a3c41cc030e700b980999ea8f1b277e49",
-      "php_cli_size": 95099992,
-      "frankenphp_sha256": "9cb3a31d10c7e8bf2448d599937bda889bdff8d3934011ee1b6a40e4fab5c5a5",
-      "frankenphp_size": 168138896
+      "release": "frankenphp-1.13.5-r1",
+      "runtime_build": "1.13.5-r1",
+      "arco_build_id": "php8.5.12-fp1.13.5-r1",
+      "php_cli_sha256": "7f82ee022accb45fdc252d107f82af9a9ac499f55c3ba0335d45fd1e5f1871d9",
+      "php_cli_size": 95101080,
+      "frankenphp_sha256": "2a21b7d3b74d9e3292915608f248adc26e98bc9b34ee4128a8c87b0629f9c07f",
+      "frankenphp_size": 173764552
     }
   },
   "go": {
