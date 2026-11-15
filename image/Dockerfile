@@ -45,8 +45,8 @@ RUN dnf install -y tar gzip \
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108
 
 ARG PHP_MINOR=8.5
-# Arco's build id for the pre-seeded runtime cache (the manifest key, e.g. php8.5.12-fp1.13.1-r1).
-ARG RUNTIME_BUILD=php8.5.12-fp1.13.1-r1
+# Arco's build id for the pre-seeded runtime cache (the manifest key, e.g. php8.5.12-fp1.13.5-r1).
+ARG RUNTIME_BUILD=php8.5.12-fp1.13.5-r1
 ARG COREPACK_VERSION=0.36.0
 ARG REVISION=dev
 
