@@ -23,7 +23,7 @@ describe('parseJobDocument', () => {
   });
   it('normalises null root_dir to empty string', () => {
     const d: any = valid(); d.source.root_dir = null;
-    expect(parseJobDocument(d).source.root_dir).toBe('');
+    expect(parseJobDocument(d).source!.root_dir).toBe('');
   });
   it('ignores extra keys', () => {
     const d: any = { ...valid(), extra: 1 }; d.source.more = 2;
@@ -31,6 +31,34 @@ describe('parseJobDocument', () => {
   });
   it('rejects a bad sha', () => {
     const d: any = valid(); d.source.sha = 'ABC';
+    expect(() => parseJobDocument(d)).toThrow(InvalidJobDocument);
+  });
+  it('accepts a remove document with null source', () => {
+    const d = parseJobDocument({ ...valid(), mode: 'remove', source: null, commands: [], cache: null, tests: null });
+    expect(d.mode).toBe('remove');
+    expect(d.source).toBeNull();
+    expect(d.cache).toBeNull();
+    expect(d.commands).toEqual([]);
+    expect(d.tests).toBeNull();
+  });
+  it('accepts a remove document with a source', () => {
+    const d = parseJobDocument({ ...valid(), mode: 'remove', commands: [], cache: null });
+    expect(d.source).toEqual({ ...valid().source });
+    expect(d.cache).toBeNull();
+  });
+  it('drops a cache sent with a remove: a remove never restores or saves one', () => {
+    expect(parseJobDocument({ ...valid(), mode: 'remove', commands: [] }).cache).toBeNull();
+  });
+  it('rejects null source for deploy', () => {
+    expect(() => parseJobDocument({ ...valid(), source: null })).toThrow(InvalidJobDocument);
+    expect(() => parseJobDocument({ ...valid(), mode: 'inventory', source: null })).toThrow(InvalidJobDocument);
+  });
+  it('rejects null cache for deploy and inventory', () => {
+    expect(() => parseJobDocument({ ...valid(), cache: null })).toThrow(InvalidJobDocument);
+    expect(() => parseJobDocument({ ...valid(), mode: 'inventory', cache: null })).toThrow(InvalidJobDocument);
+  });
+  it('rejects a missing source for remove (null only)', () => {
+    const d: any = { ...valid(), mode: 'remove', cache: null }; delete d.source;
     expect(() => parseJobDocument(d)).toThrow(InvalidJobDocument);
   });
   it('rejects non-objects and wrong field types', () => {

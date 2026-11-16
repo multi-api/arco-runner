@@ -12,11 +12,11 @@ import { runTestPhase } from '../tests/run-tests.js';
 import { killUserProcesses } from '../wipe.js';
 import { CACHE_LAYOUT, CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
 import { runBuildCommands } from './commands.js';
-import type { JobDocument, TicketPayload } from './document.js';
+import type { JobCache, JobDocument, SourcedJob, TicketPayload } from './document.js';
 import { BuildFailure } from './errors.js';
 import { claim, reportIdle } from './runner-api.js';
 import { completeSession, issueCredentials, MalformedAnswer, openSession, type OpenSession } from './session.js';
-import { checkout, revokeGithubToken, type CheckoutContext } from './source.js';
+import { checkout, emptyProjectDir, revokeGithubToken, type CheckoutContext } from './source.js';
 import { Steps } from './steps.js';
 
 /** `idle`: the VM is clean again (after the wipe, before the idle report); MicroVM mode only. */
@@ -77,6 +77,8 @@ const SAVE_TIME_BOX_MS = 8 * 60_000;
 const MIN_CREDENTIAL_TTL_MS = 20 * 60_000;
 const ARCO_MISSING =
   'vendor/bin/arco not found: add multiapi/arco to composer.json and install it in your build commands (dev dependencies included)';
+/** Logged instead of the checkout when a remove job has no source (spec: environment deletion). */
+export const NO_CHECKOUT_LINE = 'No repository checkout: removing with the Cloud configuration only.';
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const messageOf = (e: unknown): string => {
@@ -124,6 +126,9 @@ async function executableFile(bin: string, identity: Identity | null): Promise<b
   }
 }
 
+/** The job's root_dir; a remove without a source runs in the (empty) repository directory itself. */
+const rootDirOf = (doc: JobDocument): string => doc.source?.root_dir ?? '';
+
 /** Cache roots under the repo, relative to it: the checkout keeps them (spec §6.3 step 4). */
 const repoKeep = (rootDir: string): string[] =>
   cacheRoots(rootDir).filter((r) => r.startsWith('work/repo/')).map((r) => r.slice('work/repo/'.length));
@@ -131,7 +136,8 @@ const repoKeep = (rootDir: string): string[] =>
 /**
  * One job, from ticket to idle, in the order of spec §6.3: claim, mask, start, source, cache restore (only when
  * the VM knows no cache), tests (deploy mode, when the job has them), build commands, deploy + finish, cache save,
- * wipe (MicroVM only), idle.
+ * wipe (MicroVM only), idle. A remove job has no cache and no tests, and may have no source: then it runs in an
+ * empty project directory with Cloud's configuration layer alone.
  */
 export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult> {
   const now = deps.now ?? Date.now;
@@ -221,11 +227,13 @@ export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult
     // 8. Cache save: after finish, only after a deploy ran, never after a transient restore failure (R23: the
     // object may be fine, so it is not overwritten; after a content failure a fresh cache replaces it)
     deps.onPhase('saving');
-    if (saveBy !== null && !restoreTransientFailure) await save(doc, deps, now, log, saveBy);
+    if (saveBy !== null && !restoreTransientFailure && doc.source && doc.cache) {
+      await save(doc as SourcedJob, doc.cache, deps, now, log, saveBy);
+    }
 
     // 9. Wipe (the checkout ran: customer code may have run)
     deps.onPhase('wiping');
-    if (deps.mode === 'microvm') await deps.wipe(doc.source.root_dir);
+    if (deps.mode === 'microvm') await deps.wipe(rootDirOf(doc));
   }
 
   // 9. Idle. R22 (MicroVM): Cloud's /idle suspends this VM before it answers, so the agent must already be idle
@@ -251,31 +259,39 @@ async function build(
 
   // 4. Source
   const short = shortMaskValues(doc);
-  if (short > 0) steps.warning('build.clone', `${short} secret value(s) shorter than 4 characters are not masked`);
-  steps.start('build.clone');
-  let hasSubmodules: boolean;
-  try {
-    ({ hasSubmodules } = await checkout(doc, {
-      paths, identity, env, signal, keep: repoKeep(doc.source.root_dir),
-      onLine: (l) => s.batcher.addLine(cutLine(l)),
-      ...deps.checkoutOptions,
-    }));
-  } finally {
-    // Also after a failed clone: the token is single-purpose either way.
-    await revokeGithubToken(doc.source.clone_url, doc.source.auth_header, deps.fetchImpl);
+  const source = doc.source;
+  if (source) {
+    if (short > 0) steps.warning('build.clone', `${short} secret value(s) shorter than 4 characters are not masked`);
+    steps.start('build.clone');
+    let hasSubmodules: boolean;
+    try {
+      ({ hasSubmodules } = await checkout(doc as SourcedJob, {
+        paths, identity, env, signal, keep: repoKeep(source.root_dir),
+        onLine: (l) => s.batcher.addLine(cutLine(l)),
+        ...deps.checkoutOptions,
+      }));
+    } finally {
+      // Also after a failed clone: the token is single-purpose either way.
+      await revokeGithubToken(source.clone_url, source.auth_header, deps.fetchImpl);
+    }
+    if (hasSubmodules) steps.note('build.clone', 'Submodules are not checked out');
+  } else {
+    // A remove without a source: no step to attach the short-mask warning to, so it is a plain line.
+    if (short > 0) s.batcher.addLine(`${short} secret value(s) shorter than 4 characters are not masked`);
+    await emptyProjectDir(paths, identity);
+    s.batcher.addLine(NO_CHECKOUT_LINE);
   }
-  if (hasSubmodules) steps.note('build.clone', 'Submodules are not checked out');
-  let projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
-  steps.done('build.clone');
+  let projectDir = await resolveProjectDir(paths.repo, rootDirOf(doc));
+  if (source) steps.done('build.clone');
   cancelled();
 
-  // 5. Cache restore: only when this VM has not built with a cache yet
+  // 5. Cache restore: only when this VM has not built with a cache yet (never for a remove: it has no cache)
   let restoreTransientFailure = false;
-  if (deps.knownCache.get() === null) {
+  if (source && doc.cache && deps.knownCache.get() === null) {
     steps.start('build.cache_restore');
     try {
       const r = await restoreCache(doc.cache.restore_url, {
-        paths, identity, rootDir: doc.source.root_dir, signal, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+        paths, identity, rootDir: source.root_dir, signal, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
       });
       if (r.status === 'missing') steps.note('build.cache_restore', 'No cache yet');
       else {
@@ -292,19 +308,19 @@ async function build(
   cancelled();
 
   // Tests (spec §4): without build secrets or credentials; a failure ends the run before the build commands.
-  if (doc.mode === 'deploy' && doc.tests) {
+  if (doc.mode === 'deploy' && source && doc.tests) {
     await runTestPhase({
-      doc, tests: doc.tests, projectDir, paths, identity, batcher: s.batcher, steps, redactor, signal,
+      doc: doc as SourcedJob, tests: doc.tests, projectDir, paths, identity, batcher: s.batcher, steps, redactor, signal,
       buildDeadlineMs: deadlineMs, services: deps.services, killBuildProcesses: buildProcessKiller(deps),
       ...(deps.language ? { language: deps.language } : {}),
       ...(deps.now ? { now: deps.now } : {}),
     });
     cancelled();
     // The tests ran in the tree: resolve root_dir again rather than trust the earlier answer.
-    projectDir = await resolveProjectDir(paths.repo, doc.source.root_dir);
+    projectDir = await resolveProjectDir(paths.repo, source.root_dir);
   }
 
-  // 6. Build commands
+  // 6. Build commands (also for a remove: Cloud installs Arco with them)
   await runBuildCommands(doc.commands, {
     projectDir, env, identity, batcher: s.batcher, steps, deadlineMs, signal, timeoutSeconds: doc.timeout_seconds,
   });
@@ -330,7 +346,7 @@ async function deploy(
   doc: JobDocument, deps: JobDeps, apiBase: string, redactor: Redactor, open: OpenSession,
   finishWarn: (m: string) => void, signal: AbortSignal, now: () => number, sleep: (ms: number) => Promise<void>,
 ): Promise<number> {
-  const projectDir = await resolveProjectDir(deps.paths.repo, doc.source.root_dir);
+  const projectDir = await resolveProjectDir(deps.paths.repo, rootDirOf(doc));
   const env = buildEnv(deps.paths, arcoJobEnv(doc.env));
   // Cloud sends ARCO_BIN=arco for apps without vendor/ (Go): a global `composer global require multiapi/arco`.
   const arcoBin = resolveArcoBin(undefined, env);
@@ -386,7 +402,7 @@ async function deploy(
 }
 
 /** Step 8, after finish: nothing reaches Cloud's logs any more, diagnostics go to stdout only. */
-async function save(doc: JobDocument, deps: JobDeps, now: () => number, log: (m: string) => void, savedBy: number): Promise<void> {
+async function save(doc: SourcedJob, cache: JobCache, deps: JobDeps, now: () => number, log: (m: string) => void, savedBy: number): Promise<void> {
   try {
     // Ruling R13: no build process may be alive while the cache roots are walked and archived.
     const kill = buildProcessKiller(deps);
@@ -401,11 +417,11 @@ async function save(doc: JobDocument, deps: JobDeps, now: () => number, log: (m:
     const projectDir = await resolveProjectDir(deps.paths.repo, doc.source.root_dir);
     const lock = await lockHashes(projectDir);
     const known = deps.knownCache.get();
-    if (!shouldSave(lock, known && known.key === doc.cache.key ? known : null)) return;
+    if (!shouldSave(lock, known && known.key === cache.key ? known : null)) return;
     const manifest: CacheManifest = {
-      version: 1, key: doc.cache.key, lock, created_at: new Date(now()).toISOString(), layout: CACHE_LAYOUT,
+      version: 1, key: cache.key, lock, created_at: new Date(now()).toISOString(), layout: CACHE_LAYOUT,
     };
-    const outcome = await saveCache(doc.cache.save_url, manifest, {
+    const outcome = await saveCache(cache.save_url, manifest, {
       paths: deps.paths, identity: deps.identity, rootDir: doc.source.root_dir, signal: deps.signal,
       ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
     }, savedBy);

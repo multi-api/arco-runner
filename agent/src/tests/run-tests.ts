@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { runCommand, type Batcher, type Redactor } from '@multiapi/arco-cloud-client';
 import { readPlainFile, removeTree } from '../fsutil.js';
 import { runBuildCommands, runShell, type BuildCommandsContext } from '../job/commands.js';
-import type { JobDocument, TestsSpec } from '../job/document.js';
+import type { SourcedJob, TestsSpec } from '../job/document.js';
 import { BuildFailure } from '../job/errors.js';
 import { GIT_HARDENING } from '../job/source.js';
 import type { Steps } from '../job/steps.js';
@@ -23,7 +23,8 @@ const NO_SERVICES = 'Test services are not available on this runner';
 const PREDIS_NOTE = 'The PHP of this runner has no redis extension: REDIS_CLIENT=predis, so the app needs predis/predis';
 
 export interface TestPhaseContext {
-  doc: JobDocument;
+  /** Tests run only in deploy mode, which always has a source. */
+  doc: SourcedJob;
   tests: TestsSpec;
   /** resolveProjectDir-validated project directory. */
   projectDir: string;

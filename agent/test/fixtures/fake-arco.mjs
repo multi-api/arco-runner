@@ -8,6 +8,7 @@
 //   FAKE_ARCO_DNSFILE  = file to copy AWS_SHARED_CREDENTIALS_FILE's content to (deploy only; the runner removes the original)
 //   FAKE_ARCO_LAYERFILE = file to copy ARCO_CONFIG_LAYER's content to (deploy only; the runner removes the original)
 //   FAKE_ARCO_VERSION  = the version `--version` prints (default 0.10.0)
+//   `remove` notes a kept bucket and reports outcome removed
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -63,6 +64,11 @@ if (args[0] === '--version') {
   const merged = { ...base, ...over };
   for (const k of Object.keys(merged)) if (merged[k] === '__absent__') delete merged[k];
   emit(merged);
+} else if (args[0] === 'remove') {
+  // FAKE_ARCO_REMOVE_CWD = file to write the working directory to
+  if (process.env.FAKE_ARCO_REMOVE_CWD) writeFileSync(process.env.FAKE_ARCO_REMOVE_CWD, process.cwd());
+  emit({ type: 'step', key: 'remove.resource_kept', status: 'note', params: { type: 'bucket', name: 'shop-files' } });
+  emit({ type: 'result', outcome: 'removed', app: 'shop', environment: 'production', revision: null, url: null, domains: [], rolled_back: false, cold_start_ms: null, error: null });
 } else if (args[0] === 'info') {
   const mode = process.env.FAKE_ARCO_INFO ?? 'ok';
   if (mode === 'fail') process.exit(1);

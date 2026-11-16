@@ -99,6 +99,18 @@ docker run --rm --network none --user 0 arco-runner:go-dev /usr/bin/node /opt/ar
 
 `--minor 8.5` (or `--image php85`) still selects the PHP image in every script.
 
+## Remove jobs
+
+Cloud deletes an environment with a job whose `mode` is `remove` (always on its Fargate runner). It needs `@multiapi/arco-cloud-client` 0.1.11 or newer, which runs `arco remove --env=<env> --yes --json --no-wait-interfaces` and finishes `removed` or `failed`, with the kept resources as `notes` and Arco's error `params` as `error_params`.
+
+| What | In a remove job |
+| --- | --- |
+| Document | `cache` is always treated as `null` and `tests` are never run. `source` may be `null` (only in remove mode; a deploy or inventory without a source is an invalid document) |
+| Source | With a source, the repository is checked out as usual so Arco can read the project's own configuration. With `source: null` there is no clone: the agent empties `/home/build/work/repo`, runs there and logs `No repository checkout: removing with the Cloud configuration only.` Arco then works from Cloud's configuration layer alone |
+| Cache | Never restored and never saved |
+| Build commands | Still run, so Cloud can install Arco: without a checkout there is no `vendor/bin/arco`, so the job must install it globally (`composer global require multiapi/arco:<version>`) and set `ARCO_BIN=arco`, as for Go apps. Otherwise the run fails `arco.not_installed` |
+| Credentials, wipe, idle | As for a deploy |
+
 ## Image
 
 Besides PHP, FrankenPHP, Composer, Node and tini, the image carries the test services (design spec §5), stopped:
