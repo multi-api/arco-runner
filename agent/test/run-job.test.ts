@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { secretVariants, toFinishPayload, type ArcoResult } from '@multiapi/arco-cloud-client';
@@ -857,6 +857,102 @@ describe('runJob: tests before deploy', () => {
     expect(r.finishes[0]).toMatchObject({
       result: 'failed', error_code: 'build.test_service_failed', error_message: 'Test services are not available on this runner',
     });
+  }, 30_000);
+});
+
+describe('runJob: remove jobs', () => {
+  // Steps only: Arco's result event has no key.
+  const eventsOf = (r: Awaited<ReturnType<typeof run>>) =>
+    r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).events as { key?: string; status: string }[])
+      .filter((e): e is { key: string; status: string } => typeof e.key === 'string');
+  const removeJob = (extra: Record<string, unknown> = {}) => ({ mode: 'remove', cache: null, tests: null, ...extra });
+  // The wrapper appends the path it was run as ($0) to out/arco-paths.txt.
+  const globalArco = async (w: World) => {
+    const src = join(w.out, 'arco');
+    await writeFile(src, `#!/bin/sh\necho "$0" >> "${join(w.out, 'arco-paths.txt')}"\nexec "${process.execPath}" "${FAKE_ARCO}" "$@"\n`);
+    await chmod(src, 0o755);
+    // Stands in for Cloud's single install line, `composer global require multiapi/arco:<version>`.
+    return `mkdir -p "$COMPOSER_HOME/vendor/bin" && cp "${src}" "$COMPOSER_HOME/vendor/bin/arco" && chmod 755 "$COMPOSER_HOME/vendor/bin/arco"`;
+  };
+  const removedFinish = {
+    result: 'removed', revision: null, rolled_back: false, error_code: null, error_message: null, arco_version: '0.10.0',
+    notes: [{ type: 'bucket', name: 'shop-files' }],
+  };
+
+  it('remove job skips cache and clone and runs the client in remove mode', async () => {
+    const w = await world({ withArco: false });
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls }, job: removeJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: true, idleReported: true });
+    expect((await readFile(calls, 'utf8')).split('\n').filter((l) => l && l !== '--version'))
+      .toEqual(['remove --env=production --yes --json --no-wait-interfaces']);
+    expect(r.cloud.requests.filter((q) => q.pathname.startsWith('/s3/'))).toHaveLength(0);
+    expect(w.knownCache.get()).toBeNull();
+    const events = eventsOf(r);
+    expect(events.some((e) => e.key === 'build.clone' || e.key.startsWith('build.cache') || e.key.startsWith('build.test'))).toBe(false);
+  }, 30_000);
+
+  it('remove job with a source checks it out, runs no tests and touches no cache', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls },
+      job: removeJob({ tests: { command: 'exit 1', services: [] } }),
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    expect((await readFile(calls, 'utf8')).split('\n')).toContain('remove --env=production --yes --json --no-wait-interfaces');
+    expect(r.cloud.requests.filter((q) => q.pathname.startsWith('/s3/'))).toHaveLength(0);
+    expect(w.knownCache.get()).toBeNull();
+    const events = eventsOf(r);
+    // Arco reads the project's own configuration from the checkout.
+    expect(events).toContainEqual(expect.objectContaining({ key: 'build.clone', status: 'done' }));
+    expect(events.some((e) => e.key.startsWith('build.cache') || e.key.startsWith('build.test'))).toBe(false);
+  }, 30_000);
+
+  it("runs the global arco at its absolute path, whatever bare ARCO_BIN the job sets", async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    // A bare ARCO_BIN that resolves nowhere, and the project's own vendor/bin/arco: neither is used.
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'not-arco', FAKE_ARCO_CALLS: calls }, job: removeJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    const ran = (await readFile(join(w.out, 'arco-paths.txt'), 'utf8')).split('\n').filter(Boolean);
+    expect(new Set(ran)).toEqual(new Set([join(w.paths.home, '.config/composer/vendor/bin/arco')]));
+    expect((await readFile(calls, 'utf8')).split('\n')).toContain('remove --env=production --yes --json --no-wait-interfaces');
+  }, 30_000);
+
+  it('fails clearly when the global arco was not installed', async () => {
+    const w = await world();
+    const r = await run(w, { commands: [], env: { ARCO_BIN: 'arco' }, job: removeJob() });
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'arco.not_installed',
+      error_message: "arco not installed globally: the remove job's install command failed", arco_version: null,
+    }]);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+
+  it('remove job without source logs the layer-only line', async () => {
+    const w = await world({ withArco: false });
+    // Left over from an earlier job: the remove must not run in it.
+    await writeFile(join(w.paths.repo, 'stale.txt'), 'x');
+    const cwd = join(w.out, 'cwd.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_REMOVE_CWD: cwd }, job: removeJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    const lines = r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).lines as string[]);
+    expect(lines).toContain('No repository checkout: removing with the Cloud configuration only.');
+    const events = eventsOf(r);
+    expect(events.some((e) => e.key === 'build.clone' || e.key.startsWith('build.cache'))).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ key: 'build.command.1', status: 'done' }));
+    expect(await readFile(cwd, 'utf8')).toBe(await realpath(w.paths.repo));
+    expect(existsSync(join(w.paths.repo, 'stale.txt'))).toBe(false);
+    expect(r.cloud.requests.filter((q) => q.pathname.startsWith('/s3/'))).toHaveLength(0);
+    expect(r.wipes).toEqual(['']);
   }, 30_000);
 });
 

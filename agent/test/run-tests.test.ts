@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Batcher, Redactor, type Batcher as BatcherT } from '@multiapi/arco-cloud-client';
 import { describe, expect, it } from 'vitest';
-import type { JobDocument, ServiceName, TestsSpec } from '../src/job/document.js';
+import type { ServiceName, SourcedJob, TestsSpec } from '../src/job/document.js';
 import { BuildFailure } from '../src/job/errors.js';
 import { Steps } from '../src/job/steps.js';
 import { registerJobSecrets } from '../src/mask.js';
@@ -109,7 +109,7 @@ async function run(w: World, o: RunOptions = {}) {
     command: 'vendor/bin/phpunit', setup_commands: [], services: [], primary_database: null, timeout_seconds: 900,
     env: {}, mask: [], ...o.tests,
   };
-  const doc: JobDocument = {
+  const doc: SourcedJob = {
     deployment_id: 'dep_1', environment: 'production', mode: 'deploy', nonce: NONCE, runner_token: TOKEN,
     source: { clone_url: 'file:///x', auth_header: 'basic eA==', sha: w.sha, root_dir: w.rootDir },
     php_version: '8.5', commands: ['echo build'], env: o.env ?? {}, mask: o.mask ?? [], timeout_seconds: o.timeoutSeconds ?? 600,

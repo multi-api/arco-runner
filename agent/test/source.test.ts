@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as client from '@multiapi/arco-cloud-client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parseJobDocument } from '../src/job/document.js';
+import { parseJobDocument, type SourcedJob } from '../src/job/document.js';
 import { checkout } from '../src/job/source.js';
 import type { Paths } from '../src/system.js';
 
@@ -38,7 +38,7 @@ async function fixture() {
     source: { clone_url: `file://${origin}`, auth_header: AUTH, sha, root_dir: null },
     php_version: '8.5', commands: [], env: {}, mask: [],
     cache: { restore_url: 'https://s3/r', save_url: 'https://s3/s', key: 'k' }, timeout_seconds: 60,
-  });
+  }) as SourcedJob;
   const ctx = (keep: string[] = [], env: NodeJS.ProcessEnv = { PATH: process.env.PATH }) => ({
     paths, identity: null, env, onLine: () => {},
     signal: new AbortController().signal, keep, extraGitArgs: ['-c', 'protocol.file.allow=always'], allowFileUrl: true,

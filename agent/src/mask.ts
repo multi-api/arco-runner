@@ -27,12 +27,12 @@ export function registerJobSecrets(r: Redactor, d: JobDocument): void {
     ...(d.tests?.mask ?? []),
     d.runner_token,
     d.nonce,
-    d.source.auth_header,
-    cloneToken(d.source.auth_header),
-    d.cache.restore_url,
-    d.cache.save_url,
-    signature(d.cache.restore_url),
-    signature(d.cache.save_url),
+    d.source?.auth_header ?? null,
+    d.source ? cloneToken(d.source.auth_header) : null,
+    d.cache?.restore_url ?? null,
+    d.cache?.save_url ?? null,
+    d.cache ? signature(d.cache.restore_url) : null,
+    d.cache ? signature(d.cache.save_url) : null,
   ];
   for (const s of secrets) if (s) r.add(s);
 }

@@ -28,8 +28,8 @@ describe('registerJobSecrets', () => {
     const d = doc();
     const r = new Redactor();
     registerJobSecrets(r, d);
-    const line = [d.mask[0], d.runner_token, d.nonce, d.source.auth_header, 'ghs_abc123',
-      d.cache.restore_url, d.cache.save_url, 'sigRESTORE99', 'sigSAVE1234'].join(' | ');
+    const line = [d.mask[0], d.runner_token, d.nonce, d.source!.auth_header, 'ghs_abc123',
+      d.cache!.restore_url, d.cache!.save_url, 'sigRESTORE99', 'sigSAVE1234'].join(' | ');
     const out = r.redact(line);
     for (const s of ['hunter22', 'runner-token-xyz', 'nonce-secret-77', 'ghs_abc123', 'sigRESTORE99', 'sigSAVE1234', 's3/r?', 's3/s?']) {
       expect(out).not.toContain(s);

@@ -5,7 +5,7 @@ import { runCommand } from '@multiapi/arco-cloud-client';
 import { ensureRealDir, sanitizeKeep, wipeExcept } from '../fsutil.js';
 import { cloneToken } from '../mask.js';
 import { type Identity, type Paths } from '../system.js';
-import type { JobDocument } from './document.js';
+import type { SourcedJob } from './document.js';
 import { BuildFailure } from './errors.js';
 
 export const GIT_HARDENING: string[] = [
@@ -43,7 +43,7 @@ export interface CheckoutContext {
   allowHttpUrl?: boolean;
 }
 
-export async function checkout(doc: JobDocument, ctx: CheckoutContext): Promise<{ hasSubmodules: boolean }> {
+export async function checkout(doc: SourcedJob, ctx: CheckoutContext): Promise<{ hasSubmodules: boolean }> {
   const { paths, identity } = ctx;
   const url = doc.source.clone_url;
   const allowed = url.startsWith('https://') || (ctx.allowFileUrl && url.startsWith('file://'))
@@ -83,6 +83,16 @@ export async function checkout(doc: JobDocument, ctx: CheckoutContext): Promise<
     await rm(emptyHome, { recursive: true, force: true });
   }
   return { hasSubmodules: existsSync(join(paths.repo, '.gitmodules')) };
+}
+
+/**
+ * A remove without a source: the project directory exists, belongs to the build user and is empty (nothing from
+ * an earlier job is left for Arco to read). Arco works from Cloud's configuration layer alone.
+ */
+export async function emptyProjectDir(paths: Paths, identity: Identity | null): Promise<void> {
+  for (const d of new Set([paths.home, dirname(paths.repo), paths.repo])) await ensureRealDir(d);
+  await wipeExcept(paths.repo, []);
+  if (identity) await lchown(paths.repo, identity.uid, identity.gid);
 }
 
 /** Best effort: the installation token is single-purpose, so revoke it as soon as the checkout is done. */
