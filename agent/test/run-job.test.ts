@@ -866,9 +866,10 @@ describe('runJob: remove jobs', () => {
     r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).events as { key?: string; status: string }[])
       .filter((e): e is { key: string; status: string } => typeof e.key === 'string');
   const removeJob = (extra: Record<string, unknown> = {}) => ({ mode: 'remove', cache: null, tests: null, ...extra });
+  // The wrapper appends the path it was run as ($0) to out/arco-paths.txt.
   const globalArco = async (w: World) => {
     const src = join(w.out, 'arco');
-    await writeFile(src, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_ARCO}" "$@"\n`);
+    await writeFile(src, `#!/bin/sh\necho "$0" >> "${join(w.out, 'arco-paths.txt')}"\nexec "${process.execPath}" "${FAKE_ARCO}" "$@"\n`);
     await chmod(src, 0o755);
     // Stands in for Cloud's single install line, `composer global require multiapi/arco:<version>`.
     return `mkdir -p "$COMPOSER_HOME/vendor/bin" && cp "${src}" "$COMPOSER_HOME/vendor/bin/arco" && chmod 755 "$COMPOSER_HOME/vendor/bin/arco"`;
@@ -898,7 +899,8 @@ describe('runJob: remove jobs', () => {
     const w = await world();
     const calls = join(w.out, 'arco-calls.txt');
     const r = await run(w, {
-      commands: [], env: { FAKE_ARCO_CALLS: calls }, job: removeJob({ tests: { command: 'exit 1', services: [] } }),
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls },
+      job: removeJob({ tests: { command: 'exit 1', services: [] } }),
     });
     expect(r.finishes).toEqual([removedFinish]);
     expect((await readFile(calls, 'utf8')).split('\n')).toContain('remove --env=production --yes --json --no-wait-interfaces');
@@ -908,6 +910,29 @@ describe('runJob: remove jobs', () => {
     // Arco reads the project's own configuration from the checkout.
     expect(events).toContainEqual(expect.objectContaining({ key: 'build.clone', status: 'done' }));
     expect(events.some((e) => e.key.startsWith('build.cache') || e.key.startsWith('build.test'))).toBe(false);
+  }, 30_000);
+
+  it("runs the global arco at its absolute path, whatever bare ARCO_BIN the job sets", async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    // A bare ARCO_BIN that resolves nowhere, and the project's own vendor/bin/arco: neither is used.
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'not-arco', FAKE_ARCO_CALLS: calls }, job: removeJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    const ran = (await readFile(join(w.out, 'arco-paths.txt'), 'utf8')).split('\n').filter(Boolean);
+    expect(new Set(ran)).toEqual(new Set([join(w.paths.home, '.config/composer/vendor/bin/arco')]));
+    expect((await readFile(calls, 'utf8')).split('\n')).toContain('remove --env=production --yes --json --no-wait-interfaces');
+  }, 30_000);
+
+  it('fails clearly when the global arco was not installed', async () => {
+    const w = await world();
+    const r = await run(w, { commands: [], env: { ARCO_BIN: 'arco' }, job: removeJob() });
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'arco.not_installed',
+      error_message: "arco not installed globally: the remove job's install command failed", arco_version: null,
+    }]);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
   }, 30_000);
 
   it('remove job without source logs the layer-only line', async () => {

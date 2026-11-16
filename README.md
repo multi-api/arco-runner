@@ -108,7 +108,8 @@ Cloud deletes an environment with a job whose `mode` is `remove` (always on its 
 | Document | `cache` is always treated as `null` and `tests` are never run. `source` may be `null` (only in remove mode; a deploy or inventory without a source is an invalid document) |
 | Source | With a source, the repository is checked out as usual so Arco can read the project's own configuration. With `source: null` there is no clone: the agent empties `/home/build/work/repo`, runs there and logs `No repository checkout: removing with the Cloud configuration only.` Arco then works from Cloud's configuration layer alone |
 | Cache | Never restored and never saved |
-| Build commands | Still run, so Cloud can install Arco: without a checkout there is no `vendor/bin/arco`, so the job must install it globally (`composer global require multiapi/arco:<version>`) and set `ARCO_BIN=arco`, as for Go apps. Otherwise the run fails `arco.not_installed` |
+| Build commands | Still run: Cloud installs Arco with them (`composer global require multiapi/arco:<version> --no-interaction`) |
+| Arco binary | Always the global install at its absolute path, `/home/build/.config/composer/vendor/bin/arco` (Composer's global bin dir), never `vendor/bin/arco` and never a PATH lookup: a bare `ARCO_BIN` (Cloud sends `arco`) is ignored, an absolute one is honoured. Missing or not executable after the commands: the run fails `arco.not_installed` with `arco not installed globally: the remove job's install command failed` |
 | Credentials, wipe, idle | As for a deploy |
 
 ## Image

@@ -7,7 +7,7 @@ import {
 } from '@multiapi/arco-cloud-client';
 import { registerJobSecrets, shortMaskValues } from '../mask.js';
 import type { ServicesManager } from '../services/manager.js';
-import { buildEnv, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
+import { buildEnv, composerGlobalBin, cutLine, resolveProjectDir, type Identity, type Paths } from '../system.js';
 import { runTestPhase } from '../tests/run-tests.js';
 import { killUserProcesses } from '../wipe.js';
 import { CACHE_LAYOUT, CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
@@ -77,6 +77,8 @@ const SAVE_TIME_BOX_MS = 8 * 60_000;
 const MIN_CREDENTIAL_TTL_MS = 20 * 60_000;
 const ARCO_MISSING =
   'vendor/bin/arco not found: add multiapi/arco to composer.json and install it in your build commands (dev dependencies included)';
+/** A remove job's Arco is the global install its commands made; this is what it fails with when it is missing. */
+export const GLOBAL_ARCO_MISSING = "arco not installed globally: the remove job's install command failed";
 /** Logged instead of the checkout when a remove job has no source (spec: environment deletion). */
 export const NO_CHECKOUT_LINE = 'No repository checkout: removing with the Cloud configuration only.';
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -124,6 +126,17 @@ async function executableFile(bin: string, identity: Identity | null): Promise<b
   } catch {
     return false;
   }
+}
+
+/**
+ * The Arco binary of a job. A remove runs the global install (`composer global require multiapi/arco:<v>` in its
+ * commands) at its absolute path, so no PATH lookup is involved; only an absolute ARCO_BIN from the job overrides it.
+ * Deploy and inventory keep the client's rule: ARCO_BIN, else vendor/bin/arco.
+ */
+export function jobArcoBin(doc: JobDocument, paths: Paths, env: NodeJS.ProcessEnv): string {
+  if (doc.mode !== 'remove') return resolveArcoBin(undefined, env);
+  const fromJob = env.ARCO_BIN?.trim();
+  return fromJob && isAbsolute(fromJob) ? fromJob : join(composerGlobalBin(paths), 'arco');
 }
 
 /** The job's root_dir; a remove without a source runs in the (empty) repository directory itself. */
@@ -349,9 +362,9 @@ async function deploy(
   const projectDir = await resolveProjectDir(deps.paths.repo, rootDirOf(doc));
   const env = buildEnv(deps.paths, arcoJobEnv(doc.env));
   // Cloud sends ARCO_BIN=arco for apps without vendor/ (Go): a global `composer global require multiapi/arco`.
-  const arcoBin = resolveArcoBin(undefined, env);
+  const arcoBin = jobArcoBin(doc, deps.paths, env);
   if (!(await arcoInstalled(projectDir, deps.identity, arcoBin, env.PATH ?? ''))) {
-    throw new BuildFailure('arco.not_installed', arcoMissingMessage(arcoBin));
+    throw new BuildFailure('arco.not_installed', doc.mode === 'remove' ? GLOBAL_ARCO_MISSING : arcoMissingMessage(arcoBin));
   }
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
   // M3: no background build process may live next to arco (it could read /proc/<arco>/environ). A failure is an
