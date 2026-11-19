@@ -9,6 +9,8 @@
 //   FAKE_ARCO_LAYERFILE = file to copy ARCO_CONFIG_LAYER's content to (deploy only; the runner removes the original)
 //   FAKE_ARCO_VERSION  = the version `--version` prints (default 0.10.0)
 //   `remove` notes a kept bucket and reports outcome removed
+//   `tenants:restore` prints one pretty-printed document (outcome FAKE_ARCO_RESTORE, default restored; exit 1 unless
+//   it is a success outcome) and writes its working directory to FAKE_ARCO_REMOVE_CWD
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -69,6 +71,13 @@ if (args[0] === '--version') {
   if (process.env.FAKE_ARCO_REMOVE_CWD) writeFileSync(process.env.FAKE_ARCO_REMOVE_CWD, process.cwd());
   emit({ type: 'step', key: 'remove.resource_kept', status: 'note', params: { type: 'bucket', name: 'shop-files' } });
   emit({ type: 'result', outcome: 'removed', app: 'shop', environment: 'production', revision: null, url: null, domains: [], rolled_back: false, cold_start_ms: null, error: null });
+} else if (args[0] === 'tenants:restore') {
+  if (process.env.FAKE_ARCO_REMOVE_CWD) writeFileSync(process.env.FAKE_ARCO_REMOVE_CWD, process.cwd());
+  const outcome = process.env.FAKE_ARCO_RESTORE ?? 'restored';
+  const ok = ['restored', 'already_enabled', 'limit_kept', 'nothing_to_restore'].includes(outcome);
+  const error = ok ? null : { key: 'tenants.restore_failed', message: 'Could not restore the tenant domains', params: { count: 2 } };
+  console.log(JSON.stringify({ schema: 1, outcome, environment: 'production', tenants: [], error }, null, 4));
+  if (!ok) process.exit(1);
 } else if (args[0] === 'info') {
   const mode = process.env.FAKE_ARCO_INFO ?? 'ok';
   if (mode === 'fail') process.exit(1);

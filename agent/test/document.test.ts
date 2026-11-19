@@ -57,6 +57,29 @@ describe('parseJobDocument', () => {
     expect(() => parseJobDocument({ ...valid(), cache: null })).toThrow(InvalidJobDocument);
     expect(() => parseJobDocument({ ...valid(), mode: 'inventory', cache: null })).toThrow(InvalidJobDocument);
   });
+  it('accepts a tenants_restore document with null source', () => {
+    const d = parseJobDocument({ ...valid(), mode: 'tenants_restore', source: null, commands: [], cache: null, tests: null });
+    expect(d.mode).toBe('tenants_restore');
+    expect(d.source).toBeNull();
+    expect(d.cache).toBeNull();
+    expect(d.tests).toBeNull();
+  });
+  it('accepts a tenants_restore document with a source', () => {
+    const d = parseJobDocument({ ...valid(), mode: 'tenants_restore', commands: [], cache: null });
+    expect(d.source).toEqual({ ...valid().source });
+    expect(d.cache).toBeNull();
+  });
+  it('drops a cache sent with a tenants_restore', () => {
+    expect(parseJobDocument({ ...valid(), mode: 'tenants_restore', commands: [] }).cache).toBeNull();
+  });
+  it('rejects a missing source for tenants_restore (null only)', () => {
+    const d: any = { ...valid(), mode: 'tenants_restore', cache: null }; delete d.source;
+    expect(() => parseJobDocument(d)).toThrow(InvalidJobDocument);
+  });
+  it('keeps no trace of the remove key: the agent never derives --force from the job document', () => {
+    const d = parseJobDocument({ ...valid(), mode: 'remove', source: null, cache: null, remove: { force: true } });
+    expect(d).not.toHaveProperty('remove');
+  });
   it('rejects a missing source for remove (null only)', () => {
     const d: any = { ...valid(), mode: 'remove', cache: null }; delete d.source;
     expect(() => parseJobDocument(d)).toThrow(InvalidJobDocument);
