@@ -109,8 +109,16 @@ Cloud deletes an environment with a job whose `mode` is `remove` (always on its 
 | Source | With a source, the repository is checked out as usual so Arco can read the project's own configuration. With `source: null` there is no clone: the agent empties `/home/build/work/repo`, runs there and logs `No repository checkout: removing with the Cloud configuration only.` Arco then works from Cloud's configuration layer alone |
 | Cache | Never restored and never saved |
 | Build commands | Still run: Cloud installs Arco with them (`composer global require multiapi/arco:<version> --no-interaction`) |
-| Arco binary | Always the global install at its absolute path, `/home/build/.config/composer/vendor/bin/arco` (Composer's global bin dir), never `vendor/bin/arco` and never a PATH lookup: a bare `ARCO_BIN` (Cloud sends `arco`) is ignored, an absolute one is honoured. Missing or not executable after the commands: the run fails `arco.not_installed` with `arco not installed globally: the remove job's install command failed` |
+| Arco binary | Always the global install at its absolute path, `/home/build/.config/composer/vendor/bin/arco` (Composer's global bin dir), never `vendor/bin/arco` and never a PATH lookup: a bare `ARCO_BIN` (Cloud sends `arco`) is ignored, an absolute one is honoured. Missing or not executable after the commands: the run fails `arco.not_installed` with `arco not installed globally: the maintenance job's install command failed` |
 | Credentials, wipe, idle | As for a deploy |
+
+### Forced removes (customer domains)
+
+When the environment has customer (tenant) domains, Cloud may run one Remove that deletes them: its `/start` answer carries `remove: {"force": true}`. The agent hands the `/start` answer's `remove` key to the shared client untouched, and the client (0.2.0 or newer) appends `--force` to `arco remove` only when `remove.force` is exactly `true`. The agent never adds `--force` itself and ignores the `remove` key of the job document. It advertises the client's capabilities at `/start` (`external_dns`, `extensions`, `tenant_domains`); without `tenant_domains` Cloud answers a forced Remove with `409 client_outdated` and issues no credentials.
+
+## Tenant restore jobs
+
+Cloud re-enables an environment's customer domains with a job whose `mode` is `tenants_restore` (Arco 0.25.0 or newer). It needs `@multiapi/arco-cloud-client` 0.2.0 or newer, which runs `arco tenants:restore --env=<env> --json` and finishes `succeeded` (outcome `restored`, `already_enabled`, `limit_kept` or `nothing_to_restore`) or `failed`, with the outcome as `restore_outcome` and Arco's error `params` as `error_params`. The job is handled exactly like a remove job (table above): no cache, no tests, `source` may be `null`, the build commands install Arco globally and the global Arco runs. Without a source the agent logs `No repository checkout: restoring with the Cloud configuration only.`
 
 ## Image
 

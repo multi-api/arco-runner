@@ -12,7 +12,7 @@ import { runTestPhase } from '../tests/run-tests.js';
 import { killUserProcesses } from '../wipe.js';
 import { CACHE_LAYOUT, CacheError, type CacheManifest, cacheRoots, lockHashes, restoreCache, saveCache, shouldSave } from './cache.js';
 import { runBuildCommands } from './commands.js';
-import type { JobCache, JobDocument, SourcedJob, TicketPayload } from './document.js';
+import { isMaintenanceMode, type JobCache, type JobDocument, type SourcedJob, type TicketPayload } from './document.js';
 import { BuildFailure } from './errors.js';
 import { claim, reportIdle } from './runner-api.js';
 import { completeSession, issueCredentials, MalformedAnswer, openSession, type OpenSession } from './session.js';
@@ -77,10 +77,15 @@ const SAVE_TIME_BOX_MS = 8 * 60_000;
 const MIN_CREDENTIAL_TTL_MS = 20 * 60_000;
 const ARCO_MISSING =
   'vendor/bin/arco not found: add multiapi/arco to composer.json and install it in your build commands (dev dependencies included)';
-/** A remove job's Arco is the global install its commands made; this is what it fails with when it is missing. */
-export const GLOBAL_ARCO_MISSING = "arco not installed globally: the remove job's install command failed";
-/** Logged instead of the checkout when a remove job has no source (spec: environment deletion). */
+/**
+ * A remove or tenants_restore job's Arco is the global install its commands made; this is what it fails with when it
+ * is missing.
+ */
+export const GLOBAL_ARCO_MISSING = "arco not installed globally: the maintenance job's install command failed";
+/** Logged instead of the checkout when a remove or tenants_restore job has no source (spec: environment deletion). */
 export const NO_CHECKOUT_LINE = 'No repository checkout: removing with the Cloud configuration only.';
+/** The same line for a tenants_restore job without a source. */
+export const NO_CHECKOUT_RESTORE_LINE = 'No repository checkout: restoring with the Cloud configuration only.';
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const messageOf = (e: unknown): string => {
@@ -129,17 +134,18 @@ async function executableFile(bin: string, identity: Identity | null): Promise<b
 }
 
 /**
- * The Arco binary of a job. A remove runs the global install (`composer global require multiapi/arco:<v>` in its
- * commands) at its absolute path, so no PATH lookup is involved; only an absolute ARCO_BIN from the job overrides it.
+ * The Arco binary of a job. A remove or tenants_restore runs the global install
+ * (`composer global require multiapi/arco:<v>` in its commands) at its absolute path, so no PATH lookup is
+ * involved; only an absolute ARCO_BIN from the job overrides it.
  * Deploy and inventory keep the client's rule: ARCO_BIN, else vendor/bin/arco.
  */
 export function jobArcoBin(doc: JobDocument, paths: Paths, env: NodeJS.ProcessEnv): string {
-  if (doc.mode !== 'remove') return resolveArcoBin(undefined, env);
+  if (!isMaintenanceMode(doc.mode)) return resolveArcoBin(undefined, env);
   const fromJob = env.ARCO_BIN?.trim();
   return fromJob && isAbsolute(fromJob) ? fromJob : join(composerGlobalBin(paths), 'arco');
 }
 
-/** The job's root_dir; a remove without a source runs in the (empty) repository directory itself. */
+/** The job's root_dir; a remove or tenants_restore without a source runs in the (empty) repository directory itself. */
 const rootDirOf = (doc: JobDocument): string => doc.source?.root_dir ?? '';
 
 /** Cache roots under the repo, relative to it: the checkout keeps them (spec §6.3 step 4). */
@@ -149,8 +155,9 @@ const repoKeep = (rootDir: string): string[] =>
 /**
  * One job, from ticket to idle, in the order of spec §6.3: claim, mask, start, source, cache restore (only when
  * the VM knows no cache), tests (deploy mode, when the job has them), build commands, deploy + finish, cache save,
- * wipe (MicroVM only), idle. A remove job has no cache and no tests, and may have no source: then it runs in an
- * empty project directory with Cloud's configuration layer alone.
+ * wipe (MicroVM only), idle. A remove or tenants_restore job has no cache and no tests, and may have no source: then
+ * it runs in an empty project directory with Cloud's configuration layer alone. Which Arco command runs (and whether
+ * `arco remove` gets `--force`) is the shared client's decision, from Cloud's start answer.
  */
 export async function runJob(p: TicketPayload, deps: JobDeps): Promise<JobResult> {
   const now = deps.now ?? Date.now;
@@ -289,16 +296,16 @@ async function build(
     }
     if (hasSubmodules) steps.note('build.clone', 'Submodules are not checked out');
   } else {
-    // A remove without a source: no step to attach the short-mask warning to, so it is a plain line.
+    // A remove or tenants_restore without a source: no step to attach the short-mask warning to, so it is a plain line.
     if (short > 0) s.batcher.addLine(`${short} secret value(s) shorter than 4 characters are not masked`);
     await emptyProjectDir(paths, identity);
-    s.batcher.addLine(NO_CHECKOUT_LINE);
+    s.batcher.addLine(doc.mode === 'tenants_restore' ? NO_CHECKOUT_RESTORE_LINE : NO_CHECKOUT_LINE);
   }
   let projectDir = await resolveProjectDir(paths.repo, rootDirOf(doc));
   if (source) steps.done('build.clone');
   cancelled();
 
-  // 5. Cache restore: only when this VM has not built with a cache yet (never for a remove: it has no cache)
+  // 5. Cache restore: only when this VM has not built with a cache yet (never for a remove or tenants_restore: no cache)
   let restoreTransientFailure = false;
   if (source && doc.cache && deps.knownCache.get() === null) {
     steps.start('build.cache_restore');
@@ -333,7 +340,7 @@ async function build(
     projectDir = await resolveProjectDir(paths.repo, source.root_dir);
   }
 
-  // 6. Build commands (also for a remove: Cloud installs Arco with them)
+  // 6. Build commands (also for a remove or tenants_restore: Cloud installs Arco with them)
   await runBuildCommands(doc.commands, {
     projectDir, env, identity, batcher: s.batcher, steps, deadlineMs, signal, timeoutSeconds: doc.timeout_seconds,
   });
@@ -364,7 +371,7 @@ async function deploy(
   // Cloud sends ARCO_BIN=arco for apps without vendor/ (Go): a global `composer global require multiapi/arco`.
   const arcoBin = jobArcoBin(doc, deps.paths, env);
   if (!(await arcoInstalled(projectDir, deps.identity, arcoBin, env.PATH ?? ''))) {
-    throw new BuildFailure('arco.not_installed', doc.mode === 'remove' ? GLOBAL_ARCO_MISSING : arcoMissingMessage(arcoBin));
+    throw new BuildFailure('arco.not_installed', isMaintenanceMode(doc.mode) ? GLOBAL_ARCO_MISSING : arcoMissingMessage(arcoBin));
   }
   if (signal.aborted) throw new BuildFailure('build.cancelled', 'Cancelled');
   // M3: no background build process may live next to arco (it could read /proc/<arco>/environ). A failure is an

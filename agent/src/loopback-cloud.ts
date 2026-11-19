@@ -5,6 +5,7 @@
 //   POST /api/v1/deployments/{id}/start       {nonce, defer_credentials?, capabilities?, supports_config_layer?}
 //                                             -> 200 credentials (null when deferred) and `config`
 //                                             | 409 runner_outdated (job has tests, flag missing)
+//                                             | 409 client_outdated (forced remove or tenants_restore, no tenant_domains)
 //   POST /api/v1/deployments/{id}/credentials {}       -> 200 {credentials, region, permissionsBoundary} once,
 //                                             then 409 credentials_already_issued | 409 finished
 //   POST /api/v1/deployments/{id}/logs        {seq, lines, events} -> 204 (or the configured answer)
@@ -43,6 +44,8 @@ export interface FakeCloudOptions {
   permissionsBoundary?: string | null;
   /** The config layer every start answer carries. Default null. */
   config?: Record<string, unknown> | null;
+  /** The `remove` key every start answer carries (Cloud sends `{force: true}` on a forced remove only). Default absent. */
+  remove?: unknown;
   /** When set, every start request gets this answer instead of the credentials. */
   startAnswer?: CannedAnswer;
   /** An older Cloud: start ignores defer_credentials (and the tests rule) and always returns credentials. */
@@ -158,7 +161,18 @@ export async function startFakeCloud(options: FakeCloudOptions): Promise<FakeClo
     };
     if (action === 'start') {
       if (options.startAnswer) return json(res, options.startAnswer.status, options.startAnswer.body);
-      const answer = { environment: options.job.environment, mode: options.job.mode, config: options.config ?? null };
+      const answer = {
+        environment: options.job.environment, mode: options.job.mode, config: options.config ?? null,
+        ...(options.remove !== undefined ? { remove: options.remove } : {}),
+      };
+      // Like Cloud: a forced remove or a tenants_restore run needs a client that advertises tenant_domains.
+      const forced = options.job.mode === 'remove' && (options.remove as { force?: unknown } | undefined)?.force === true;
+      if (forced || options.job.mode === 'tenants_restore') {
+        const capabilities = parse(body)?.capabilities;
+        if (!Array.isArray(capabilities) || !capabilities.includes('tenant_domains')) {
+          return json(res, 409, { error: 'client_outdated', message: 'Update the runner' });
+        }
+      }
       if (!options.ignoreDefer) {
         const defer = parse(body)?.defer_credentials === true;
         const tests = options.job.tests;

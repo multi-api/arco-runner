@@ -1,7 +1,7 @@
 // The runner's own start and credentials calls (spec §4.1). The shared client's startRun always expects credentials
 // from start; the runner asks start to defer them and fetches them from /credentials right before arco deploy.
 import {
-  Batcher, CloudApi, CloudApiError, isRunLost, parseConfigLayer, parseExtensions, parseExternalDns, type ConfigLayer, type Credentials,
+  Batcher, CAPABILITIES, CloudApi, CloudApiError, isRunLost, parseConfigLayer, parseExtensions, parseExternalDns, type ConfigLayer, type Credentials,
   type Extension, type ExternalDns,
   type Redactor, type RunSession, type StartResponse,
 } from '@multiapi/arco-cloud-client';
@@ -27,12 +27,20 @@ export interface OpenSession {
   config: ConfigLayer | null;
   /** The Arco Cloud extensions from start (empty without any); deployAndFinish places them under `.arco-cloud/`. */
   extensions: Record<string, Extension>;
+  /**
+   * The start answer's `remove` key exactly as Cloud sent it (undefined when absent). Handed to the client untouched:
+   * only the client decides from it whether `arco remove` gets `--force`; the agent never reads it.
+   */
+  remove: StartResponse['remove'] | undefined;
   /** Ends the run like a fatal logs answer does: sets the abort message and aborts session.signal. */
   markRunLost(e: unknown): void;
 }
 
-/** What this runner tells Cloud it can do, sent with every start. */
-export const RUNNER_CAPABILITIES = ['external_dns', 'extensions'];
+/**
+ * What this runner tells Cloud it can do, sent with every start: exactly what the shared client implements
+ * (`tenant_domains` since 0.2.0: the forced remove and the tenants_restore mode), since the client runs Arco.
+ */
+export const RUNNER_CAPABILITIES: readonly string[] = [...CAPABILITIES];
 
 /** Sent with every start: this runner writes `config` to a file and sets ARCO_CONFIG_LAYER (through deployAndFinish). */
 export const SUPPORTS_CONFIG_LAYER = true;
@@ -202,6 +210,7 @@ export async function openSession(o: {
     mode: started.mode,
     config,
     extensions,
+    remove: started.remove,
     markRunLost,
   };
 }
@@ -247,7 +256,7 @@ export function completeSession(open: OpenSession, issued: Issued, redactor: Red
     dns,
     cloudflareToken,
     started: { credentials, region, permissionsBoundary, environment: open.environment, mode: open.mode, config: open.config,
-      extensions: open.extensions },
+      extensions: open.extensions, ...(open.remove !== undefined ? { remove: open.remove } : {}) },
     awsEnv: {
       AWS_ACCESS_KEY_ID: credentials.accessKeyId,
       AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,

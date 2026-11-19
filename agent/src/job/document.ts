@@ -16,26 +16,37 @@ const DEFAULT_TESTS_TIMEOUT_SECONDS = 900;
 export type JobSource = { clone_url: string; auth_header: string; sha: string; root_dir: string };
 export type JobCache = { restore_url: string; save_url: string; key: string };
 
+export type JobMode = 'deploy' | 'inventory' | 'remove' | 'tenants_restore';
+
+/**
+ * Cloud's own maintenance runs on its runner (a remove, a tenants:restore): no app build, no cache, no tests, the
+ * global Arco from the job's commands, and maybe no source.
+ */
+export const isMaintenanceMode = (mode: JobMode): boolean => mode === 'remove' || mode === 'tenants_restore';
+
 export type JobDocument = {
   deployment_id: string;
   environment: string;
-  mode: 'deploy' | 'inventory' | 'remove';
+  mode: JobMode;
   nonce: string;
   runner_token: string;
-  /** Null only in remove mode: the environment is removed with Cloud's configuration layer alone. */
+  /** Null only in remove and tenants_restore modes: Arco then runs with Cloud's configuration layer alone. */
   source: JobSource | null;
   php_version: string;
   commands: string[];
   env: Record<string, string>;
   mask: string[];
-  /** Always null in remove mode (whatever Cloud sent): the agent never restores or saves a cache for a remove. */
+  /**
+   * Always null in remove and tenants_restore modes (whatever Cloud sent): the agent never restores or saves a cache
+   * for them.
+   */
   cache: JobCache | null;
   timeout_seconds: number;
   defer_credentials: boolean;
   tests: TestsSpec | null;
 };
 
-/** A job with a repository to check out: every deploy and inventory, and a remove that has one. */
+/** A job with a repository to check out: every deploy and inventory, and a remove or tenants_restore that has one. */
 export type SourcedJob = JobDocument & { source: JobSource };
 
 export type TicketPayload = { ticket: string; api_base: string; deployment_id: string };
@@ -142,11 +153,13 @@ export function parseJobDocument(x: unknown): JobDocument {
   const fail: Fail = (m) => { throw new InvalidJobDocument(m); };
   const o = obj(x, 'document', fail);
   const mode = o.mode;
-  if (mode !== 'deploy' && mode !== 'inventory' && mode !== 'remove') fail('mode must be "deploy", "inventory" or "remove"');
-  const remove = mode === 'remove';
+  if (mode !== 'deploy' && mode !== 'inventory' && mode !== 'remove' && mode !== 'tenants_restore') {
+    fail('mode must be "deploy", "inventory", "remove" or "tenants_restore"');
+  }
+  const maintenance = isMaintenanceMode(mode as JobMode);
 
-  // Only a remove may come without a source (null, never absent) or a cache.
-  const source = remove && o.source === null ? null : parseSource(o.source, fail);
+  // Only a remove or a tenants_restore may come without a source (null, never absent) or a cache.
+  const source = maintenance && o.source === null ? null : parseSource(o.source, fail);
 
   const envIn = objOrEmptyList(o.env, 'env', fail);
   const env: Record<string, string> = {};
@@ -155,13 +168,13 @@ export function parseJobDocument(x: unknown): JobDocument {
     env[k] = v as string;
   }
 
-  const cache = remove ? null : parseCache(o.cache, fail);
+  const cache = maintenance ? null : parseCache(o.cache, fail);
   if (typeof o.timeout_seconds !== 'number' || !Number.isFinite(o.timeout_seconds)) fail('timeout_seconds must be a number');
 
   return {
     deployment_id: str(o, 'deployment_id', '', fail),
     environment: str(o, 'environment', '', fail),
-    mode: mode as JobDocument['mode'],
+    mode: mode as JobMode,
     nonce: str(o, 'nonce', '', fail),
     runner_token: str(o, 'runner_token', '', fail),
     source,

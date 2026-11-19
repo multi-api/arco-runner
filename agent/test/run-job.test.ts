@@ -188,7 +188,7 @@ describe('runJob: secrets', () => {
     });
     expect(r.result.finished).toBe(true);
     const start = JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'));
-    expect(start).toEqual({ nonce: NONCE, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
+    expect(start).toEqual({ nonce: NONCE, capabilities: ['external_dns', 'extensions', 'tenant_domains'], supports_config_layer: true });
     const c = { accessKeyId: 'AKIAFAKECLOUD0000001', secretAccessKey: 'fake/Secret+Access+Key/0123456789abcdefABCD', sessionToken: 'FwoGZXIvYXdzEFAKESESSIONTOKEN0123456789' };
     const job = r.cloud.options.job as { cache: { restore_url: string; save_url: string } };
     const secrets = [
@@ -723,7 +723,7 @@ describe('runJob: deferred credentials', () => {
       job: { defer_credentials: true },
       deps: { killBuildProcesses: async () => { if (killedAt === 0) killedAt = Date.now(); } },
     });
-    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions', 'tenant_domains'], supports_config_layer: true });
     const creds = r.order.indexOf('credentials');
     expect(r.order.slice(0, 2)).toEqual(['claim', 'start']);
     expect(new Set(r.order.slice(2, creds))).toEqual(new Set(['logs']));
@@ -743,7 +743,7 @@ describe('runJob: deferred credentials', () => {
     const r = await run(w, {
       job: { tests: { command: 'true', services: [] } },
     });
-    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions', 'tenant_domains'], supports_config_layer: true });
     expect(r.cloud.calls('/credentials')).toHaveLength(1);
   }, 30_000);
 
@@ -930,7 +930,7 @@ describe('runJob: remove jobs', () => {
     const r = await run(w, { commands: [], env: { ARCO_BIN: 'arco' }, job: removeJob() });
     expect(r.finishes).toEqual([{
       result: 'failed', revision: null, rolled_back: false, error_code: 'arco.not_installed',
-      error_message: "arco not installed globally: the remove job's install command failed", arco_version: null,
+      error_message: "arco not installed globally: the maintenance job's install command failed", arco_version: null,
     }]);
     expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
   }, 30_000);
@@ -953,6 +953,140 @@ describe('runJob: remove jobs', () => {
     expect(existsSync(join(w.paths.repo, 'stale.txt'))).toBe(false);
     expect(r.cloud.requests.filter((q) => q.pathname.startsWith('/s3/'))).toHaveLength(0);
     expect(r.wipes).toEqual(['']);
+  }, 30_000);
+
+  const removeLines = async (calls: string) =>
+    (await readFile(calls, 'utf8')).split('\n').filter((l) => l.startsWith('remove '));
+
+  it('forced remove: hands the start answer to the client, which adds --force, and advertises tenant_domains', async () => {
+    const w = await world({ withArco: false });
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls },
+      job: removeJob({ source: null, remove: { force: true } }), cloud: { remove: { force: true } },
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8')).capabilities).toContain('tenant_domains');
+    expect(await removeLines(calls)).toEqual(['remove --env=production --yes --json --no-wait-interfaces --force']);
+  }, 30_000);
+
+  it('never adds --force from the job document alone', async () => {
+    const w = await world({ withArco: false });
+    const calls = join(w.out, 'arco-calls.txt');
+    // Only the start answer may ask for it; a job document (or env) saying so is ignored.
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls, ARCO_REMOVE_FORCE: '1' },
+      job: removeJob({ source: null, remove: { force: true } }),
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    expect(await removeLines(calls)).toEqual(['remove --env=production --yes --json --no-wait-interfaces']);
+  }, 30_000);
+
+  it('passes a start answer remove.force that is not exactly true through untouched: no --force', async () => {
+    const w = await world({ withArco: false });
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls },
+      job: removeJob({ source: null }), cloud: { remove: { force: 'true' } },
+    });
+    expect(r.finishes).toEqual([removedFinish]);
+    expect(await removeLines(calls)).toEqual(['remove --env=production --yes --json --no-wait-interfaces']);
+  }, 30_000);
+});
+
+describe('runJob: tenants_restore jobs', () => {
+  const eventsOf = (r: Awaited<ReturnType<typeof run>>) =>
+    r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).events as { key?: string; status: string }[])
+      .filter((e): e is { key: string; status: string } => typeof e.key === 'string');
+  const linesOf = (r: Awaited<ReturnType<typeof run>>) =>
+    r.cloud.calls('/logs').flatMap((q) => JSON.parse(q.body.toString('utf8')).lines as string[]);
+  const restoreJob = (extra: Record<string, unknown> = {}) =>
+    ({ mode: 'tenants_restore', cache: null, tests: null, timeout_seconds: 900, ...extra });
+  const globalArco = async (w: World) => {
+    const src = join(w.out, 'arco');
+    await writeFile(src, `#!/bin/sh\necho "$0" >> "${join(w.out, 'arco-paths.txt')}"\nexec "${process.execPath}" "${FAKE_ARCO}" "$@"\n`);
+    await chmod(src, 0o755);
+    return `mkdir -p "$COMPOSER_HOME/vendor/bin" && cp "${src}" "$COMPOSER_HOME/vendor/bin/arco" && chmod 755 "$COMPOSER_HOME/vendor/bin/arco"`;
+  };
+  const arcoCalls = async (calls: string) =>
+    (await readFile(calls, 'utf8')).split('\n').filter((l) => l && l !== '--version');
+  const succeededFinish = {
+    result: 'succeeded', revision: null, rolled_back: false, error_code: null, error_message: null, arco_version: '0.10.0',
+    restore_outcome: 'restored',
+  };
+
+  it('skips cache and clone, runs only arco tenants:restore and finishes succeeded', async () => {
+    const w = await world({ withArco: false });
+    await writeFile(join(w.paths.repo, 'stale.txt'), 'x');
+    const calls = join(w.out, 'arco-calls.txt');
+    const cwd = join(w.out, 'cwd.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls, FAKE_ARCO_REMOVE_CWD: cwd },
+      job: restoreJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([succeededFinish]);
+    expect(r.result).toEqual({ deploymentId: 'dep_1', finished: true, buildOk: true, idleReported: true });
+    expect(await arcoCalls(calls)).toEqual(['tenants:restore --env=production --json']);
+    expect(JSON.parse(r.cloud.calls('/start')[0]!.body.toString('utf8')).capabilities).toContain('tenant_domains');
+    expect(linesOf(r)).toContain('No repository checkout: restoring with the Cloud configuration only.');
+    expect(await readFile(cwd, 'utf8')).toBe(await realpath(w.paths.repo));
+    expect(existsSync(join(w.paths.repo, 'stale.txt'))).toBe(false);
+    expect(r.cloud.requests.filter((q) => q.pathname.startsWith('/s3/'))).toHaveLength(0);
+    expect(w.knownCache.get()).toBeNull();
+    const events = eventsOf(r);
+    expect(events.some((e) => e.key === 'build.clone' || e.key.startsWith('build.cache') || e.key.startsWith('build.test'))).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ key: 'build.command.1', status: 'done' }));
+    expect(r.wipes).toEqual(['']);
+  }, 30_000);
+
+  it('with a source checks it out, runs no tests and touches no cache', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_CALLS: calls },
+      job: restoreJob({ tests: { command: 'exit 1', services: [] } }),
+    });
+    expect(r.finishes).toEqual([succeededFinish]);
+    expect(await arcoCalls(calls)).toEqual(['tenants:restore --env=production --json']);
+    expect(r.cloud.requests.filter((q) => q.pathname.startsWith('/s3/'))).toHaveLength(0);
+    expect(w.knownCache.get()).toBeNull();
+    const events = eventsOf(r);
+    expect(events).toContainEqual(expect.objectContaining({ key: 'build.clone', status: 'done' }));
+    expect(events.some((e) => e.key.startsWith('build.cache') || e.key.startsWith('build.test'))).toBe(false);
+  }, 30_000);
+
+  it('runs the global arco at its absolute path, whatever bare ARCO_BIN the job sets', async () => {
+    const w = await world();
+    const calls = join(w.out, 'arco-calls.txt');
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'not-arco', FAKE_ARCO_CALLS: calls }, job: restoreJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([succeededFinish]);
+    const ran = (await readFile(join(w.out, 'arco-paths.txt'), 'utf8')).split('\n').filter(Boolean);
+    expect(new Set(ran)).toEqual(new Set([join(w.paths.home, '.config/composer/vendor/bin/arco')]));
+  }, 30_000);
+
+  it('fails clearly when the global arco was not installed', async () => {
+    const w = await world();
+    const r = await run(w, { commands: [], env: { ARCO_BIN: 'arco' }, job: restoreJob() });
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'arco.not_installed',
+      error_message: "arco not installed globally: the maintenance job's install command failed", arco_version: null,
+    }]);
+    expect(r.result).toMatchObject({ finished: true, buildOk: false, idleReported: true });
+  }, 30_000);
+
+  it("reports Arco's failure with its key, message and params", async () => {
+    const w = await world({ withArco: false });
+    const r = await run(w, {
+      commands: [await globalArco(w)], env: { ARCO_BIN: 'arco', FAKE_ARCO_RESTORE: 'failed' }, job: restoreJob({ source: null }),
+    });
+    expect(r.finishes).toEqual([{
+      result: 'failed', revision: null, rolled_back: false, error_code: 'tenants.restore_failed',
+      error_message: 'Could not restore the tenant domains', arco_version: '0.10.0', restore_outcome: 'failed',
+      error_params: { count: 2 },
+    }]);
+    expect(r.result).toMatchObject({ finished: true, idleReported: true });
   }, 30_000);
 });
 

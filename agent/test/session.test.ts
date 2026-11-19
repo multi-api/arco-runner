@@ -67,7 +67,7 @@ describe('extensions', () => {
 
 describe('RUNNER_CAPABILITIES', () => {
   it('is what start announces', () => {
-    expect(RUNNER_CAPABILITIES).toEqual(['external_dns', 'extensions']);
+    expect(RUNNER_CAPABILITIES).toEqual(['external_dns', 'extensions', 'tenant_domains']);
   });
 });
 
@@ -76,12 +76,33 @@ describe('openSession', () => {
     const c = await cloud();
     const o = await open(c, new Redactor());
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, defer_credentials: true, capabilities: ['external_dns', 'extensions', 'tenant_domains'], supports_config_layer: true });
       expect(o.issued).toBeNull();
       expect(o.environment).toBe('production');
       expect(o.mode).toBe('deploy');
     } finally {
       await o.session.batcher.close();
+    }
+  });
+
+  it("hands the start answer's remove key to the run session untouched, and omits it when absent", async () => {
+    const c = await cloud({ remove: { force: true } });
+    const redactor = new Redactor();
+    const o = await open(c, redactor);
+    try {
+      expect(o.remove).toEqual({ force: true });
+      const issued = await issueCredentials({ apiBase: c.url, token: TOKEN, deploymentId: 'dep_1' });
+      expect(completeSession(o, issued, redactor).started.remove).toEqual({ force: true });
+    } finally {
+      await o.session.batcher.close();
+    }
+    const plain = await cloud();
+    const p = await open(plain, redactor);
+    try {
+      const issued = await issueCredentials({ apiBase: plain.url, token: TOKEN, deploymentId: 'dep_1' });
+      expect(completeSession(p, issued, redactor).started).not.toHaveProperty('remove');
+    } finally {
+      await p.session.batcher.close();
     }
   });
 
@@ -108,7 +129,7 @@ describe('external DNS', () => {
     const c = await cloud({ ignoreDefer: true });
     const o = await open(c, new Redactor(), false);
     try {
-      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns', 'extensions'], supports_config_layer: true });
+      expect(JSON.parse(c.calls('/start')[0]!.body.toString('utf8'))).toEqual({ nonce: NONCE, capabilities: ['external_dns', 'extensions', 'tenant_domains'], supports_config_layer: true });
     } finally {
       await o.session.batcher.close();
     }
