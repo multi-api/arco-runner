@@ -1,4 +1,4 @@
-export type ServiceName = 'mysql' | 'pgsql' | 'redis';
+export type ServiceName = 'mysql' | 'pgsql' | 'redis' | 'floci';
 
 export type TestsSpec = {
   command: string;
@@ -10,7 +10,7 @@ export type TestsSpec = {
   mask: string[];
 };
 
-const SERVICE_NAMES: readonly string[] = ['mysql', 'pgsql', 'redis'];
+const SERVICE_NAMES: readonly string[] = ['mysql', 'pgsql', 'redis', 'floci'];
 const DEFAULT_TESTS_TIMEOUT_SECONDS = 900;
 
 export type JobSource = { clone_url: string; auth_header: string; sha: string; root_dir: string };

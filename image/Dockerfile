@@ -10,6 +10,8 @@
 # Global so both stages see the same pinned version (each stage re-declares it).
 ARG MYSQL_VERSION=8.4.13
 ARG GO_VERSION=1.27.4
+# sha256 of the Floci binary (versions.json services.floci.binary_sha256).
+ARG FLOCI_SHA256=ab62c17a4f81234b1ab646415137d0fbbe36750451774d6db3a9fb0b513bf600
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108 AS mysql
 ARG MYSQL_VERSION
 COPY inputs/mysql.tar.xz /tmp/mysql.tar.xz
@@ -28,6 +30,17 @@ RUN dnf install -y tar xz binutils findutils \
       /opt/mysql/share/aclocal /opt/mysql/mysql-test \
  && find /opt/mysql -name '*.a' -type f -delete \
  && find /opt/mysql -type f -exec sh -c 'for f; do if [ "$(head -c 4 "$f" | tr -d "\0")" = "$(printf "\177ELF")" ]; then strip --strip-unneeded "$f" || exit 1; fi; done' sh {} +
+
+# Floci (the local AWS emulator), also in its own stage. inputs/floci-layer.tar.gz is the layer of the official
+# floci/floci image that holds the native linux/arm64 binary (/app/application), verified by fetch-inputs and
+# package-image; only that one file is extracted, checked against its pinned sha256, and copied over.
+FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:53cdb05519dd396022a51cadd61935665a8c056c733e8a56f8ab13a3e7288108 AS floci
+ARG FLOCI_SHA256
+COPY inputs/floci-layer.tar.gz /tmp/floci-layer.tar.gz
+RUN dnf install -y tar gzip \
+ && mkdir /opt/floci \
+ && tar -xzf /tmp/floci-layer.tar.gz -C /opt/floci --strip-components=1 --no-same-owner app/application \
+ && echo "${FLOCI_SHA256}  /opt/floci/application" | sha256sum -c -
 
 # @go-begin
 # Go, also in its own stage: only /usr/local/go reaches the runner image (inputs/go.tar.gz is the official
@@ -58,7 +71,8 @@ RUN dnf install -y nodejs24 nodejs24-npm git-core zstd tar unzip shadow-utils ut
 
 RUN useradd -u 1000 -U -m -s /bin/bash build
 
-# Test services (spec §5): MySQL 8.4 LTS (official tarball), PostgreSQL 17 and Redis (AL2023 packages).
+# Test services (spec §5): MySQL 8.4 LTS (official tarball), PostgreSQL 17 and Redis (AL2023 packages), and Floci
+# (one native binary that links only glibc).
 # Each runs as its own system user; the agent starts them only for a build that selects them.
 # REDIS_PACKAGE comes from versions.json; its binaries are /usr/bin/${REDIS_PACKAGE}-server and -cli.
 ARG REDIS_PACKAGE=redis6
@@ -66,12 +80,14 @@ ARG MYSQL_VERSION
 RUN dnf install -y --setopt=install_weak_deps=0 postgresql17-server postgresql17 ${REDIS_PACKAGE} libaio numactl-libs \
  && dnf clean all
 COPY --from=mysql /opt/mysql /opt/mysql
-RUN chown -R root:root /opt/mysql && chmod -R u=rwX,go=rX /opt/mysql \
- && for u in mysql postgres redis; do getent passwd "$u" >/dev/null || useradd -r -U -M -s /sbin/nologin "$u"; done \
+COPY --from=floci /opt/floci/application /opt/floci/floci-aws
+RUN chown -R root:root /opt/mysql /opt/floci && chmod -R u=rwX,go=rX /opt/mysql /opt/floci \
+ && for u in mysql postgres redis floci; do getent passwd "$u" >/dev/null || useradd -r -U -M -s /sbin/nologin "$u"; done \
  && for b in mysqld mysql mysqladmin; do ln -s /opt/mysql/bin/$b /usr/local/bin/$b; done \
  && for b in postgres initdb pg_isready psql; do ln -s /usr/bin/$b /usr/local/bin/$b; done \
  && for b in server cli; do ln -s /usr/bin/${REDIS_PACKAGE}-$b /usr/local/bin/redis-$b; done \
- && for b in mysqld mysql mysqladmin postgres initdb pg_isready psql redis-server redis-cli; do test -x /usr/local/bin/$b || { echo "missing $b"; exit 1; }; done \
+ && ln -s /opt/floci/floci-aws /usr/local/bin/floci-aws \
+ && for b in mysqld mysql mysqladmin postgres initdb pg_isready psql redis-server redis-cli floci-aws; do test -x /usr/local/bin/$b || { echo "missing $b"; exit 1; }; done \
  && install -d -o root -g root -m 0755 /opt/arco-services /opt/arco-services/templates /var/lib/arco-services /run/arco-services
 # Pristine data templates: the agent copies one to /var/lib/arco-services/<service> at start. No server keeps running.
 # The MySQL TLS/RSA keys and server UUID are deleted so no VM shares them; mysqld regenerates them on first start.
@@ -119,7 +135,7 @@ RUN chown -R root:root /opt/arco-runner \
 
 # No test server may be running or hold data when the image is snapshotted.
 # pgrep exits 1 only when nothing matches (2 and 3 are errors, which must fail the build too).
-RUN pgrep -x 'mysqld|postgres|redis-server|redis6-server'; test $? -eq 1 \
+RUN pgrep -x 'mysqld|postgres|redis-server|redis6-server|floci-aws'; test $? -eq 1 \
  && test -z "$(ls -A /var/lib/arco-services)"
 
 ENV ARCO_RUNNER_IMAGE=php85 ARCO_RUNNER_IMAGE_REVISION=$REVISION

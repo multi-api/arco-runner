@@ -99,7 +99,7 @@ describe('smokeServices', () => {
     roots.push(root);
     const paths: Paths = { home: root, repo: join(root, 'repo'), tmpDirs: [root], agentDir: root, varDir: root };
     const passwd = join(root, 'passwd');
-    await writeFile(passwd, 'mysql:x:27:27::/:/sbin/nologin\npostgres:x:26:26::/:/bin/sh\nredis:x:980:980::/:/sbin/nologin\n');
+    await writeFile(passwd, 'mysql:x:27:27::/:/sbin/nologin\npostgres:x:26:26::/:/bin/sh\nredis:x:980:980::/:/sbin/nologin\nfloci:x:979:979::/:/sbin/nologin\n');
     const err = await smokeServices({
       manager, identity: { uid: 1000, gid: 1000 }, paths, log: () => {}, passwdPath: passwd,
       servicePaths: { dataDir: join(root, 'data'), runDir: join(root, 'run'), templateDir: join(root, 't'), binDir: root },
@@ -123,7 +123,7 @@ describe('smokeServices', () => {
     const root = await mkdtemp(join(tmpdir(), 'smoke-'));
     roots.push(root);
     const passwd = join(root, 'passwd');
-    await writeFile(passwd, 'mysql:x:27:27::/:/sbin/nologin\nredis:x:980:980::/:/sbin/nologin\n');
+    await writeFile(passwd, 'mysql:x:27:27::/:/sbin/nologin\nredis:x:980:980::/:/sbin/nologin\nfloci:x:979:979::/:/sbin/nologin\n');
     const paths: Paths = { home: root, repo: join(root, 'repo'), tmpDirs: [root], agentDir: root, varDir: root };
     const err = await smokeServices({
       manager, identity: { uid: 1000, gid: 1000 }, paths, log: () => {}, passwdPath: passwd,

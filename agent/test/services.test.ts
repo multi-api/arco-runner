@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,12 +46,13 @@ interface FakeProc extends ServerProcess {
 }
 
 /** Fakes for every side effect: a manual clock, servers that obey (or ignore) SIGTERM, probes, admin SQL. */
-function harness(o: { ready?: (s: ServiceName) => boolean; ignoreTerm?: boolean; listing?: string; onSleep?: (t: number) => void } = {}) {
+function harness(o: { ready?: (s: ServiceName) => boolean; ignoreTerm?: boolean; listing?: string; onSleep?: (t: number) => void; bucketError?: string } = {}) {
   let t = 0;
   const procs: Record<string, FakeProc> = {};
   const probes: string[][] = [];
   const admins: Array<{ s: ServiceName; argv: string[]; sql: string }> = [];
   const killedUsers: number[] = [];
+  const buckets: string[] = [];
   const fakes = {
     now: () => t,
     sleep: async (ms: number) => { t += ms; o.onSleep?.(t); },
@@ -77,24 +78,28 @@ function harness(o: { ready?: (s: ServiceName) => boolean; ignoreTerm?: boolean;
       probes.push(argv);
       return o.ready ? o.ready(_s) : true;
     },
+    createBucket: async (name: string) => {
+      if (o.bucketError) throw new Error(o.bucketError);
+      buckets.push(name);
+    },
     admin: async (s: ServiceName, argv: string[], sql: string) => {
       admins.push({ s, argv, sql });
       return { exitCode: 0, stdout: /^(SHOW|SELECT)/.test(sql) ? (o.listing ?? '') : '', stderr: '' };
     },
   };
-  return { fakes, procs, probes, admins, killedUsers, clock: () => t };
+  return { fakes, procs, probes, admins, killedUsers, buckets, clock: () => t };
 }
 
 describe('catalog', () => {
   it('looks up the service users in passwd and names the missing ones', () => {
     const passwd = 'root:x:0:0::/root:/bin/sh\nmysql:x:27:27::/var/lib/mysql:/sbin/nologin\nredis:x:0:0::/:/sbin/nologin\nbuild:x:1000:1000::/home/build:/bin/bash\n';
-    expect(serviceUserIds(passwd)).toEqual({ uids: { mysql: 27 }, missing: ['postgres', 'redis'] });
-    expect(serviceUserIds('')).toEqual({ uids: {}, missing: ['mysql', 'postgres', 'redis'] });
+    expect(serviceUserIds(passwd)).toEqual({ uids: { mysql: 27 }, missing: ['postgres', 'redis', 'floci'] });
+    expect(serviceUserIds('')).toEqual({ uids: {}, missing: ['mysql', 'postgres', 'redis', 'floci'] });
   });
   it('binds every server to 127.0.0.1 on its port and never puts the password in argv', async () => {
     const p = await makePaths();
     const password = "S3cr3t'pw-xyz";
-    for (const s of ['mysql', 'pgsql', 'redis'] as const) {
+    for (const s of ['mysql', 'pgsql', 'redis', 'floci'] as const) {
       for (const argv of [serverArgv(s, p, 7), probeArgv(s, p)]) {
         expect(argv.join(' ')).toContain('127.0.0.1');
         expect(argv.join(' ')).toContain(String(SERVICE_PORTS[s]));
@@ -119,6 +124,13 @@ describe('catalog', () => {
       '--protected-mode', 'yes', '--rename-command', 'MODULE', '', '--rename-command', 'CONFIG', '',
       '--rename-command', 'DEBUG', '',
     ]);
+
+    // Floci: loopback only, in memory, and without EC2 (its IMDS server would listen on 0.0.0.0:9169).
+    expect(serverArgv('floci', p, 7)).toEqual([
+      `${p.binDir}/floci-aws`, '-Dquarkus.http.host=127.0.0.1', '-Dquarkus.http.port=4566',
+      '-Dfloci.storage.mode=memory', '-Dfloci.services.ec2.enabled=false',
+    ]);
+    expect(probeArgv('floci', p).at(-1)).toContain('http://127.0.0.1:4566/_floci/health');
 
     // Through the manager: no argv it runs carries the password; the password only travels on stdin.
     const h = harness();
@@ -243,6 +255,33 @@ describe('services manager', () => {
     expect(readFileSync(join(p.dataDir, 'mysql', 'pristine'), 'utf8')).toBe('mysql');
     expect(existsSync(join(p.dataDir, 'redis'))).toBe(true);
     expect(existsSync(join(p.dataDir, 'mysql', 'server.log'))).toBe(true);
+  });
+
+  it('starts Floci in an empty data dir, creates the testing bucket and runs no SQL', async () => {
+    const p = await makePaths();
+    const h = harness({ listing: 'testing\n' });
+    const m = createServicesManager(p, h.fakes);
+    const ms = await m.start(['floci'], 'pw', new AbortController().signal);
+    expect(ms).toEqual({ floci: 0 });
+    expect(h.procs.floci!.argv[0]).toBe(`${p.binDir}/floci-aws`);
+    expect(h.buckets).toEqual(['testing']);
+    expect(h.admins).toEqual([]);
+    expect(readdirSync(join(p.dataDir, 'floci'))).toEqual(['server.log']);
+    // Floci holds no database: dropDatabases skips it.
+    expect(await m.dropDatabases()).toEqual([]);
+    expect(h.admins).toEqual([]);
+    await m.stopAll();
+    expect(h.procs.floci!.signals.map((x) => x.signal)).toEqual(['SIGTERM']);
+  });
+
+  it('fails with ServiceStartError and stops Floci when the bucket cannot be created', async () => {
+    const p = await makePaths();
+    const h = harness({ bucketError: 'HTTP 500' });
+    const m = createServicesManager(p, h.fakes);
+    const err = await m.start(['floci'], 'pw', new AbortController().signal).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ServiceStartError);
+    expect((err as Error).message).toBe('Floci: creating the S3 bucket testing failed: HTTP 500');
+    expect(h.procs.floci!.signals.map((x) => x.signal)).toEqual(['SIGTERM']);
   });
 
   it('fails with ServiceStartError after 30 s without readiness and stops what it started', async () => {

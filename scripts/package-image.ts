@@ -36,6 +36,7 @@ async function main(): Promise<void> {
   await checkFile(join(inputs, 'composer.phar'), 'composer.phar', versions.composer.sha256);
   await checkFile(join(inputs, 'tini'), 'tini', versions.tini.sha256, versions.tini.size);
   await checkFile(join(inputs, 'mysql.tar.xz'), 'mysql.tar.xz', versions.services.mysql.sha256, versions.services.mysql.size);
+  await checkFile(join(inputs, 'floci-layer.tar.gz'), 'floci-layer.tar.gz', versions.services.floci.layer_sha256, versions.services.floci.layer_size);
 
   const zip = new yazl.ZipFile();
   const add = (file: string, name: string, mode: number) =>
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
     corepack: versions.corepack.version,
     mysqlVersion: versions.services.mysql.version,
     redisPackage: versions.services.redis.package,
+    flociSha256: versions.services.floci.binary_sha256,
     image: { id: image.id, kind: image.kind },
     ...(image.go ? { goVersion: image.go.version } : {}),
   });
@@ -65,6 +67,7 @@ async function main(): Promise<void> {
   add(join(inputs, 'composer.phar'), 'inputs/composer.phar', 0o755);
   add(join(inputs, 'tini'), 'inputs/tini', 0o755);
   add(join(inputs, 'mysql.tar.xz'), 'inputs/mysql.tar.xz', 0o644);
+  add(join(inputs, 'floci-layer.tar.gz'), 'inputs/floci-layer.tar.gz', 0o644);
 
   add(resolve(args.agent!), 'agent/arco-runner.mjs', 0o644);
   // Optional: the standalone /validate runner used by image smoke tests.

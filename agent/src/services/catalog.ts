@@ -19,10 +19,13 @@ export const defaultServicePaths = (): ServicePaths => ({
   binDir: '/usr/local/bin',
 });
 
-export type DatabaseService = Exclude<ServiceName, 'redis'>;
+export type DatabaseService = Exclude<ServiceName, 'redis' | 'floci'>;
 
-export const SERVICE_PORTS = { mysql: 3306, pgsql: 5432, redis: 6379 } as const satisfies Record<ServiceName, number>;
-export const SERVICE_USERS = { mysql: 'mysql', pgsql: 'postgres', redis: 'redis' } as const satisfies Record<ServiceName, string>;
+/** Whether `s` is a database server: it has a data template, an admin client and the `testing` database. */
+export const isDatabase = (s: ServiceName): s is DatabaseService => s === 'mysql' || s === 'pgsql';
+
+export const SERVICE_PORTS = { mysql: 3306, pgsql: 5432, redis: 6379, floci: 4566 } as const satisfies Record<ServiceName, number>;
+export const SERVICE_USERS = { mysql: 'mysql', pgsql: 'postgres', redis: 'redis', floci: 'floci' } as const satisfies Record<ServiceName, string>;
 /**
  * The test services' system users looked up in `/etc/passwd` text: each one's uid, and the names that are missing.
  * A user with uid 0 or a malformed uid counts as missing.
@@ -38,7 +41,7 @@ export function serviceUserIds(passwd: string): { uids: Partial<Record<ServiceNa
   }
   return { uids, missing };
 }
-export const SERVICE_LABELS = { mysql: 'MySQL', pgsql: 'PostgreSQL', redis: 'Redis' } as const satisfies Record<ServiceName, string>;
+export const SERVICE_LABELS = { mysql: 'MySQL', pgsql: 'PostgreSQL', redis: 'Redis', floci: 'Floci' } as const satisfies Record<ServiceName, string>;
 
 export const SYSTEM_DATABASES: Record<DatabaseService, readonly string[]> = {
   mysql: ['mysql', 'information_schema', 'performance_schema', 'sys'],
@@ -46,6 +49,14 @@ export const SYSTEM_DATABASES: Record<DatabaseService, readonly string[]> = {
 };
 
 const HOST = '127.0.0.1';
+
+/** Floci (the local AWS emulator): the endpoint the tests call and the S3 bucket the agent creates at start. */
+export const FLOCI_ENDPOINT = `http://${HOST}:${SERVICE_PORTS.floci}`;
+export const FLOCI_BUCKET = 'testing';
+/** Floci accepts any credentials; these are the conventional emulator ones and open nothing real. */
+export const FLOCI_CREDENTIALS = { accessKeyId: 'test', secretAccessKey: 'test', region: 'us-east-1' } as const;
+
+const FLOCI_PROBE = `fetch(${JSON.stringify(`${FLOCI_ENDPOINT}/_floci/health`)}, { signal: AbortSignal.timeout(2000) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1));`;
 
 /** The PostgreSQL client-authentication file, root-owned in the root-owned runDir. */
 export const pgHbaPath = (p: ServicePaths) => `${p.runDir}/pg_hba.conf`;
@@ -111,6 +122,17 @@ export function serverArgv(s: ServiceName, p: ServicePaths, redisMajor: number):
           : ['--rename-command', 'MODULE', '', '--rename-command', 'CONFIG', '']),
         '--rename-command', 'DEBUG', '',
       ];
+    case 'floci':
+      // A Quarkus native binary: configuration goes as -D system properties. In-memory storage, so nothing but
+      // the log is written. The runner has no Docker, so the services Floci backs with containers cannot work;
+      // EC2 is switched off because it alone opens a second listener (IMDS, 0.0.0.0:9169).
+      return [
+        `${p.binDir}/floci-aws`,
+        `-Dquarkus.http.host=${HOST}`,
+        `-Dquarkus.http.port=${SERVICE_PORTS.floci}`,
+        '-Dfloci.storage.mode=memory',
+        '-Dfloci.services.ec2.enabled=false',
+      ];
   }
 }
 
@@ -125,6 +147,9 @@ export function probeArgv(s: ServiceName, p: ServicePaths): string[] {
       return [`${p.binDir}/pg_isready`, '-h', HOST, '-p', String(SERVICE_PORTS.pgsql), '-t', '2'];
     case 'redis':
       return [`${p.binDir}/redis-cli`, '-h', HOST, '-p', String(SERVICE_PORTS.redis), 'ping'];
+    case 'floci':
+      // Floci ships no client: the agent's own Node asks the health endpoint. The script is a constant.
+      return [process.execPath, '-e', FLOCI_PROBE];
   }
 }
 

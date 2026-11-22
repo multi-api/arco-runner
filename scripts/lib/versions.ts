@@ -36,6 +36,15 @@ export interface Versions {
     postgresql: { package: 'postgresql17-server' };
     /** Rendered into `ARG REDIS_PACKAGE`; the binaries are `/usr/bin/<package>-server` and `-cli`. */
     redis: { package: string; note?: string };
+    /**
+     * The local AWS emulator. Its native linux/arm64 binary is taken from one layer of the official image on
+     * Docker Hub: `layer_sha256` is that layer's blob digest (what fetch-inputs downloads and checks) and
+     * `binary_sha256` the `/app/application` inside it (what the Dockerfile checks after extracting it).
+     */
+    floci: {
+      version: string; repository: string; manifest_digest: string; layer_sha256: string; layer_size: number;
+      binary_sha256: string; binary_size: number; note?: string;
+    };
   };
 }
 

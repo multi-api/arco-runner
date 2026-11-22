@@ -1,7 +1,7 @@
 // Downloads the inputs of one runner image and verifies them against image/versions.json: size, sha256 and, for
 // the arco-runtime builds, the build attestation. Any mismatch exits 1.
-//   --minor 8.5 (or --image php85): PHP CLI, FrankenPHP, Composer, tini, MySQL
-//   --image go:                     PHP CLI (versions.go.php_minor), Go, Composer, tini, MySQL
+//   --minor 8.5 (or --image php85): PHP CLI, FrankenPHP, Composer, tini, MySQL, Floci
+//   --image go:                     PHP CLI (versions.go.php_minor), Go, Composer, tini, MySQL, Floci
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -16,6 +16,10 @@ const COMPOSER_BASE = process.env.COMPOSER_DOWNLOAD_BASE ?? 'https://getcomposer
 const TINI_BASE = process.env.TINI_DOWNLOAD_BASE ?? 'https://github.com/krallin/tini/releases/download';
 // go.dev/dl redirects to dl.google.com; both are tried. The pinned sha256 is the one go.dev/dl/?mode=json lists.
 const GO_BASES = process.env.GO_DOWNLOAD_BASE ? [process.env.GO_DOWNLOAD_BASE] : ['https://go.dev/dl', 'https://dl.google.com/go'];
+// Floci's binary is a layer of its Docker Hub image. Docker Hub wants a bearer token even for a public pull; an
+// empty FLOCI_REGISTRY_TOKEN_URL (a mirror, the tests) sends none.
+const FLOCI_REGISTRY_BASE = process.env.FLOCI_REGISTRY_BASE ?? 'https://registry-1.docker.io';
+const FLOCI_REGISTRY_TOKEN_URL = process.env.FLOCI_REGISTRY_TOKEN_URL ?? 'https://auth.docker.io/token?service=registry.docker.io';
 const ATTEST_REPO = 'multi-api/arco-runtime';
 const ATTEST_SIGNER = 'multi-api/arco-runtime/.github/workflows/publish.yml';
 
@@ -27,10 +31,23 @@ interface Input {
   sha256: string;
   size?: number;
   attest: boolean;
+  /** Request headers, asked for once per input. fetch drops Authorization when a redirect leaves the host. */
+  headers?: () => Promise<Record<string, string>>;
 }
 
-async function download(url: string, dest: string): Promise<void> {
+/** An anonymous pull token for `repository`, or no header when the registry asks for none. */
+async function registryAuth(repository: string): Promise<Record<string, string>> {
+  if (FLOCI_REGISTRY_TOKEN_URL === '') return {};
+  const url = `${FLOCI_REGISTRY_TOKEN_URL}${FLOCI_REGISTRY_TOKEN_URL.includes('?') ? '&' : '?'}scope=${encodeURIComponent(`repository:${repository}:pull`)}`;
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`registry token: HTTP ${res.status}`);
+  const token = ((await res.json()) as { token?: unknown }).token;
+  if (typeof token !== 'string' || token === '') throw new Error('registry token: the answer carries no token');
+  return { Authorization: `Bearer ${token}` };
+}
+
+async function download(url: string, dest: string, headers: Record<string, string> = {}): Promise<void> {
+  const res = await fetch(url, { headers });
   if (!res.ok || !res.body) throw new Error(`${url}: HTTP ${res.status}`);
   // Streamed: the MySQL tarball is several hundred MB.
   await pipeline(Readable.fromWeb(res.body as ReadableStream<Uint8Array>), createWriteStream(dest));
@@ -111,6 +128,16 @@ async function main(): Promise<void> {
       size: versions.services.mysql.size,
       attest: false,
     },
+    {
+      // A registry blob is content-addressed: its digest is the sha256 of the bytes, pinned with the size.
+      asset: `floci-${versions.services.floci.version}-linux-arm64 (image layer)`,
+      urls: [`${FLOCI_REGISTRY_BASE}/v2/${versions.services.floci.repository}/blobs/sha256:${versions.services.floci.layer_sha256}`],
+      dest: join(out, 'floci-layer.tar.gz'),
+      sha256: versions.services.floci.layer_sha256,
+      size: versions.services.floci.layer_size,
+      attest: false,
+      headers: () => registryAuth(versions.services.floci.repository),
+    },
   ];
 
   for (const input of inputs) {
@@ -120,7 +147,7 @@ async function main(): Promise<void> {
     let fetched = false;
     for (const url of input.urls) {
       try {
-        await download(url, temp);
+        await download(url, temp, input.headers ? await input.headers() : {});
         fetched = true;
         break;
       } catch (e) {

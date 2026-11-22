@@ -27,7 +27,7 @@ describe('selfCheck with services', () => {
     dirs.push(root);
     const bin = join(root, 'bin');
     await mkdir(bin);
-    for (const t of ['php', 'composer', 'node', 'git', 'zstd', 'mysqld', 'postgres', 'redis-server']) {
+    for (const t of ['php', 'composer', 'node', 'git', 'zstd', 'mysqld', 'postgres', 'redis-server', 'floci-aws']) {
       await writeFile(join(bin, t), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     }
     const proc = join(root, 'proc');
