@@ -47,6 +47,16 @@
     "redis": {
       "package": "redis6",
       "note": "dnf repoquery redis7 on al2023-minimal arm64 (2026-10-23): no match; redis6 6.2.20 is the newest Redis package (valkey 8/9 also exist)"
+    },
+    "floci": {
+      "version": "2.3.0",
+      "repository": "floci/floci",
+      "manifest_digest": "sha256:2b60d1b3843084a366cc05d86f089f8e54271b4b62094ea6706831bbea277a00",
+      "layer_sha256": "03f9ecbd8ddee908576d3e5687f485e2da1a3b12c5e766b11f3d077ce3b2d207",
+      "layer_size": 78263174,
+      "binary_sha256": "ab62c17a4f81234b1ab646415137d0fbbe36750451774d6db3a9fb0b513bf600",
+      "binary_size": 226363576,
+      "note": "Floci releases 2.0.1 to 2.5.0 attach no standalone binary (checked 2026-11-21), so the linux/arm64 native binary comes from the official Docker Hub image: manifest_digest is the linux/arm64 manifest of floci/floci:2.3.0 and layer_sha256 its gzip layer that holds /app/application"
     }
   }
 }

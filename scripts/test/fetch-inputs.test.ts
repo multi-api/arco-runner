@@ -19,6 +19,12 @@ const files: Record<string, Buffer> = {
   '/go/go1.27.4.linux-arm64.tar.gz': Buffer.from('fake go tarball'),
 };
 const mysqlAsset = 'mysql-8.4.13-linux-glibc2.28-aarch64.tar.xz';
+// A registry blob lives at its own digest; the fake registry wants the bearer token the fake token endpoint hands out.
+const flociLayer = Buffer.from('fake floci layer');
+const flociBlob = `/v2/floci/floci/blobs/sha256:${sha(flociLayer)}`;
+files[flociBlob] = flociLayer;
+const REGISTRY_TOKEN = 'registry-token';
+const authSeen: string[] = [];
 
 let server: Server;
 let base: string;
@@ -26,7 +32,7 @@ let work: string;
 let fakeBin: string;
 let ghLog: string;
 
-function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string; mysqlUrls?: string[]; goSha?: string } = {}): string {
+function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: string; tiniSha?: string; mysqlSha?: string; mysqlUrls?: string[]; goSha?: string; flociSize?: number } = {}): string {
   const path = join(work, `versions-${Math.random().toString(36).slice(2)}.json`);
   const php = files['/frankenphp-1.13.1-r1/php-linux-aarch64']!;
   const fp = files['/frankenphp-1.13.1-r1/frankenphp-linux-aarch64']!;
@@ -61,6 +67,11 @@ function versionsFile(overrides: { phpSha?: string; phpSize?: number; release?: 
         },
         postgresql: { package: 'postgresql17-server' },
         redis: { package: 'redis6' },
+        floci: {
+          version: '2.3.0', repository: 'floci/floci', manifest_digest: 'sha256:1',
+          layer_sha256: sha(flociLayer), layer_size: overrides.flociSize ?? flociLayer.length,
+          binary_sha256: 'b'.repeat(64), binary_size: 1,
+        },
       },
     }),
   );
@@ -80,6 +91,8 @@ function run(
       COMPOSER_DOWNLOAD_BASE: `${base}/composer`,
       TINI_DOWNLOAD_BASE: `${base}/tini`,
       GO_DOWNLOAD_BASE: `${base}/go`,
+      FLOCI_REGISTRY_BASE: base,
+      FLOCI_REGISTRY_TOKEN_URL: `${base}/token?service=registry`,
       FAKE_GH_LOG: ghLog,
       ...extraEnv,
     },
@@ -99,6 +112,11 @@ beforeAll(async () => {
   writeFileSync(join(fakeBin, 'gh'), '#!/bin/sh\necho "$@" >> "$FAKE_GH_LOG"\n[ -n "$FAKE_GH_FAIL" ] && { echo "no matching attestation" >&2; exit 1; }\nexit 0\n');
   chmodSync(join(fakeBin, 'gh'), 0o755);
   server = createServer((req, res) => {
+    if (req.url?.startsWith('/token?')) {
+      authSeen.push(req.url);
+      return void res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ token: REGISTRY_TOKEN }));
+    }
+    if (req.url?.startsWith('/v2/') && req.headers.authorization !== `Bearer ${REGISTRY_TOKEN}`) return void res.writeHead(401).end();
     const body = files[req.url ?? ''];
     if (!body) return void res.writeHead(404).end();
     res.writeHead(200).end(body);
@@ -154,6 +172,32 @@ describe('fetch-inputs', () => {
     expect(r.stderr).toContain('sha256');
     expect(existsSync(join(out, 'mysql.tar.xz'))).toBe(false);
     expect(readdirSync(out).filter((f) => f.startsWith('mysql'))).toEqual([]); // no .part left behind
+  });
+
+  it('downloads the Floci layer from the registry with an anonymous pull token', async () => {
+    const out = join(work, 'out-floci-ok');
+    authSeen.length = 0;
+    const r = await run(versionsFile(), out);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ok floci-2.3.0-linux-arm64 (image layer)');
+    expect(readFileSync(join(out, 'floci-layer.tar.gz'), 'utf8')).toBe('fake floci layer');
+    expect(authSeen).toEqual(['/token?service=registry&scope=repository%3Afloci%2Ffloci%3Apull']);
+  });
+
+  it('exits 1 naming Floci when the layer does not match versions.json', async () => {
+    const out = join(work, 'out-floci-bad');
+    const r = await run(versionsFile({ flociSize: 3 }), out);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('floci-2.3.0-linux-arm64 (image layer): size');
+    expect(readdirSync(out).filter((f) => f.startsWith('floci'))).toEqual([]); // no .part left behind
+  });
+
+  it('exits 1 naming Floci when the registry refuses the pull (no token asked for)', async () => {
+    const out = join(work, 'out-floci-401');
+    const r = await run(versionsFile(), out, { FLOCI_REGISTRY_TOKEN_URL: '' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('floci-2.3.0-linux-arm64 (image layer): no URL served it');
+    expect(r.stderr).toContain('HTTP 401');
   });
 
   it('downloads and verifies the MySQL tarball', async () => {

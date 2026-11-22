@@ -3,6 +3,7 @@ import { lstat, open, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readPlainFile } from '../fsutil.js';
 import type { ServiceName, TestsSpec } from '../job/document.js';
+import { FLOCI_BUCKET, FLOCI_CREDENTIALS, FLOCI_ENDPOINT } from '../services/catalog.js';
 import { buildEnv, type Identity, type Paths } from '../system.js';
 
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -15,6 +16,8 @@ export type TestLanguage = 'php' | 'go';
  * Variables injected for the selected services (spec §5.3). The primary database gets DB_*, the other DB_<NAME>_*.
  * Go also gets URLs: DATABASE_URL for the primary database (DATABASE_<NAME>_URL for the other) and REDIS_URL. Redis has no
  * password, so a Go app gets no REDIS_PASSWORD (Laravel reads the string "null" as none) and no REDIS_CLIENT.
+ * Floci gets what the AWS SDKs read (AWS_ENDPOINT_URL, the emulator's dummy credentials, the region) and the bucket
+ * the agent created; PHP also gets the names Laravel's config files read.
  */
 export function serviceVariables(
   services: ServiceName[],
@@ -46,6 +49,21 @@ export function serviceVariables(
       out.REDIS_CLIENT = redisClient ?? 'phpredis';
     }
   }
+  if (services.includes('floci')) {
+    out.AWS_ENDPOINT_URL = FLOCI_ENDPOINT;
+    out.AWS_ACCESS_KEY_ID = FLOCI_CREDENTIALS.accessKeyId;
+    out.AWS_SECRET_ACCESS_KEY = FLOCI_CREDENTIALS.secretAccessKey;
+    out.AWS_REGION = FLOCI_CREDENTIALS.region;
+    out.AWS_DEFAULT_REGION = FLOCI_CREDENTIALS.region;
+    out.AWS_BUCKET = FLOCI_BUCKET;
+    if (language === 'php') {
+      // config/filesystems.php (s3 disk) and config/cache.php (dynamodb store) of a stock Laravel app.
+      out.AWS_ENDPOINT = FLOCI_ENDPOINT;
+      out.AWS_USE_PATH_STYLE_ENDPOINT = 'true';
+      out.AWS_URL = `${FLOCI_ENDPOINT}/${FLOCI_BUCKET}`;
+      out.DYNAMODB_ENDPOINT = FLOCI_ENDPOINT;
+    }
+  }
   return out;
 }
 
@@ -54,13 +72,18 @@ const databaseUrl = (d: 'mysql' | 'pgsql', password: string): string => d === 'm
   ? `mysql://arco:${password}@127.0.0.1:3306/testing`
   : `postgres://arco:${password}@127.0.0.1:5432/testing?sslmode=disable`;
 
-/** Precedence: services > tests.env > build defaults (APP_ENV=testing for PHP). Never AWS credentials nor the permissions boundary. */
+/**
+ * Precedence: services > tests.env > build defaults (APP_ENV=testing for PHP). Never AWS credentials nor the permissions
+ * boundary: every AWS_* variable is dropped, whoever set it, and then only the ones the agent itself built for Floci
+ * (`serviceVars`: the emulator's endpoint and dummy credentials) are put back.
+ */
 export function testEnv(
   paths: Paths, tests: TestsSpec, serviceVars: Record<string, string>, appKey: string | null, language: TestLanguage = 'php',
 ): NodeJS.ProcessEnv {
   const defaults: Record<string, string> = language === 'php' ? { APP_ENV: 'testing' } : {};
   const env = buildEnv(paths, { ...defaults, ...tests.env, ...serviceVars, ...(appKey ? { APP_KEY: appKey } : {}) });
   for (const k of Object.keys(env)) if (/^aws_/i.test(k) || k.toUpperCase() === 'ARCO_PERMISSIONS_BOUNDARY') delete env[k];
+  for (const [k, v] of Object.entries(serviceVars)) if (/^aws_/i.test(k)) env[k] = v;
   return env;
 }
 

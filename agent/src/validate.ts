@@ -217,7 +217,7 @@ export async function prefetchRuntimeCache(home: string): Promise<{ files: numbe
 
 /**
  * Connects as the app would, from the §5.3 variables: PDO for a database, phpredis for Redis (a raw PING when
- * the extension is missing). Prints "ok" or why it failed; never prints a variable's value.
+ * the extension is missing), an S3 object written to and read back from the bucket for Floci. Prints "ok" or why it failed; never prints a variable's value.
  */
 const SMOKE_PHP = `
 $e = fn (string $k): string => (string) getenv($k);
@@ -240,6 +240,11 @@ try {
             fwrite($s, "PING\\r\\n");
             if (fgets($s) !== "+PONG\\r\\n") throw new RuntimeException('no PONG');
         }
+    } elseif ($e('AWS_ENDPOINT_URL') !== '') {
+        $url = $e('AWS_ENDPOINT_URL') . '/' . $e('AWS_BUCKET') . '/arco_smoke';
+        $put = stream_context_create(['http' => ['method' => 'PUT', 'content' => 'ok', 'timeout' => 5, 'ignore_errors' => true]]);
+        if (@file_get_contents($url, false, $put) === false) throw new RuntimeException('the object could not be written');
+        if (@file_get_contents($url, false, stream_context_create(['http' => ['timeout' => 5]])) !== 'ok') throw new RuntimeException('the object was not read back');
     } else {
         throw new RuntimeException('no service variables');
     }
@@ -250,7 +255,7 @@ try {
 }
 `;
 
-const SMOKE_SERVICES: readonly ServiceName[] = ['mysql', 'pgsql', 'redis'];
+const SMOKE_SERVICES: readonly ServiceName[] = ['mysql', 'pgsql', 'redis', 'floci'];
 
 async function entries(dir: string): Promise<string[]> {
   try { return await readdir(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []; throw e; }

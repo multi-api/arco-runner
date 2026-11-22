@@ -10,6 +10,8 @@ import type { ServiceName } from '../job/document.js';
 import type { Identity } from '../system.js';
 import { killUserProcesses } from '../wipe.js';
 import {
+  FLOCI_BUCKET,
+  FLOCI_ENDPOINT,
   PG_HBA,
   SERVICE_LABELS,
   SERVICE_USERS,
@@ -17,6 +19,7 @@ import {
   adminArgv,
   createSql,
   dropSql,
+  isDatabase,
   listDatabasesSql,
   pgHbaPath,
   probeArgv,
@@ -84,6 +87,8 @@ export interface ServicesManagerOptions {
   /** Major version of redis-server (gates the Redis 7 flags). Default: `redis-server --version`. */
   redisMajor?: () => Promise<number>;
   phpHasRedis?: (env: NodeJS.ProcessEnv, identity: Identity | null) => Promise<boolean>;
+  /** Creates the S3 bucket `name` on the running Floci. Default: an unsigned PUT to its endpoint. */
+  createBucket?: (name: string, signal: AbortSignal) => Promise<void>;
 }
 
 const isRoot = () => process.getuid?.() === 0;
@@ -178,6 +183,12 @@ async function readTail(path: string): Promise<string> {
   }
 }
 
+/** Floci takes unsigned requests: a PUT of the bucket path creates it (200), as `aws s3 mb` does. */
+async function defaultCreateBucket(name: string, signal: AbortSignal): Promise<void> {
+  const res = await fetch(`${FLOCI_ENDPOINT}/${name}`, { method: 'PUT', signal: AbortSignal.any([signal, AbortSignal.timeout(ADMIN_TIMEOUT_MS)]) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
 const tailLines = (text: string, n: number) => text.split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-n);
 
 export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions = {}): ServicesManager {
@@ -186,6 +197,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
   const spawnServer = o.spawnServer ?? defaultSpawnServer;
   const probe = o.probe ?? defaultProbe;
   const admin = o.admin ?? defaultAdmin;
+  const createBucket = o.createBucket ?? defaultCreateBucket;
   const killUser = o.killUser ?? (async (uid: number) => {
     // On a dev machine the "service user" may be the agent's own uid: never kill that.
     if (isRoot() && uid > 0) await killUserProcesses(uid);
@@ -252,7 +264,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     await removeTree(data);
     await removeTree(run);
     if (s === 'pgsql') await writePgHba();
-    if (s === 'redis') {
+    if (!isDatabase(s)) {
       await mkdir(data, { mode: 0o700 });
     } else {
       const template = join(p.templateDir, s);
@@ -305,7 +317,15 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
       await Promise.race([sleep(PROBE_INTERVAL_MS), aborted]);
     }
 
-    if (s !== 'redis') {
+    if (s === 'floci') {
+      try {
+        await createBucket(FLOCI_BUCKET, signal);
+      } catch (e) {
+        if (signal.aborted) throw abortError();
+        throw new ServiceStartError(s, `${label}: creating the S3 bucket ${FLOCI_BUCKET} failed: ${(e as Error).message}`);
+      }
+    }
+    if (isDatabase(s)) {
       const r = await admin(s, adminArgv(s, p), createSql(s, password), { ...as, signal });
       if (signal.aborted) throw abortError();
       if (r.exitCode !== 0) {
@@ -363,7 +383,7 @@ export function createServicesManager(p: ServicePaths, o: ServicesManagerOptions
     async dropDatabases() {
       const dropped: string[] = [];
       for (const { s } of running) {
-        if (s === 'redis') continue;
+        if (!isDatabase(s)) continue;
         const as = ids(s);
         const list = await admin(s, adminArgv(s, p), listDatabasesSql(s), { ...as, signal: AbortSignal.timeout(DROP_TIMEOUT_MS) });
         if (list.exitCode !== 0) throw new Error(`${SERVICE_LABELS[s]}: listing databases failed (exit ${list.exitCode})`);

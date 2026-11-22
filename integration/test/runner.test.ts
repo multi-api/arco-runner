@@ -106,6 +106,35 @@ return [
 ];
 `;
 
+/** Floci: the injected AWS variables are the emulator's, and an S3 object makes the round trip through the bucket. */
+const FLOCI_TEST = `<?php
+return [
+    'floci s3 round trip' => function (): void {
+        $expected = [
+            'AWS_ENDPOINT_URL' => 'http://127.0.0.1:4566', 'AWS_ENDPOINT' => 'http://127.0.0.1:4566',
+            'AWS_ACCESS_KEY_ID' => 'test', 'AWS_SECRET_ACCESS_KEY' => 'test',
+            'AWS_DEFAULT_REGION' => 'us-east-1', 'AWS_BUCKET' => 'testing', 'AWS_USE_PATH_STYLE_ENDPOINT' => 'true',
+        ];
+        foreach ($expected as $name => $value) {
+            if (getenv($name) !== $value) {
+                throw new RuntimeException($name.' is '.var_export(getenv($name), true));
+            }
+        }
+        if (getenv('AWS_SESSION_TOKEN') !== false) {
+            throw new RuntimeException('AWS_SESSION_TOKEN reached the tests');
+        }
+        $url = getenv('AWS_ENDPOINT_URL').'/'.getenv('AWS_BUCKET').'/arco.txt';
+        $put = stream_context_create(['http' => ['method' => 'PUT', 'content' => 'round trip', 'timeout' => 5]]);
+        if (file_get_contents($url, false, $put) === false) {
+            throw new RuntimeException('the object was not written');
+        }
+        if (file_get_contents($url) !== 'round trip') {
+            throw new RuntimeException('the object did not come back');
+        }
+    },
+];
+`;
+
 const SLEEP_TEST = `<?php
 return [
     'sleeps' => function (): void {
@@ -590,6 +619,13 @@ describe('runner image against a fake Cloud', () => {
     await expectServicesPass(job, ['redis']);
   });
 
+  test('tests: Floci', async () => {
+    const sha = await commitTests({ FlociTest: FLOCI_TEST });
+    // A test variable can never bring real AWS credentials in: the agent's emulator values win.
+    const job = await testsJob('tests-floci', sha, { services: ['floci'], env: { AWS_ACCESS_KEY_ID: 'AKIAREALKEY', AWS_SESSION_TOKEN: 'real-token' } });
+    await expectServicesPass(job, ['floci']);
+  });
+
   test('tests: both databases, pgsql primary', async () => {
     const sha = await commitTests({ PgsqlTest: pdoTest('pgsql', 'DB_'), MysqlTest: pdoTest('mysql', 'DB_MYSQL_') });
     const job = await testsJob('tests-both', sha, { services: ['mysql', 'pgsql'], primary_database: 'pgsql' });
@@ -643,7 +679,7 @@ describe('runner image against a fake Cloud', () => {
     const data = await execRunner('ls -A /var/lib/arco-services');
     expect(data.code, data.stderr).toBe(0);
     expect(data.stdout).toBe('');
-    const procs = await execRunner('pgrep -u mysql,postgres,redis');
+    const procs = await execRunner('pgrep -u mysql,postgres,redis,floci');
     expect(procs.stdout).toBe('');
     expect(procs.code).toBe(1); // pgrep: no process matched
     const report = await execRunner('test ! -e /tmp/arco-tests');

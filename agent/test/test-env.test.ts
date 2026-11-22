@@ -32,6 +32,20 @@ describe('serviceVariables', () => {
     expect(v.DB_MYSQL_USERNAME).toBe('arco');
     expect(Object.keys(v).some((k) => k.startsWith('DB_PGSQL_'))).toBe(false);
   });
+  it('gives Floci the endpoint, the dummy credentials and the bucket; Laravel names for PHP only', () => {
+    expect(serviceVariables(['floci'], null, 'pw', 'phpredis')).toEqual({
+      AWS_ENDPOINT_URL: 'http://127.0.0.1:4566', AWS_ACCESS_KEY_ID: 'test', AWS_SECRET_ACCESS_KEY: 'test',
+      AWS_REGION: 'us-east-1', AWS_DEFAULT_REGION: 'us-east-1', AWS_BUCKET: 'testing',
+      AWS_ENDPOINT: 'http://127.0.0.1:4566', AWS_USE_PATH_STYLE_ENDPOINT: 'true',
+      AWS_URL: 'http://127.0.0.1:4566/testing', DYNAMODB_ENDPOINT: 'http://127.0.0.1:4566',
+    });
+    expect(serviceVariables(['floci'], null, 'pw', null, 'go')).toEqual({
+      AWS_ENDPOINT_URL: 'http://127.0.0.1:4566', AWS_ACCESS_KEY_ID: 'test', AWS_SECRET_ACCESS_KEY: 'test',
+      AWS_REGION: 'us-east-1', AWS_DEFAULT_REGION: 'us-east-1', AWS_BUCKET: 'testing',
+    });
+    // The password of the databases never reaches Floci's variables.
+    expect(Object.values(serviceVariables(['floci'], null, 'S3cr3t', 'phpredis'))).not.toContain('S3cr3t');
+  });
   it('uses predis when phpredis is missing', () => {
     expect(serviceVariables(['redis'], null, 'pw', 'predis').REDIS_CLIENT).toBe('predis');
   });
@@ -67,8 +81,27 @@ describe('testEnv', () => {
     const env = testEnv(paths, tests({ AWS_SECRET_ACCESS_KEY: 's', AWS_REGION: 'r', ARCO_PERMISSIONS_BOUNDARY: 'b', KEEP: '1' }), {}, null);
     expect(Object.keys(env).filter((k) => k.startsWith('AWS_') || k === 'ARCO_PERMISSIONS_BOUNDARY')).toEqual([]);
     expect(env.KEEP).toBe('1');
+    // Without Floci selected, nothing puts an AWS variable back.
+    const db = testEnv(paths, tests({ AWS_ACCESS_KEY_ID: 'AKIAREAL' }), serviceVariables(['mysql'], 'mysql', 'pw', 'phpredis'), null);
+    expect(Object.keys(db).filter((k) => /^aws_/i.test(k))).toEqual([]);
     const lower = testEnv(paths, tests({ aws_session_token: 't', arco_permissions_boundary: 'b' }), {}, null);
     expect(Object.keys(lower).filter((k) => /^aws_|^arco_permissions/i.test(k))).toEqual([]);
+  });
+});
+
+describe('testEnv with Floci', () => {
+  it('carries only the AWS variables the agent built for the emulator, never the ones a test variable set', () => {
+    const svc = serviceVariables(['floci'], null, 'pw', 'phpredis');
+    const env = testEnv(paths, tests({
+      AWS_ACCESS_KEY_ID: 'AKIAREAL', AWS_SECRET_ACCESS_KEY: 'real', AWS_SESSION_TOKEN: 'token', aws_profile: 'prod',
+      AWS_ENDPOINT_URL: 'https://s3.amazonaws.com', AWS_BUCKET: 'production', ARCO_PERMISSIONS_BOUNDARY: 'b',
+    }), svc, null);
+    const aws = Object.fromEntries(Object.entries(env).filter(([k]) => /^aws_/i.test(k)));
+    expect(aws).toEqual(Object.fromEntries(Object.entries(svc).filter(([k]) => k.startsWith('AWS_'))));
+    expect(env.AWS_ACCESS_KEY_ID).toBe('test');
+    expect(env.AWS_ENDPOINT_URL).toBe('http://127.0.0.1:4566');
+    expect(env.DYNAMODB_ENDPOINT).toBe('http://127.0.0.1:4566');
+    expect(env.ARCO_PERMISSIONS_BOUNDARY).toBeUndefined();
   });
 });
 

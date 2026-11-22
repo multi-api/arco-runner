@@ -124,6 +124,12 @@ describe('parseJobDocument tests block', () => {
     const r = parseJobDocument({ ...valid(), tests: { ...testsBlock(), services: ['redis'], primary_database: null } }).tests!;
     expect(r.primary_database).toBeNull();
   });
+  it('accepts floci, which is never a primary database', () => {
+    const t = parseJobDocument({ ...valid(), tests: { ...testsBlock(), services: ['floci', 'pgsql'], primary_database: null } }).tests!;
+    expect(t.services).toEqual(['floci', 'pgsql']);
+    expect(t.primary_database).toBe('pgsql');
+    expect(parseJobDocument({ ...valid(), tests: { ...testsBlock(), services: ['floci'], primary_database: null } }).tests!.primary_database).toBeNull();
+  });
   it('accepts an empty JSON array as an empty env and treats a non-positive timeout as 900', () => {
     const d = parseJobDocument({ ...valid(), env: [], tests: { ...testsBlock(), env: [], timeout_seconds: 0 } });
     expect(d.env).toEqual({});
@@ -138,6 +144,7 @@ describe('parseJobDocument tests block', () => {
     const bad = (t: object) => expect(() => parseJobDocument({ ...valid(), tests: { ...testsBlock(), ...t } })).toThrow(InvalidJobDocument);
     bad({ services: ['mongo'] });
     bad({ services: ['redis', 'redis'] });
+    bad({ services: ['floci'], primary_database: 'floci' });
     bad({ services: ['redis'], primary_database: 'pgsql' });
     bad({ env: { A: 1 } });
   });

@@ -74,12 +74,32 @@ describe('package-image mysql', () => {
   });
 });
 
+describe('package-image floci', () => {
+  it('re-checks the Floci layer against versions.json', async () => {
+    const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+    const inputs = join(work, 'inputs-floci');
+    mkdirSync(inputs);
+    for (const [f, c] of [['php', 'p'], ['frankenphp', 'f'], ['composer.phar', 'c'], ['tini', 't'], ['mysql.tar.xz', 'm'], ['floci-layer.tar.gz', 'flocX']] as const) writeFileSync(join(inputs, f), c);
+    const v = readVersions();
+    v.php['8.5'] = { ...v.php['8.5']!, php_cli_sha256: sha('p'), php_cli_size: 1, frankenphp_sha256: sha('f'), frankenphp_size: 1 };
+    v.composer.sha256 = sha('c');
+    v.tini = { version: '0.19.0', sha256: sha('t'), size: 1 };
+    v.services.mysql = { ...v.services.mysql, sha256: sha('m'), size: 1 };
+    v.services.floci = { ...v.services.floci, layer_sha256: sha('floci'), layer_size: 5 };
+    const file = join(work, 'versions-floci.json');
+    writeFileSync(file, JSON.stringify(v));
+    const r = await run(inputs, join(work, 'out-floci.zip'), { ARCO_VERSIONS_FILE: file });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('floci-layer.tar.gz: sha256'); // same length, so the hash (not the size) catches it
+  });
+});
+
 describe('renderDockerfile', () => {
   it('pins digest, args and image name from versions.json', () => {
     const v = readVersions();
     const text = renderDockerfile(readFileSync(resolve(import.meta.dirname, '../../image/Dockerfile'), 'utf8'), {
       digest: 'sha256:' + 'a'.repeat(64), minor: '8.6', runtimeBuild: 'php8.6.0-fp9-r1', revision: 'deadbee', corepack: v.corepack.version,
-      mysqlVersion: v.services.mysql.version, redisPackage: v.services.redis.package,
+      mysqlVersion: v.services.mysql.version, redisPackage: v.services.redis.package, flociSha256: v.services.floci.binary_sha256,
     });
     expect(text).toContain('@sha256:' + 'a'.repeat(64));
     expect(text).toContain('ARG PHP_MINOR=8.6');
@@ -92,14 +112,16 @@ describe('renderDockerfile', () => {
     const v = readVersions();
     const text = renderDockerfile(readFileSync(resolve(import.meta.dirname, '../../image/Dockerfile'), 'utf8'), {
       digest: 'sha256:' + 'b'.repeat(64), minor: '8.5', runtimeBuild: 'x', revision: 'r', corepack: v.corepack.version,
-      mysqlVersion: '8.4.99', redisPackage: 'redis42',
+      mysqlVersion: '8.4.99', redisPackage: 'redis42', flociSha256: 'f'.repeat(64),
     });
     expect(text).toContain('ARG MYSQL_VERSION=8.4.99');
     expect(text).toContain('ARG REDIS_PACKAGE=redis42');
+    // The value is set once, before the first FROM; the Floci stage re-declares the ARG without one.
+    expect(text.match(/^ARG FLOCI_SHA256.*$/gm)).toEqual([`ARG FLOCI_SHA256=${'f'.repeat(64)}`, 'ARG FLOCI_SHA256']);
     // Every stage is pinned to the same base digest.
-    // Both stages (the MySQL extraction stage and the runner) are pinned to the same base digest.
+    // The three stages (the MySQL and Floci extraction stages and the runner) are pinned to the same base digest.
     const froms = text.split('\n').filter((l) => l.startsWith('FROM '));
-    expect(froms).toHaveLength(2);
+    expect(froms).toHaveLength(3);
     for (const f of froms) expect(f).toContain('@sha256:' + 'b'.repeat(64));
   });
 });
@@ -150,7 +172,7 @@ describe('renderDockerfile flavours', () => {
   const base = () => {
     const v = readVersions();
     return { digest: 'sha256:' + 'c'.repeat(64), minor: '8.5', runtimeBuild: 'rb', revision: 'r', corepack: v.corepack.version,
-      mysqlVersion: v.services.mysql.version, redisPackage: v.services.redis.package };
+      mysqlVersion: v.services.mysql.version, redisPackage: v.services.redis.package, flociSha256: v.services.floci.binary_sha256 };
   };
   it('keeps Go and drops the FrankenPHP pre-seed for the go image', () => {
     const text = renderDockerfile(template(), { ...base(), image: { id: 'go', kind: 'go' }, goVersion: '1.27.9' });
@@ -161,7 +183,7 @@ describe('renderDockerfile flavours', () => {
     expect(text).not.toContain('frankenphp');
     expect(text).not.toMatch(/^# @/m);
     const froms = text.split('\n').filter((l) => l.startsWith('FROM '));
-    expect(froms).toHaveLength(3);
+    expect(froms).toHaveLength(4);
     for (const f of froms) expect(f).toContain('@sha256:' + 'c'.repeat(64));
   });
   it('drops Go from the PHP image', () => {

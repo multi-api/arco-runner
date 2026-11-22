@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { access, constants, readFile, readdir, stat } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import type { ServicePaths } from './services/catalog.js';
 import { pidsOfUid } from './wipe.js';
@@ -12,6 +12,8 @@ const TOOLS: Array<[string, string[]]> = [
 ];
 
 const SERVICE_BINARIES = ['mysqld', 'postgres', 'redis-server'];
+/** Floci has no `--version` (any argument starts the server), so it is only checked to be an executable file. */
+const SERVICE_EXECUTABLES = ['floci-aws'];
 
 /** Whether `id` could write to a path with this owner and mode (root aside). */
 export function writableBy(st: { uid: number; gid: number; mode: number }, id: Identity): boolean {
@@ -55,6 +57,13 @@ export async function selfCheck(
           await execFileP(`${services.paths.binDir}/${bin}`, ['--version'], { env, timeout: 10_000 });
         } catch (e) {
           return `${bin} --version failed${(e as { code?: unknown }).code !== undefined ? ` (${String((e as { code?: unknown }).code)})` : ''}`;
+        }
+      }
+      for (const bin of SERVICE_EXECUTABLES) {
+        try {
+          await access(`${services.paths.binDir}/${bin}`, constants.X_OK);
+        } catch {
+          return `${bin} is missing or not executable`;
         }
       }
       for (const uid of services.uids) {

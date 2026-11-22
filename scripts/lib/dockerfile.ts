@@ -8,6 +8,8 @@ export function renderDockerfile(
   template: string,
   opts: {
     digest: string; minor: string; runtimeBuild: string; revision: string; corepack: string; mysqlVersion: string; redisPackage: string;
+    /** sha256 of the Floci binary: the Floci stage checks the file it extracted against it. */
+    flociSha256: string;
     /** Default: the PHP image of `minor` (`php85`). */
     image?: { id: string; kind: ImageKind };
     /** Required for the go image. */
@@ -30,6 +32,7 @@ export function renderDockerfile(
     [/^ARG REVISION=.*$/m, `ARG REVISION=${opts.revision}`],
     [/^ARG MYSQL_VERSION=.*$/m, `ARG MYSQL_VERSION=${opts.mysqlVersion}`],
     [/^ARG REDIS_PACKAGE=.*$/m, `ARG REDIS_PACKAGE=${opts.redisPackage}`],
+    [/^ARG FLOCI_SHA256=.*$/m, `ARG FLOCI_SHA256=${opts.flociSha256}`],
     [/^ARG GO_VERSION=.*$/m, `ARG GO_VERSION=${opts.goVersion ?? 'none'}`],
     [/^ENV ARCO_RUNNER_IMAGE=\S+/m, `ENV ARCO_RUNNER_IMAGE=${image.id}`],
   ];
